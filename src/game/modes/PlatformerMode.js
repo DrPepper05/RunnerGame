@@ -63,9 +63,13 @@ export default class PlatformerMode extends BaseMode {
     const spawnY = typeof theme.spawnY === 'number' ? (this.scene.LOGICAL_FLOOR_Y + theme.spawnY) : (this.scene.LOGICAL_FLOOR_Y - 250);
     this.scene.player.setPosition(spawnX, spawnY);
 
-    // Camera follow
-    this.updateCameraBounds(this.scene.scale);
-    this.scene.cameras.main.startFollow(this.scene.player, true, 0.08, 0.08);
+    // Camera follow - handled via Multi-Camera Manager
+    if (this.scene.cameraManager) {
+      this.scene.cameraManager.setMode('follow-target', this.scene.player);
+    } else {
+      this.updateCameraBounds(this.scene.scale);
+      this.scene.cameras.main.startFollow(this.scene.player, true, 0.08, 0.08);
+    }
 
     // Create fixed platforms for Level 1
     this.platforms = this.scene.physics.add.staticGroup();
@@ -161,7 +165,12 @@ export default class PlatformerMode extends BaseMode {
     const viewHeight = camera.height || safeHeight;
     this.updateMobileControlSizing(viewWidth, viewHeight);
     this.repositionMobileControls(viewWidth, viewHeight);
-    this.updateCameraBounds({ width: safeWidth, height: safeHeight });
+    
+    if (this.scene.cameraManager) {
+      this.scene.cameraManager.handleResize({ width: safeWidth, height: safeHeight });
+    } else {
+      this.updateCameraBounds({ width: safeWidth, height: safeHeight });
+    }
   }
 
   updateCameraBounds(gameSize) {
@@ -187,7 +196,7 @@ export default class PlatformerMode extends BaseMode {
     // Very simple hand-placed static map
     const theme = this.scene.activeTheme || {};
     const isSmallWorld = (theme.worldWidth || 4000) < 2000;
-    const layout = isSmallWorld ? [
+    const layout = this.scene.gameConfig.layoutArray || (isSmallWorld ? [
       { x: 180, y: floorY - 20, scaleX: 5, hasEnemy: false },
       { x: 350, y: floorY - 35, scaleX: 5, hasEnemy: true },
       { x: 520, y: floorY - 20, scaleX: 5, hasEnemy: false },
@@ -203,13 +212,13 @@ export default class PlatformerMode extends BaseMode {
       { x: 2600, y: floorY - 80, scaleX: 1.5, hasEnemy: false },
       { x: 3000, y: floorY - 120, scaleX: 1.0, hasEnemy: true },
       { x: 3400, y: floorY - 200, scaleX: 3.0, hasEnemy: false }, // Big finish block
-    ];
+    ]);
 
     const maxEnemies = this.enemyCount;
 
     const TILE_W = theme.tileWidth || 64;
     const PLATFORM_H = theme.platformHeight || 32;
-    const themePlatformTexture = this.scene.activeTheme?.platformTexture || 'stone_tile';
+    const themePlatformTexture = this.scene.gameConfig.dynamicAssetUrls ? 'dyn_platform' : (this.scene.activeTheme?.platformTexture || 'stone_tile');
     const collectibleTexture = this.scene.activeTheme?.collectibleTexture || 'crate';
 
     // Retrieve dimensions of the platform texture frame for correct dynamic repeating tile scale
@@ -264,231 +273,12 @@ export default class PlatformerMode extends BaseMode {
     });
   }
 
-  generateMobileIcons() {
-    const iconSize = 64;
-    const h = iconSize / 2;
+  jump() {
+    if (this.scene.isGameOver) return;
 
-    const makeIcon = (key, draw) => {
-      const g = this.scene.make.graphics({ add: false });
-      draw(g, h);
-      g.generateTexture(key, iconSize, iconSize);
-      g.destroy();
-    };
-
-    // Jump: upward chevron arrow with base line
-    makeIcon('icon_jump', (g, c) => {
-      g.fillStyle(0xffffff, 1);
-      // Arrow head (chevron)
-      g.fillTriangle(c, c - 18, c - 16, c + 4, c + 16, c + 4);
-      // Arrow shaft
-      g.fillRect(c - 5, c + 4, 10, 18);
-      // Base line
-      g.fillRect(c - 12, c + 22, 24, 4);
-    });
-
-    // Melee: sword shape (blade + crossguard)
-    makeIcon('icon_melee', (g, c) => {
-      g.fillStyle(0xffffff, 1);
-      // Blade
-      g.fillRect(c - 3, 4, 6, 30);
-      // Blade tip
-      g.fillTriangle(c - 8, 8, c + 8, 8, c, 2);
-      // Crossguard
-      g.fillRect(4, c - 3, iconSize - 8, 6);
-      // Handle
-      g.fillRect(c - 2, c + 5, 4, 14);
-    });
-
-    // Shoot: crosshair (+) with center dot
-    makeIcon('icon_shoot', (g, c) => {
-      g.fillStyle(0xffffff, 1);
-      g.fillRect(c - 3, 6, 6, 16);
-      g.fillRect(c - 3, h + 10, 6, 16);
-      g.fillRect(6, c - 3, 16, 6);
-      g.fillRect(h + 10, c - 3, 16, 6);
-      g.fillCircle(c, c, 4);
-    });
-
-    // Left / Right arrows (used inline in createMobileControls)
-  }
-
-  createMobileButton(x, y, textureKey, size, onPress, onRelease) {
-    const btn = this.scene.add.image(x, y, textureKey)
-      .setDepth(100)
-      .setAlpha(0.65)
-      .setScale(size / 64)
-      .setInteractive({ useHandCursor: false })
-      .on('pointerdown', (pointer, localX, localY, event) => {
-        event.stopPropagation();
-        btn.setAlpha(1);
-        if (onPress) onPress(pointer);
-      })
-      .on('pointerup', (pointer) => {
-        btn.setAlpha(0.65);
-        if (onRelease) onRelease(pointer);
-      })
-      .on('pointerupoutside', (pointer) => {
-        btn.setAlpha(0.65);
-        if (onRelease) onRelease(pointer);
-      })
-      .on('pointerout', () => {
-        btn.setAlpha(0.65);
-      });
-
-    this.uiContainer.add(btn);
-    this.mobileControls.push(btn);
-    return btn;
-  }
-
-  createMobileControls() {
-    const isTouch = this.scene.sys.game.device.input.touch;
-    if (!isTouch && this.scene.scale.width > 1024) return;
-
-    this.generateMobileIcons();
-
-    this.uiContainer = this.scene.add.container(0, 0)
-      .setDepth(100)
-      .setScrollFactor(0);
-
-    // Left / Right buttons — use simple arrow images
-    const arrowSize = 64;
-    const makeArrowIcon = (key, dir) => {
-      const g = this.scene.make.graphics({ add: false });
-      g.fillStyle(0xffffff, 1);
-      const c = arrowSize / 2;
-      if (dir === 'left') {
-        g.fillTriangle(c + 12, c - 18, c + 12, c + 18, c - 16, c);
-      } else {
-        g.fillTriangle(c - 12, c - 18, c - 12, c + 18, c + 16, c);
-      }
-      g.generateTexture(key, arrowSize, arrowSize);
-      g.destroy();
-    };
-    makeArrowIcon('icon_arrow_left', 'left');
-    makeArrowIcon('icon_arrow_right', 'right');
-
-    const btnSize = 56;
-
-    this.btnLeft = this.createMobileButton(0, 0, 'icon_arrow_left', btnSize,
-      (pointer) => {
-        this.movingLeft = true;
-        this.leftPointerId = pointer.id;
-      },
-      (pointer) => {
-        if (pointer.id === this.leftPointerId) {
-          this.movingLeft = false;
-          this.leftPointerId = null;
-        }
-      }
-    );
-
-    this.btnRight = this.createMobileButton(0, 0, 'icon_arrow_right', btnSize,
-      (pointer) => {
-        this.movingRight = true;
-        this.rightPointerId = pointer.id;
-      },
-      (pointer) => {
-        if (pointer.id === this.rightPointerId) {
-          this.movingRight = false;
-          this.rightPointerId = null;
-        }
-      }
-    );
-
-    this.btnJump = this.createMobileButton(0, 0, 'icon_jump', btnSize,
-      () => this.jump()
-    );
-
-    this.btnMelee = this.createMobileButton(0, 0, 'icon_melee', btnSize,
-      () => this.melee()
-    );
-
-    if (this.projectilesEnabled) {
-      this.btnShoot = this.createMobileButton(0, 0, 'icon_shoot', btnSize,
-        () => this.shoot()
-      );
-    }
-
-    const camera = this.scene.cameras.main;
-    this.updateMobileControlSizing(camera.width, camera.height);
-    this.repositionMobileControls(camera.width, camera.height);
-  }
-
-  updateMobileControlSizing(screenWidth, screenHeight) {
-    const minSide = Math.min(screenWidth, screenHeight);
-    const baseSize = Phaser.Math.Clamp(Math.round(minSide * 0.12), 44, 64);
-    const marginScreen = Math.round(baseSize * 0.45);
-    const gapScreen = Math.round(baseSize * 0.3);
-
-    this.mobileLayout = {
-      marginScreen,
-      gapScreen,
-      targetSize: baseSize
-    };
-
-    // Apply scale to all image-based buttons
-    const scale = baseSize / 64;
-    this.mobileControls.forEach((btn) => {
-      if (btn) btn.setScale(scale);
-    });
-
-    this.refreshMobileHitAreas();
-  }
-
-  refreshMobileHitAreas() {
-    const HIT_PAD = 12;
-    this.mobileControls.forEach((btn) => {
-      if (!btn) return;
-      // Use unscaled dimensions (btn.width & btn.height) for custom hit area shapes.
-      // Phaser applies the scale factor to custom hit areas automatically during input detection.
-      const w = btn.width;
-      const h = btn.height;
-      btn.disableInteractive();
-      btn.setInteractive(
-        new Phaser.Geom.Rectangle(-HIT_PAD, -HIT_PAD, w + HIT_PAD * 2, h + HIT_PAD * 2),
-        Phaser.Geom.Rectangle.Contains
-      );
-    });
-  }
-
-  repositionMobileControls(screenWidth, screenHeight) {
-    const safeBottomInset = window?.__pmSafeAreaBottom || 0;
-    const safeRightInset = window?.__pmSafeAreaRight || 0;
-    const safeLeftInset = window?.__pmSafeAreaLeft || 0;
-    const safeTopInset = window?.__pmSafeAreaTop || 0;
-
-    const margin = this.mobileLayout?.marginScreen || 28;
-    const gap = this.mobileLayout?.gapScreen || 12;
-    const btnSize = this.mobileLayout?.targetSize || 64;
-    const safeRight = safeRightInset + 12;
-    const safeLeft = safeLeftInset + 12;
-    const safeBottom = safeBottomInset + 12;
-
-    // ── Left side: movement buttons (origin 0.5) ──
-    const leftEdgeX = safeLeft + margin;
-    const bottomY = screenHeight - safeBottom - btnSize;
-    const centerY = bottomY + btnSize / 2;
-
-    if (this.btnLeft) this.btnLeft.setPosition(leftEdgeX + btnSize / 2, centerY);
-    if (this.btnRight) this.btnRight.setPosition(leftEdgeX + btnSize + gap + btnSize / 2, centerY);
-
-    // ── Right side: action buttons, stacked on right edge ──
-    const rightNudge = Math.round(gap * 0.6);
-    const rightEdgeX = screenWidth - safeRight - margin + rightNudge;
-    const bottomCenter = screenHeight - safeBottom - btnSize / 2;
-    const topCenter = bottomCenter - btnSize - gap;
-
-    if (this.btnJump) this.btnJump.setPosition(rightEdgeX - btnSize / 2, bottomCenter);
-    if (this.btnShoot) this.btnShoot.setPosition(rightEdgeX - btnSize - gap - btnSize / 2, bottomCenter);
-    if (this.btnMelee) this.btnMelee.setPosition(rightEdgeX - btnSize / 2, topCenter);
-
-    // Safety: ensure buttons don't overlap the top safe area
-    const topLimit = safeTopInset + margin + btnSize / 2;
-    if (topCenter < topLimit) {
-      const shift = topLimit - topCenter;
-      if (this.btnJump) this.btnJump.setY(bottomCenter + shift);
-      if (this.btnShoot) this.btnShoot.setY(bottomCenter + shift);
-      if (this.btnMelee) this.btnMelee.setY(topCenter + shift);
+    const touchingDown = this.scene.player.body.touching.down || this.scene.player.body.blocked.down;
+    if (touchingDown) {
+      this.scene.player.setVelocityY(-this.jumpForce);
     }
   }
 
@@ -661,6 +451,9 @@ export default class PlatformerMode extends BaseMode {
     if (enemy.health <= 0) {
       // Mark dying immediately to prevent double-processing from rapid overlaps
       enemy._dying = true;
+      if (enemy.body) {
+        enemy.body.enable = false;
+      }
 
       // Death particles
       for (let i = 0; i < 8; i++) {
@@ -705,7 +498,7 @@ export default class PlatformerMode extends BaseMode {
   }
 
   handlePlayerEnemyCollision(player, enemy) {
-    // Only hit if player touches enemy from side or bottom (basic)
+    if (enemy._dying) return;
     this.scene.hitObstacle();
   }
 
@@ -743,7 +536,7 @@ export default class PlatformerMode extends BaseMode {
     let enemiesCreated = 0;
     const maxEnemies = this.enemyCount;
     const theme = this.scene.activeTheme;
-    const enemyTexture = theme?.enemyTexture || 'dude';
+    const enemyTexture = this.scene.gameConfig.dynamicAssetUrls ? 'dyn_enemy' : (theme?.enemyTexture || 'dude');
 
     const enemySpots = [];
     const fallbackSpots = [];
@@ -765,7 +558,15 @@ export default class PlatformerMode extends BaseMode {
       enemy.health = 3;
       enemy.setGravityY(this.gravity);
       
-      if (enemyTexture === 'fox') {
+      if (this.scene.gameConfig.dynamicAssetUrls) {
+        const textureObj = this.scene.textures.get(enemyTexture);
+        const frame = textureObj?.get(0);
+        const h = frame ? frame.height : 128;
+        // Target a standardized height of 50px
+        enemy.setScale(50 / h);
+        enemy.body.setSize(enemy.width, enemy.height);
+        enemy.body.setOffset(0, 0);
+      } else if (enemyTexture === 'fox') {
         enemy.setScale(1.5);
         const enemyAnim = theme?.enemyAnim || 'slug_walk';
         if (enemyAnim === 'yeti_walk') {
@@ -828,12 +629,6 @@ export default class PlatformerMode extends BaseMode {
     if (this.gameInputListener) {
       window.removeEventListener('game-input', this.gameInputListener);
       this.gameInputListener = null;
-    }
-
-    this.mobileControls = [];
-    if (this.uiContainer && this.uiContainer.scene) {
-      this.uiContainer.destroy();
-      this.uiContainer = null;
     }
   }
 }

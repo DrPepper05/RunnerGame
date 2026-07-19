@@ -191,6 +191,7 @@ const CreatorPanel = ({
   const isCustom = presetKey === 'custom';
   const [promptText, setPromptText] = useState('');
   const [promptBusy, setPromptBusy] = useState(false);
+  const [apiKey, setApiKey] = useState(() => localStorage.getItem('GEMINI_API_KEY') || '');
 
   const handlePromptSubmit = () => {
     if (!promptText.trim() || !onPromptGenerate) return;
@@ -305,6 +306,30 @@ const CreatorPanel = ({
         </div>
 
       <div style={{ padding: '24px', display: 'flex', flexDirection: 'column', gap: '20px', overflowY: 'auto', overflowX: 'hidden', flex: 1 }}>
+
+        {/* 0. API Key Config */}
+        <div>
+          <button
+            onClick={!!import.meta.env.VITE_GEMINI_API_KEY ? () => alert("Using API Key from environment (.env)") : () => {
+              const key = prompt("Enter your Google Gemini API Key:", apiKey);
+              if (key !== null) {
+                const trimmed = key.trim();
+                localStorage.setItem('GEMINI_API_KEY', trimmed);
+                setApiKey(trimmed);
+              }
+            }}
+            style={{
+              width: '100%',
+              background: (!!import.meta.env.VITE_GEMINI_API_KEY || apiKey) ? 'rgba(0, 229, 153, 0.1)' : 'rgba(255,255,255,0.05)',
+              border: (!!import.meta.env.VITE_GEMINI_API_KEY || apiKey) ? '1px solid var(--pm-accent-teal)' : '1px solid var(--pm-border)',
+              color: (!!import.meta.env.VITE_GEMINI_API_KEY || apiKey) ? 'var(--pm-accent-teal)' : 'var(--pm-text-secondary)',
+              fontSize: '13px', padding: '8px 12px', borderRadius: '8px', cursor: 'pointer',
+              display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '6px'
+            }}
+          >
+            {!!import.meta.env.VITE_GEMINI_API_KEY ? '✓ Gemini Key Detected & Usable' : (apiKey ? '⚙️ Gemini Key Configured' : '⚙️ Configure Gemini Key')}
+          </button>
+        </div>
 
         {/* 1. Game Name */}
         <div>

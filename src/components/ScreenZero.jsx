@@ -1,6 +1,8 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { GAME_PRESETS } from '../gameConfig';
 import { parsePromptKeywords, generateTitle } from '../game/promptUtils';
+import { generateGameConfig, compileAssetUrls } from '../game/geminiService';
+import { AssetOrchestrator, PROVIDERS } from '../game/AssetOrchestrator';
 
 const BANNED_WORDS = ['fuck', 'shit', 'bitch', 'cunt', 'ass', 'dick', 'pussy', 'cock', 'nigger', 'faggot'];
 
@@ -25,6 +27,47 @@ const getRandomMode = (selectedMode) => {
 
 const getRandomDifficulty = () => {
   return Math.floor(Math.random() * 10) + 1;
+};
+
+const cropCanvasToContent = (canvas) => {
+  const ctx = canvas.getContext('2d');
+  const width = canvas.width;
+  const height = canvas.height;
+  const imgData = ctx.getImageData(0, 0, width, height);
+  const data = imgData.data;
+
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const alpha = data[(y * width + x) * 4 + 3];
+      if (alpha > 0) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+
+  // If fully transparent, don't crop
+  if (maxX === -1 || maxY === -1) {
+    return canvas;
+  }
+
+  const croppedWidth = maxX - minX + 1;
+  const croppedHeight = maxY - minY + 1;
+
+  const croppedCanvas = document.createElement('canvas');
+  croppedCanvas.width = croppedWidth;
+  croppedCanvas.height = croppedHeight;
+  const croppedCtx = croppedCanvas.getContext('2d');
+
+  croppedCtx.putImageData(ctx.getImageData(minX, minY, croppedWidth, croppedHeight), 0, 0);
+  return croppedCanvas;
 };
 
 const WORLDS = [
@@ -111,7 +154,49 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
   const [progress, setProgress] = useState(0);
   const [toastMessage, setToastMessage] = useState('');
   const [currentWorldIndex, setCurrentWorldIndex] = useState(0);
+  const [apiKey, setApiKey] = useState(() => localStorage.getItem('SEELE_API_KEY') || '');
   const formRef = useRef(null);
+  const [phaserLoaded, setPhaserLoaded] = useState(false);
+
+  useEffect(() => {
+    const handleFileComplete = (e) => {
+      const key = e.detail?.key;
+      setTerminalLogs(prev => [...prev, `[Asset Loader] Loaded asset texture: ${key}...`]);
+    };
+    const handleLoadComplete = () => {
+      setTerminalLogs(prev => [...prev, `[ENGINE] WebGL dynamic textures bound successfully.`]);
+      setPhaserLoaded(true);
+    };
+    
+    window.addEventListener('phaser-file-complete', handleFileComplete);
+    window.addEventListener('phaser-load-complete', handleLoadComplete);
+    
+    return () => {
+      window.removeEventListener('phaser-file-complete', handleFileComplete);
+      window.removeEventListener('phaser-load-complete', handleLoadComplete);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (phaserLoaded && transitionPhase === 'compiling') {
+      setProgress(100);
+      setTerminalLogs(prev => [...prev, '[ENGINE] World gate synchronized! Starting game...']);
+      
+      const fadeTimer = setTimeout(() => {
+        setTransitionPhase('fading');
+      }, 1000);
+
+      const doneTimer = setTimeout(() => {
+        setTransitionPhase('done');
+        onCompleteTransition();
+      }, 2000);
+
+      return () => {
+        clearTimeout(fadeTimer);
+        clearTimeout(doneTimer);
+      };
+    }
+  }, [phaserLoaded, transitionPhase]);
 
   useEffect(() => {
     if (transitionPhase !== 'idle') return;
@@ -174,21 +259,213 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
     processPrompt(exampleText);
   };
 
-  const startCompilationSequence = (newConfig, promptText) => {
+  const preloadDynamicAssets = async (urls, onProgress) => {
+    const keys = Object.keys(urls);
+    const preloadedImages = {};
+    let loadedCount = 0;
+
+    const seeleKey = import.meta.env.VITE_SEELE_API_KEY || localStorage.getItem('SEELE_API_KEY') || '';
+    if (!seeleKey.trim()) {
+      throw new Error('SEELE API Key is missing. Please set VITE_SEELE_API_KEY in your .env configuration.');
+    }
+
+    // Initialize SEELE AssetOrchestrator
+    const orchestrator = new AssetOrchestrator({
+      provider: PROVIDERS.SEELE_AI,
+      apiKey: seeleKey,
+      qualityMode: 'high',
+      parallelGeneration: true
+    });
+
+    const loadSingleAsset = async (key, url, attempt = 1) => {
+      try {
+        // Extract the original prompt from the Pollinations URL
+        let promptText = '';
+        try {
+          const urlDecoded = decodeURIComponent(url);
+          const match = urlDecoded.match(/\/prompt\/([^?]+)/);
+          if (match) {
+            promptText = match[1];
+          } else {
+            promptText = urlDecoded;
+          }
+        } catch (e) {
+          promptText = url;
+        }
+
+        console.log(`[SEELE AI] Generating asset "${key}" (Attempt ${attempt}/3). Prompt: "${promptText}"`);
+        onProgress(`[SEELE AI] Generating asset: ${key}...`, 75 + Math.round((loadedCount / keys.length) * 20));
+
+        // Use SEELE AssetOrchestrator to generate the asset
+        const result = await orchestrator.client.generateImage({
+          prompt: promptText,
+          width: key.startsWith('background') ? 1024 : (key === 'platform' ? 128 : 128),
+          height: key.startsWith('background') ? 512 : (key === 'platform' ? 64 : 128),
+          format: 'png',
+          transparent: key !== 'floor' && !key.startsWith('background'),
+          groundAligned: key === 'player' || key === 'enemy' || key === 'obstacle'
+        });
+
+        // Handle SEELE response
+        if (result.format === 'url') {
+          // SEELE returns URLs, load from URL
+          return new Promise((resolve, reject) => {
+            const tempImg = new Image();
+            tempImg.crossOrigin = 'anonymous';
+
+            tempImg.onload = () => {
+              // Create canvas to scale SEELE outputs to game-appropriate sizes
+              const canvas = document.createElement('canvas');
+              let targetW = 128;
+              let targetH = 128;
+
+              if (key.startsWith('background')) {
+                targetW = 1024;
+                targetH = 512;
+              } else if (key === 'floor') {
+                targetW = 128;
+                targetH = 128;
+              } else if (key === 'platform') {
+                targetW = 128;
+                targetH = 64;
+              } else if (key === 'player' || key === 'enemy' || key === 'obstacle') {
+                targetW = 128;
+                targetH = 128;
+              }
+
+              canvas.width = targetW;
+              canvas.height = targetH;
+              const ctx = canvas.getContext('2d');
+              
+              // Use high-quality bilinear scaling for AI-generated imagery (not true pixel art)
+              ctx.imageSmoothingEnabled = true;
+              ctx.imageSmoothingQuality = 'high';
+              
+              // Scale down image on canvas
+              ctx.drawImage(tempImg, 0, 0, targetW, targetH);
+
+              let finalCanvas = canvas;
+
+              // Apply white/off-white background removal for sprites and platforms
+              if (key === 'player' || key === 'enemy' || key === 'obstacle' || key === 'platform') {
+                const imgData = ctx.getImageData(0, 0, targetW, targetH);
+                const data = imgData.data;
+
+                // Threshold for detecting off-white/light-grey pixels
+                const threshold = 200;
+
+                for (let i = 0; i < data.length; i += 4) {
+                  const r = data[i];
+                  const g = data[i + 1];
+                  const b = data[i + 2];
+
+                  // If all channels are very bright, treat as background
+                  if (r >= threshold && g >= threshold && b >= threshold) {
+                    const avg = (r + g + b) / 3;
+                    
+                    if (avg > 240) {
+                      // Pure or nearly pure white -> fully transparent
+                      data[i + 3] = 0;
+                    } else {
+                      // Blend the edges: scale alpha smoothly between threshold (200) and 240
+                      const factor = (avg - threshold) / (240 - threshold);
+                      const alpha = Math.round(255 * (1 - factor));
+                      data[i + 3] = Math.min(data[i + 3], alpha);
+                    }
+                  }
+                }
+
+                ctx.putImageData(imgData, 0, 0);
+
+                // Auto-crop dynamic assets to trim transparent margin space
+                finalCanvas = cropCanvasToContent(canvas);
+              }
+
+              const finalImg = new Image();
+              finalImg.crossOrigin = 'anonymous';
+              
+              finalImg.onload = () => {
+                preloadedImages[key] = finalImg;
+                loadedCount++;
+                const progressVal = 75 + Math.round((loadedCount / keys.length) * 20);
+                onProgress(`[Google Imagen] Loaded and scaled asset: ${key} (${loadedCount}/${keys.length})...`, progressVal);
+                resolve({ success: true });
+              };
+
+              finalImg.onerror = () => {
+                reject(new Error(`Failed to load scaled image data URL for ${key}.`));
+              };
+
+              finalImg.src = finalCanvas.toDataURL();
+            };
+
+            tempImg.onerror = () => {
+              reject(new Error('Failed to load SEELE generated image.'));
+            };
+
+            tempImg.src = result.data;
+          });
+        } else if (result.format === 'base64') {
+          // Handle base64 response (fallback)
+          return new Promise((resolve, reject) => {
+            const tempImg = new Image();
+            tempImg.crossOrigin = 'anonymous';
+
+            tempImg.onload = () => {
+              preloadedImages[key] = tempImg;
+              loadedCount++;
+              const progressVal = 75 + Math.round((loadedCount / keys.length) * 20);
+              onProgress(`[SEELE AI] Loaded asset: ${key} (${loadedCount}/${keys.length})...`, progressVal);
+              resolve({ success: true });
+            };
+
+            tempImg.onerror = () => {
+              reject(new Error('Failed to parse SEELE base64 image data.'));
+            };
+
+            tempImg.src = `data:${result.mimeType};base64,${result.data}`;
+          });
+        }
+      } catch (err) {
+        if (attempt < 3) {
+          const nextAttempt = attempt + 1;
+          const warnMsg = `[SEELE AI] Retrying "${key}" (Attempt ${nextAttempt}/3) due to: ${err.message}`;
+          console.warn(warnMsg);
+          onProgress(warnMsg, 75 + Math.round((loadedCount / keys.length) * 20));
+
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          return loadSingleAsset(key, url, nextAttempt);
+        } else {
+          const errMsg = `[SEELE AI Error] Failed to generate dynamic asset "${key}" after 3 attempts.
+• Asset Key: "${key}"
+• Prompt: "${promptText}"
+• Failure Reason: ${err.message}`;
+          console.error(errMsg);
+          window.dispatchEvent(new CustomEvent('playmint-error', { detail: { message: errMsg } }));
+          throw new Error(errMsg);
+        }
+      }
+    };
+
+    await Promise.all(keys.map(key => loadSingleAsset(key, urls[key])));
+    return preloadedImages;
+  };
+
+  const startCompilationSequence = async (newConfig, promptText) => {
     if (isOverlay) {
-      // Overlay mode: direct basic expand transition
       setIsGenerating(true);
       setTransitionPhase('expanding');
+      const loadedImages = await preloadDynamicAssets(newConfig.dynamicAssetUrls, () => {});
       setTimeout(() => {
         setTransitionPhase('done');
-        onGenerate('custom', newConfig);
+        onGenerate('custom', { ...newConfig, preloadedImages: loadedImages });
       }, 700);
       return;
     }
 
-    // Fullscreen landing transition
     setIsGenerating(true);
     setTransitionPhase('compiling');
+    setPhaserLoaded(false);
     onStartTransition(newConfig);
 
     const displayPrompt = promptText ? `"${promptText.substring(0, 32)}"` : "Quick Start Preset";
@@ -204,131 +481,86 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
       ? `Jump: ${newConfig.actionJumpHeight || 550}px`
       : `Speed: ${newConfig.runSpeed || 400}px/s`;
 
-    const addLog = (logText, progressVal, delay) => {
-      setTimeout(() => {
+    setTerminalLogs([
+      "[SYSTEM] Booting PlayMint Generative Engine v2.0 with SEELE AI...",
+      `[PROMPT] Input -> ${displayPrompt}`,
+      `[THEME]  Mapping assets -> [${themeName} THEME, ${modeName}]`,
+      `[PHYSIC] Gravity: ${gravity}m/s² · ${speed} · Diff: ${difficulty}/10`,
+      "[ENGINE] Synchronizing WebGL canvas & establishing world gate...",
+      "[SEELE]  Starting SEELE AI asset generation..."
+    ]);
+    setProgress(75);
+
+    try {
+      const loadedImages = await preloadDynamicAssets(newConfig.dynamicAssetUrls, (logText, progressVal) => {
         setTerminalLogs(prev => [...prev, logText]);
         setProgress(progressVal);
-      }, delay);
-    };
+      });
 
-    addLog("[SYSTEM] Booting PlayMint Generative Engine v2.0...", 10, 0);
-    addLog(`[PROMPT] Parsed input -> ${displayPrompt}`, 30, 450);
-    addLog(`[THEME]  Mapping assets -> [${themeName} THEME, ${modeName}]`, 55, 900);
-    addLog(`[PHYSIC] Gravity: ${gravity}m/s² · ${speed} · Diff: ${difficulty}/10`, 80, 1350);
-    addLog("[ENGINE] Synchronizing WebGL canvas & establishing world gate...", 100, 1800);
-
-    // Fade out ScreenZero
-    setTimeout(() => {
-      setTransitionPhase('fading');
-    }, 2400);
-
-    // Complete transition and clean up
-    setTimeout(() => {
-      setTransitionPhase('done');
-      onCompleteTransition();
-    }, 3400);
+      setTerminalLogs(prev => [...prev, '[ENGINE] Booting game scene and registering WebGL textures...']);
+      onStartTransition({ ...newConfig, preloadedImages: loadedImages });
+    } catch (err) {
+      console.error('[Compilation Error] Preset loading failed:', err);
+      setIsGenerating(false);
+      setTransitionPhase('idle');
+      setProgress(0);
+    }
   };
 
-  const processPrompt = (input) => {
-    const text = input.toLowerCase().trim();
-
-    const isUnsafe = BANNED_WORDS.some(word => text.includes(word));
-    if (isUnsafe || text === '') {
+  const processPrompt = async (input) => {
+    const text = input.trim();
+    if (!text) {
       generateRandom();
       return;
     }
 
-    const result = parsePromptKeywords(text);
-    const mode = getRandomMode(selectedMode || result.mode);
-    const themeKey = result.themeKey || 'ice';
-    const secondaryThemeKey = result.secondaryThemeKey || null;
-
-    // Use currentConfig if overlay (to allow accumulation), otherwise start fresh from presets
-    const baseConfig = (isOverlay && currentConfig) ? currentConfig : GAME_PRESETS[mode];
-    const newConfig = { ...baseConfig };
-
-    // Set theme (only if matched or if not using overlay config)
-    if (result.themeKey || !(isOverlay && currentConfig)) {
-      newConfig.themeKey = themeKey;
-      newConfig.secondaryThemeKey = secondaryThemeKey;
-    }
-
-    // Apply difficulty cumulatively
-    let diff = baseConfig.difficulty || 5;
-    if (result.modifiers.isHard) {
-      diff = Math.min(diff + 2, 10);
-    } else if (result.modifiers.isSlow) {
-      diff = Math.max(diff - 2, 1);
-    }
-    newConfig.difficulty = diff;
-
-    const currentGameType = newConfig.gameType;
-
-    // Apply mode-specific physics & modifiers (Sync with App.jsx logic)
-    if (currentGameType === 'runner') {
-      const isModeChanging = result.mode && result.mode !== 'standard';
-      const isThemeChanging = result.themeKey && result.themeKey !== baseConfig.themeKey;
-      if (isModeChanging || isThemeChanging || !(isOverlay && currentConfig)) {
-        newConfig.runSpeed = 200 + (diff * 40);
-        newConfig.obstacleDelay = 2000 - (diff * 120);
-        newConfig.gravity = 1800;
-        newConfig.jumpForce = 750;
-      }
-
-      if (result.modifiers.highJump) {
-        newConfig.jumpForce = (newConfig.jumpForce || 750) + 250;
-      }
-      if (result.modifiers.isFast) {
-        newConfig.runSpeed = Math.min((newConfig.runSpeed || 400) + 200, 1000);
-      }
-      if (result.modifiers.isSlow) {
-        newConfig.runSpeed = Math.max((newConfig.runSpeed || 400) - 200, 150);
-      }
-      if (result.modifiers.isHard) {
-        newConfig.runSpeed = Math.min((newConfig.runSpeed || 850) + 150, 1000);
-        newConfig.gravity = (newConfig.gravity || 1800) + 500;
-        newConfig.obstacleDelay = Math.max((newConfig.obstacleDelay || 1200) - 400, 400);
-      }
-    } else if (currentGameType === 'action_quest' || currentGameType === 'platformer') {
-      const isModeChanging = result.mode && result.mode !== 'action_quest';
-      const isThemeChanging = result.themeKey && result.themeKey !== baseConfig.themeKey;
-      if (isModeChanging || isThemeChanging || !(isOverlay && currentConfig)) {
-        newConfig.actionEnemyCount = Math.floor(diff * 1.5);
-        newConfig.actionJumpHeight = 400 + (diff * 30);
-        newConfig.actionGravity = 1500;
-        newConfig.actionWalkSpeed = 300;
-      }
-
-      if (result.modifiers.highJump) {
-        newConfig.actionJumpHeight = (newConfig.actionJumpHeight || 550) + 200;
-      }
-      if (result.modifiers.isFast) {
-        newConfig.actionWalkSpeed = (newConfig.actionWalkSpeed || 300) + 100;
-      }
-      if (result.modifiers.isSlow) {
-        newConfig.actionEnemyCount = Math.max((newConfig.actionEnemyCount || 5) - 2, 0);
-        newConfig.actionGravity = Math.max((newConfig.actionGravity || 1400) - 300, 500);
-        newConfig.actionWalkSpeed = Math.max((newConfig.actionWalkSpeed || 300) - 80, 100);
-      }
-      if (result.modifiers.isHard) {
-        newConfig.actionEnemyCount = (newConfig.actionEnemyCount || 5) + 4;
-        newConfig.actionGravity = (newConfig.actionGravity || 1500) + 400;
-      }
-    }
-
-    if (result.modifiers.isLowGravity) {
-      if (currentGameType === 'runner') {
-        newConfig.gravity = Math.max((newConfig.gravity || 1800) - 400, 400);
-      } else {
-        newConfig.actionGravity = Math.max((newConfig.actionGravity || 1500) - 300, 300);
-      }
-    }
-
-    if (result.keywordsMatched === 0) {
+    const isUnsafe = BANNED_WORDS.some(word => text.toLowerCase().includes(word));
+    if (isUnsafe) {
       generateRandom();
-    } else {
-      newConfig.gameName = generateTitle(input, mode, themeKey);
-      startCompilationSequence(newConfig, input);
+      return;
+    }
+
+    if (isOverlay) {
+      setIsGenerating(true);
+      setTransitionPhase('expanding');
+      const result = await generateGameConfig(text);
+      const loadedImages = await preloadDynamicAssets(result.config.dynamicAssetUrls, () => {});
+      setTimeout(() => {
+        setTransitionPhase('done');
+        onGenerate('custom', { ...result.config, preloadedImages: loadedImages });
+      }, 700);
+      return;
+    }
+
+    console.log('[ScreenZero] Starting processPrompt compilation with prompt:', text);
+    setIsGenerating(true);
+    setTransitionPhase('compiling');
+    setTerminalLogs([]);
+    setProgress(0);
+    setPhaserLoaded(false);
+
+    try {
+      const result = await generateGameConfig(text, (logText, progressVal) => {
+        console.log(`[ScreenZero Progress Callback] Log: "${logText}", Progress: ${progressVal}%`);
+        setTerminalLogs(prev => [...prev, logText]);
+        setProgress(Math.min(progressVal, 70));
+      });
+
+      setTerminalLogs(prev => [...prev, '[ENGINE] Starting browser dynamic asset preloader...']);
+      setProgress(75);
+
+      const loadedImages = await preloadDynamicAssets(result.config.dynamicAssetUrls, (logText, progressVal) => {
+        setTerminalLogs(prev => [...prev, logText]);
+        setProgress(progressVal);
+      });
+
+      setTerminalLogs(prev => [...prev, '[ENGINE] Booting game scene and registering WebGL textures...']);
+      onStartTransition({ ...result.config, preloadedImages: loadedImages });
+    } catch (err) {
+      console.error('[Compilation Error] Game generation or preloading failed:', err);
+      setIsGenerating(false);
+      setTransitionPhase('idle');
+      setProgress(0);
     }
   };
 
@@ -343,6 +575,16 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
     config.themeKey = theme;
     
     config.gameName = generateTitle("", mode, theme);
+
+    const assets = {
+      background_far: `${theme} complete detailed scenery landscape background backdrop`,
+      floor: `${theme} soil ground surface texture`,
+      platform: `${theme} floating platform ledge block`,
+      player: `${mode === 'action_quest' ? 'adventurer explorer hero character' : 'runner speed runner athlete character'}`,
+      enemy: `${theme} themed basic monster creature enemy`,
+      obstacle: `${theme} hazard spike or barrier obstacle`
+    };
+    config.dynamicAssetUrls = compileAssetUrls(assets);
     
     startCompilationSequence(config, "Random Preset");
   };
@@ -452,6 +694,33 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
         bottom: '10%', right: '-5%', borderRadius: '50%', filter: 'blur(50px)',
         animation: 'float 18s infinite alternate-reverse', zIndex: 2
       }} />
+
+      {/* Top right settings and API key indicator */}
+      <div style={{ position: 'absolute', top: '16px', right: '16px', zIndex: 100, display: 'flex', gap: '8px' }}>
+        <button
+          onClick={!!import.meta.env.VITE_SEELE_API_KEY ? () => showToast("Using SEELE Key from environment (.env)") : () => {
+            const key = prompt("Enter your SEELE AI API Key (runs client-side only):", apiKey);
+            if (key !== null) {
+              const trimmed = key.trim();
+              localStorage.setItem('SEELE_API_KEY', trimmed);
+              setApiKey(trimmed);
+              showToast(trimmed ? "SEELE Key saved successfully!" : "SEELE Key removed.");
+            }
+          }}
+          style={{
+            background: (!!import.meta.env.VITE_SEELE_API_KEY || apiKey) ? 'rgba(162, 89, 255, 0.15)' : 'rgba(255,255,255,0.08)',
+            border: (!!import.meta.env.VITE_SEELE_API_KEY || apiKey) ? '1px solid #a259ff' : '1px solid rgba(255,255,255,0.15)',
+            color: (!!import.meta.env.VITE_SEELE_API_KEY || apiKey) ? '#a259ff' : '#fff',
+            fontSize: '13px',
+            fontWeight: '600',
+            padding: '8px 16px', borderRadius: '8px', cursor: 'pointer',
+            transition: 'all 0.2s', backdropFilter: 'blur(8px)',
+            display: 'flex', alignItems: 'center', gap: '6px'
+          }}
+        >
+          {!!import.meta.env.VITE_SEELE_API_KEY ? '✓ SEELE Key Detected' : (apiKey ? '🤖 SEELE Key Configured' : '🤖 Configure SEELE API Key')}
+        </button>
+      </div>
 
       {/* Close button for overlay */}
       {isOverlay && (

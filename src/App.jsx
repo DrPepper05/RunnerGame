@@ -5,7 +5,7 @@ import HudHeader from './components/HudHeader';
 import CreatorPanel from './components/CreatorPanel';
 import ScreenZero from './components/ScreenZero';
 import { GAME_PRESETS } from './gameConfig';
-import { parsePromptKeywords, generateTitle } from './game/promptUtils';
+import { generateGameConfig, compileAssetUrls } from './game/geminiService';
 import GameOverOverlay from './components/GameOverOverlay';
 import MobileControls from './components/MobileControls';
 
@@ -19,6 +19,21 @@ const getInitialState = () => {
         const importedConfig = JSON.parse(decodedConfigString);
         if (typeof importedConfig === 'object' && importedConfig !== null && Object.keys(importedConfig).length > 0) {
           if (!importedConfig.gameName) importedConfig.gameName = 'PlayMint Core';
+          if (!importedConfig.dynamicAssetUrls) {
+            const theme = importedConfig.themeKey || 'ice';
+            const mode = importedConfig.gameType || 'runner';
+            const assets = {
+              background_far: `${theme} sky with clouds and horizon`,
+              background_mid: `${theme} scenery landscape distant mountains or hills`,
+              background_near: `${theme} foreground elements silhouettes and structures`,
+              floor: `${theme} soil ground surface texture`,
+              platform: `${theme} floating platform ledge block`,
+              player: `${mode === 'platformer' ? 'adventurer explorer hero character' : 'runner speed runner athlete character'}`,
+              enemy: `${theme} themed basic monster creature enemy`,
+              obstacle: `${theme} hazard spike or barrier obstacle`
+            };
+            importedConfig.dynamicAssetUrls = compileAssetUrls(assets);
+          }
           return { presetKey: 'custom', liveParams: importedConfig, isImported: true };
         }
       } catch (error) {
@@ -26,7 +41,23 @@ const getInitialState = () => {
       }
     }
   }
-  return { presetKey: 'standard', liveParams: { ...GAME_PRESETS['standard'], gameName: 'PlayMint Core' }, isImported: false };
+
+  const initialPreset = { ...GAME_PRESETS['standard'], gameName: 'PlayMint Core' };
+  const theme = initialPreset.themeKey || 'ice';
+  const mode = initialPreset.gameType || 'runner';
+  const assets = {
+    background_far: `${theme} sky with clouds and horizon`,
+    background_mid: `${theme} scenery landscape distant mountains or hills`,
+    background_near: `${theme} foreground elements silhouettes and structures`,
+    floor: `${theme} soil ground surface texture`,
+    platform: `${theme} floating platform ledge block`,
+    player: `${mode === 'platformer' ? 'adventurer explorer hero character' : 'runner speed runner athlete character'}`,
+    enemy: `${theme} themed basic monster creature enemy`,
+    obstacle: `${theme} hazard spike or barrier obstacle`
+  };
+  initialPreset.dynamicAssetUrls = compileAssetUrls(assets);
+
+  return { presetKey: 'standard', liveParams: initialPreset, isImported: false };
 };
 
 function App() {
@@ -46,6 +77,32 @@ function App() {
   const [isGameOver, setIsGameOver] = useState(false);
   const [gameOverData, setGameOverData] = useState(null);
   const [gameKey, setGameKey] = useState(0);
+  const [activeError, setActiveError] = useState(null);
+
+  useEffect(() => {
+    const handlePlaymintError = (e) => {
+      const msg = e.detail?.message;
+      if (msg) {
+        setActiveError(msg);
+      }
+    };
+    window.addEventListener('playmint-error', handlePlaymintError);
+    return () => {
+      window.removeEventListener('playmint-error', handlePlaymintError);
+    };
+  }, []);
+
+  // Persist environment variables to localStorage on startup to prevent cached/stale build variables
+  useEffect(() => {
+    const geminiEnv = import.meta.env.VITE_GEMINI_API_KEY;
+    if (geminiEnv) {
+      localStorage.setItem('GEMINI_API_KEY', geminiEnv);
+    }
+    const polliEnv = import.meta.env.VITE_POLLINATIONS_API_KEY;
+    if (polliEnv) {
+      localStorage.setItem('POLLINATIONS_API_KEY', polliEnv);
+    }
+  }, []);
 
   // Detect touch device or narrow screen layout dynamically for mobile virtual D-pad
   useEffect(() => {
@@ -197,12 +254,26 @@ function App() {
 
   const applyPreset = (key) => {
     const mode = key === 'action_quest' ? 'action_quest' : 'standard';
+    const theme = 'ice';
+    const resolvedMode = key === 'action_quest' ? 'platformer' : 'runner';
+
+    const assets = {
+      background_far: `${theme} sky with clouds and horizon`,
+      background_mid: `${theme} scenery landscape distant mountains or hills`,
+      background_near: `${theme} foreground elements silhouettes and structures`,
+      floor: `${theme} soil ground surface texture`,
+      platform: `${theme} floating platform ledge block`,
+      player: `${resolvedMode === 'platformer' ? 'adventurer explorer hero character' : 'runner speed runner athlete character'}`,
+      enemy: `${theme} themed basic monster creature enemy`,
+      obstacle: `${theme} hazard spike or barrier obstacle`
+    };
 
     setPresetKey(key);
     setLiveParams({ 
       ...GAME_PRESETS[key], 
-      themeKey: 'ice',
-      gameName: generateTitle("", mode, 'ice') 
+      themeKey: theme,
+      gameName: generateTitle("", mode, theme),
+      dynamicAssetUrls: compileAssetUrls(assets)
     });
   };
 
@@ -246,7 +317,8 @@ function App() {
     setGameOverData(null);
   };
 
-  const handlePromptGenerate = (promptText) => {
+  const handlePromptGenerate = async (promptText) => {
+    console.log('[App.jsx] handlePromptGenerate triggered with prompt:', promptText);
     // Synchronously blur active elements immediately before closing menu / updating config
     if (document.activeElement && typeof document.activeElement.blur === 'function') {
       document.activeElement.blur();
@@ -254,94 +326,12 @@ function App() {
     const raw = promptText.trim();
     if (!raw) return;
 
-    const result = parsePromptKeywords(raw);
-    const currentGameType = liveParams.gameType;
-
-    // No keywords matched — nothing to change
-    if (result.keywordsMatched === 0) return;
-
-    // Start from current liveParams to preserve game state and context
-    const updatedConfig = { ...liveParams };
-
-    // Apply theme change (if detected)
-    if (result.themeKey) {
-      updatedConfig.themeKey = result.themeKey;
-    }
-
-    // Apply difficulty cumulatively
-    let diff = liveParams.difficulty || 5;
-    if (result.modifiers.isHard) {
-      diff = Math.min(diff + 2, 10);
-    } else if (result.modifiers.isSlow) {
-      diff = Math.max(diff - 2, 1);
-    }
-    updatedConfig.difficulty = diff;
-
-    // Apply mode-specific physics & modifiers
-    if (currentGameType === 'runner') {
-      // Base values for runner mode (resets ONLY if mode or theme changes)
-      const isModeChanging = result.mode && result.mode !== 'standard';
-      const isThemeChanging = result.themeKey && result.themeKey !== liveParams.themeKey;
-      if (isModeChanging || isThemeChanging) {
-        updatedConfig.runSpeed = 200 + (diff * 40);
-        updatedConfig.obstacleDelay = 2000 - (diff * 120);
-        updatedConfig.gravity = 1800;
-        updatedConfig.jumpForce = 750;
-      }
-      
-      if (result.modifiers.highJump) {
-        updatedConfig.jumpForce = (updatedConfig.jumpForce || 750) + 250;
-      }
-      if (result.modifiers.moreSpeed || result.modifiers.isFast) {
-        updatedConfig.runSpeed = Math.min((updatedConfig.runSpeed || 400) + 200, 1000);
-      }
-      if (result.modifiers.lessSpeed || result.modifiers.isSlow) {
-        updatedConfig.runSpeed = Math.max((updatedConfig.runSpeed || 400) - 200, 150);
-      }
-      if (result.modifiers.hardcore || result.modifiers.isHard) {
-        updatedConfig.runSpeed = Math.min((updatedConfig.runSpeed || 850) + 150, 1000);
-        updatedConfig.gravity = (updatedConfig.gravity || 1800) + 500;
-        updatedConfig.obstacleDelay = Math.max((updatedConfig.obstacleDelay || 1200) - 400, 400);
-      }
-    } else if (currentGameType === 'platformer') {
-      // Base values for platformer mode (resets ONLY if mode or theme changes)
-      const isModeChanging = result.mode && result.mode !== 'action_quest';
-      const isThemeChanging = result.themeKey && result.themeKey !== liveParams.themeKey;
-      if (isModeChanging || isThemeChanging) {
-        updatedConfig.actionEnemyCount = Math.floor(diff * 1.5);
-        updatedConfig.actionJumpHeight = 400 + (diff * 30);
-        updatedConfig.actionGravity = 1500;
-        updatedConfig.actionWalkSpeed = 300;
-      }
-      
-      if (result.modifiers.highJump) {
-        updatedConfig.actionJumpHeight = (updatedConfig.actionJumpHeight || 550) + 200;
-      }
-      if (result.modifiers.moreSpeed || result.modifiers.isFast) {
-        updatedConfig.actionWalkSpeed = (updatedConfig.actionWalkSpeed || 300) + 100;
-      }
-      if (result.modifiers.lessSpeed || result.modifiers.isSlow) {
-        updatedConfig.actionEnemyCount = Math.max((updatedConfig.actionEnemyCount || 5) - 2, 0);
-        updatedConfig.actionGravity = Math.max((updatedConfig.actionGravity || 1400) - 300, 500);
-        updatedConfig.actionWalkSpeed = Math.max((updatedConfig.actionWalkSpeed || 300) - 80, 100);
-      }
-      if (result.modifiers.hardcore || result.modifiers.isHard) {
-        updatedConfig.actionEnemyCount = (updatedConfig.actionEnemyCount || 5) + 4;
-        updatedConfig.actionGravity = (updatedConfig.actionGravity || 1500) + 400;
-      }
-    }
-
-    if (result.modifiers.isLowGravity) {
-      if (currentGameType === 'runner') {
-        updatedConfig.gravity = Math.max((updatedConfig.gravity || 1800) - 400, 400);
-      } else {
-        updatedConfig.actionGravity = Math.max((updatedConfig.actionGravity || 1500) - 300, 300);
-      }
-    }
-
-    // Generate title from prompt based on current mode
-    const currentMode = currentGameType === 'platformer' ? 'action_quest' : 'standard';
-    updatedConfig.gameName = generateTitle(raw, currentMode, updatedConfig.themeKey);
+    console.log('[App.jsx] Calling generateGameConfig...');
+    const result = await generateGameConfig(raw, (logText, progressVal) => {
+      console.log(`[App.jsx Config Progress] ${progressVal}% - ${logText}`);
+    });
+    const updatedConfig = result.config;
+    console.log('[App.jsx] Received updated game config:', updatedConfig);
 
     // Apply — force fresh Phaser instance
     setGameKey(k => k + 1);
@@ -477,6 +467,102 @@ function App() {
           isOverlay
           currentConfig={liveParams}
         />
+      )}
+
+      {activeError && (
+        <div style={{
+          position: 'fixed', inset: 0,
+          background: 'rgba(0,0,0,0.85)',
+          display: 'flex', justifyContent: 'center', alignItems: 'center',
+          zIndex: 99999, backdropFilter: 'blur(12px)',
+          pointerEvents: 'auto'
+        }}>
+          <div style={{
+            background: 'var(--pm-bg-dark, #060a10)',
+            border: '2px solid #ff453a',
+            borderRadius: '16px',
+            padding: '24px',
+            width: '90%',
+            maxWidth: '500px',
+            boxShadow: '0 20px 40px rgba(0,0,0,0.5), 0 0 30px rgba(255, 69, 58, 0.15)',
+            textAlign: 'left',
+            color: '#fff',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '16px'
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+              <span style={{ fontSize: '24px' }}>⚠️</span>
+              <h3 style={{ margin: 0, color: '#ff453a', fontFamily: 'var(--font-heading, sans-serif)', fontSize: '18px', fontWeight: '800', letterSpacing: '0.5px' }}>
+                RUNTIME ERROR DETECTED
+              </h3>
+            </div>
+            
+            <p style={{ margin: 0, color: 'var(--pm-text-secondary, #8e9cae)', fontSize: '13px', lineHeight: '1.4' }}>
+              An error occurred during world compilation or asset loading. You can copy the diagnostic details below to share:
+            </p>
+
+            <div style={{
+              background: 'rgba(255,255,255,0.03)',
+              border: '1px solid rgba(255,255,255,0.08)',
+              borderRadius: '8px',
+              padding: '14px',
+              maxHeight: '180px',
+              overflowY: 'auto',
+              fontFamily: 'monospace',
+              fontSize: '12px',
+              lineHeight: '1.5',
+              whiteSpace: 'pre-wrap',
+              color: '#ff453a'
+            }}>
+              {activeError}
+            </div>
+
+            <div style={{ display: 'flex', gap: '12px', marginTop: '8px' }}>
+              <button
+                onClick={() => {
+                  navigator.clipboard.writeText(activeError);
+                  alert('Error details copied to clipboard!');
+                }}
+                style={{
+                  flex: 1,
+                  background: '#ff453a',
+                  border: 'none',
+                  color: '#fff',
+                  padding: '10px 16px',
+                  borderRadius: '8px',
+                  cursor: 'pointer',
+                  fontWeight: '600',
+                  fontSize: '14px',
+                  transition: 'background 0.2s'
+                }}
+                onMouseEnter={(e) => e.target.style.background = '#ff3b30'}
+                onMouseLeave={(e) => e.target.style.background = '#ff453a'}
+              >
+                Copy Details
+              </button>
+              
+              <button
+                onClick={() => setActiveError(null)}
+                style={{
+                  background: 'rgba(255,255,255,0.08)',
+                  border: '1px solid rgba(255,255,255,0.15)',
+                  color: '#fff',
+                  padding: '10px 20px',
+                  borderRadius: '8px',
+                  cursor: 'pointer',
+                  fontWeight: '600',
+                  fontSize: '14px',
+                  transition: 'background 0.2s'
+                }}
+                onMouseEnter={(e) => e.target.style.background = 'rgba(255,255,255,0.15)'}
+                onMouseLeave={(e) => e.target.style.background = 'rgba(255,255,255,0.08)'}
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
     </div>

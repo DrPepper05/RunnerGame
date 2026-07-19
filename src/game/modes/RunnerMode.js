@@ -57,7 +57,7 @@ export default class RunnerMode extends BaseMode {
 
     const scale = Phaser.Math.FloatBetween(this.scene.gameConfig.obstacleScaleMin || 0.8, this.scene.gameConfig.obstacleScaleMax || 1.2);
     const spawnX = this.scene.cameras.main.scrollX + this.scene.cameras.main.width + 16;
-    const obstacleTexture = this.scene.activeTheme?.obstacleTexture || 'crate';
+    const obstacleTexture = this.scene.gameConfig.dynamicAssetUrls ? 'dyn_obstacle' : (this.scene.activeTheme?.obstacleTexture || 'crate');
 
     // Obtain frame dimensions for proper obstacle scaling normalization
     const textureObj = this.scene.textures.get(obstacleTexture);
@@ -65,7 +65,7 @@ export default class RunnerMode extends BaseMode {
     const frameWidth = frame ? frame.width : 64;
     const frameHeight = frame ? frame.height : 64;
 
-    const targetSize = 64;
+    const targetSize = this.scene.gameConfig.dynamicAssetUrls ? 54 : 64;
     const normalizedScaleX = (targetSize / frameWidth) * scale;
     const normalizedScaleY = (targetSize / frameHeight) * scale;
 
@@ -74,6 +74,11 @@ export default class RunnerMode extends BaseMode {
     obstacle.setScale(normalizedScaleX, normalizedScaleY);
     this.scene.physics.add.existing(obstacle);
     this.obstacles.add(obstacle);
+
+    if (this.scene.gameConfig.dynamicAssetUrls) {
+      obstacle.body.setSize(obstacle.width, obstacle.height);
+      obstacle.body.setOffset(0, 0);
+    }
 
     const theme = this.scene.activeTheme || {};
     obstacle.body.setGravityY(this.scene.gameConfig.gravity || (theme.gravity || 1800));
@@ -125,149 +130,14 @@ export default class RunnerMode extends BaseMode {
     }
   }
 
-  generateMobileIcons() {
-    const iconSize = 64;
-    const h = iconSize / 2;
-
-    const makeIcon = (key, draw) => {
-      const g = this.scene.make.graphics({ add: false });
-      draw(g, h);
-      g.generateTexture(key, iconSize, iconSize);
-      g.destroy();
-    };
-
-    // Jump: upward chevron arrow with base line
-    makeIcon('icon_jump', (g, c) => {
-      g.fillStyle(0xffffff, 1);
-      // Arrow head (chevron)
-      g.fillTriangle(c, c - 18, c - 16, c + 4, c + 16, c + 4);
-      // Arrow shaft
-      g.fillRect(c - 5, c + 4, 10, 18);
-      // Base line
-      g.fillRect(c - 12, c + 22, 24, 4);
-    });
-  }
-
-  createMobileButton(x, y, textureKey, size, onPress, onRelease) {
-    const btn = this.scene.add.image(x, y, textureKey)
-      .setDepth(100)
-      .setAlpha(0.65)
-      .setScale(size / 64)
-      .setInteractive({ useHandCursor: false })
-      .on('pointerdown', (pointer, localX, localY, event) => {
-        event.stopPropagation();
-        btn.setAlpha(1);
-        if (onPress) onPress(pointer);
-      })
-      .on('pointerup', (pointer) => {
-        btn.setAlpha(0.65);
-        if (onRelease) onRelease(pointer);
-      })
-      .on('pointerupoutside', (pointer) => {
-        btn.setAlpha(0.65);
-        if (onRelease) onRelease(pointer);
-      })
-      .on('pointerout', () => {
-        btn.setAlpha(0.65);
-      });
-
-    this.uiContainer.add(btn);
-    this.mobileControls.push(btn);
-    return btn;
-  }
-
-  createMobileControls() {
-    const isTouch = this.scene.sys.game.device.input.touch;
-    if (!isTouch && this.scene.scale.width > 1024) return;
-
-    if (!this.scene.textures.exists('icon_jump')) {
-      this.generateMobileIcons();
-    }
-
-    this.uiContainer = this.scene.add.container(0, 0)
-      .setDepth(100)
-      .setScrollFactor(0);
-
-    const btnSize = 56;
-
-    this.btnJump = this.createMobileButton(0, 0, 'icon_jump', btnSize,
-      () => this.jump()
-    );
-
-    const camera = this.scene.cameras.main;
-    this.updateMobileControlSizing(camera.width, camera.height);
-    this.repositionMobileControls(camera.width, camera.height);
-  }
-
-  updateMobileControlSizing(screenWidth, screenHeight) {
-    const minSide = Math.min(screenWidth, screenHeight);
-    const baseSize = Phaser.Math.Clamp(Math.round(minSide * 0.12), 44, 64);
-    const marginScreen = Math.round(baseSize * 0.45);
-    const gapScreen = Math.round(baseSize * 0.3);
-
-    this.mobileLayout = {
-      marginScreen,
-      gapScreen,
-      targetSize: baseSize
-    };
-
-    // Apply scale to all image-based buttons
-    const scale = baseSize / 64;
-    this.mobileControls.forEach((btn) => {
-      if (btn) btn.setScale(scale);
-    });
-
-    this.refreshMobileHitAreas();
-  }
-
-  refreshMobileHitAreas() {
-    const HIT_PAD = 12;
-    this.mobileControls.forEach((btn) => {
-      if (!btn) return;
-      const w = btn.width;
-      const h = btn.height;
-      btn.disableInteractive();
-      btn.setInteractive(
-        new Phaser.Geom.Rectangle(-HIT_PAD, -HIT_PAD, w + HIT_PAD * 2, h + HIT_PAD * 2),
-        Phaser.Geom.Rectangle.Contains
-      );
-    });
-  }
-
-  repositionMobileControls(screenWidth, screenHeight) {
-    const safeBottomInset = window?.__pmSafeAreaBottom || 0;
-    const safeRightInset = window?.__pmSafeAreaRight || 0;
-    const safeTopInset = window?.__pmSafeAreaTop || 0;
-
-    const margin = this.mobileLayout?.marginScreen || 28;
-    const gap = this.mobileLayout?.gapScreen || 12;
-    const btnSize = this.mobileLayout?.targetSize || 64;
-    const safeRight = safeRightInset + 12;
-    const safeBottom = safeBottomInset + 12;
-
-    const rightNudge = Math.round(gap * 0.6);
-    const rightEdgeX = screenWidth - safeRight - margin + rightNudge;
-    const bottomCenter = screenHeight - safeBottom - btnSize / 2;
-
-    if (this.btnJump) this.btnJump.setPosition(rightEdgeX - btnSize / 2, bottomCenter);
-
-    // Safety: ensure buttons don't overlap the top safe area
-    const topLimit = safeTopInset + margin + btnSize / 2;
-    if (bottomCenter < topLimit) {
-      const shift = topLimit - bottomCenter;
-      if (this.btnJump) this.btnJump.setY(bottomCenter + shift);
-    }
-  }
-
   handleResize(gameSize) {
     if (!this.scene || !this.scene.cameras || !this.scene.cameras.main) return;
     const safeWidth = Math.max(1, gameSize.width);
     const safeHeight = Math.max(1, gameSize.height);
-    const camera = this.scene.cameras.main;
-    const viewWidth = camera.width || safeWidth;
-    const viewHeight = camera.height || safeHeight;
-    this.updateMobileControlSizing(viewWidth, viewHeight);
-    this.repositionMobileControls(viewWidth, viewHeight);
+    
+    if (this.scene.cameraManager) {
+      this.scene.cameraManager.handleResize({ width: safeWidth, height: safeHeight });
+    }
   }
 
   onConfigUpdate(newConfig, oldConfig) {
@@ -315,11 +185,6 @@ export default class RunnerMode extends BaseMode {
       window.removeEventListener('game-input', this.gameInputListener);
       this.gameInputListener = null;
     }
-
-    this.mobileControls = [];
-    if (this.uiContainer && this.uiContainer.scene) {
-      this.uiContainer.destroy();
-      this.uiContainer = null;
-    }
   }
 }
+

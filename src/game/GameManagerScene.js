@@ -2,6 +2,11 @@ import Phaser from 'phaser';
 import { DEFAULT_CONFIG } from '../gameConfig';
 import { getTheme } from './themes';
 import GameModeManager from './GameModeManager';
+import MultiCameraManager from './MultiCameraManager';
+import { compileAssetUrls } from './geminiService';
+import ParallaxGroundSystem from './ParallaxGroundSystem';
+import SpriteAlignmentManager from './SpriteAlignmentManager';
+
 
 export default class GameManagerScene extends Phaser.Scene {
   constructor() {
@@ -9,6 +14,60 @@ export default class GameManagerScene extends Phaser.Scene {
   }
 
   preload() {
+    // Configure Phaser loader to handle cross-origin image requests
+    this.load.crossOrigin = 'anonymous';
+
+    // Hook loader listeners for rich console debugging and UI synchronization
+    this.load.on('loaderror', (fileObj) => {
+      const errorMsg = `Phaser Preloader failed to load asset key "${fileObj.key}" from URL: ${fileObj.url}`;
+      console.error('[Phaser Preloader Error]', errorMsg);
+      window.dispatchEvent(new CustomEvent('playmint-error', { detail: { message: errorMsg } }));
+    });
+
+    this.load.on('filecomplete', (key, type, data) => {
+      console.log(`[Phaser Preloader Success] Successfully loaded asset: "${key}" (${type})`);
+      window.dispatchEvent(new CustomEvent('phaser-file-complete', { detail: { key } }));
+    });
+
+    this.load.on('complete', () => {
+      console.log('[Phaser Preloader Complete] All queued assets loaded.');
+      window.dispatchEvent(new CustomEvent('phaser-load-complete'));
+    });
+
+    const hasPreloaded = !!this.gameConfig?.preloadedImages;
+    if (hasPreloaded) {
+      console.log('[Phaser Preloader] Dynamic assets already registered via browser preloader. Bypassing loader requests.');
+    } else {
+      // Guarantee that dynamicAssetUrls is always present
+      if (!this.gameConfig?.dynamicAssetUrls) {
+        console.warn('[Phaser Preloader] Config missing dynamicAssetUrls. Compiling fallback assets on the fly...');
+        const theme = this.gameConfig?.themeKey || 'ice';
+        const mode = this.gameConfig?.gameType || 'runner';
+        const assets = {
+          background_far: `${theme} complete detailed scenery landscape background backdrop`,
+          floor: `${theme} soil ground surface texture`,
+          platform: `${theme} floating platform ledge block`,
+          player: `${mode === 'platformer' ? 'adventurer explorer hero character' : 'runner speed runner athlete character'}`,
+          enemy: `${theme} themed basic monster creature enemy`,
+          obstacle: `${theme} hazard spike or barrier obstacle`
+        };
+        if (this.gameConfig) {
+          this.gameConfig.dynamicAssetUrls = compileAssetUrls(assets);
+        }
+      }
+
+      const urls = this.gameConfig?.dynamicAssetUrls;
+      if (urls) {
+        console.log('[Phaser Preloader] Loading dynamic assets:', urls);
+        if (urls.background_far) this.load.image('dyn_bg_far', urls.background_far);
+        if (urls.floor) this.load.image('dyn_floor', urls.floor);
+        if (urls.platform) this.load.image('dyn_platform', urls.platform);
+        if (urls.player) this.load.image('dyn_player', urls.player);
+        if (urls.enemy) this.load.image('dyn_enemy', urls.enemy);
+        if (urls.obstacle) this.load.image('dyn_obstacle', urls.obstacle);
+      }
+    }
+
     this.load.spritesheet('dude', 'assets/dude.png', { frameWidth: 32, frameHeight: 48 });
     this.load.atlas('fox', 'assets/atlas/atlas.png', 'assets/atlas/atlas.json');
     this.load.image('crate', 'assets/crate.png');
@@ -66,6 +125,30 @@ export default class GameManagerScene extends Phaser.Scene {
       ...data
     };
 
+    // Register preloaded HTML images into Phaser's Texture Manager
+    const preloaded = this.gameConfig?.preloadedImages;
+    if (preloaded) {
+      console.log('[Phaser GameManagerScene] Registering preloaded HTML images into Texture Manager:', Object.keys(preloaded));
+      
+      const textureMap = {
+        background_far: 'dyn_bg_far',
+        floor: 'dyn_floor',
+        platform: 'dyn_platform',
+        player: 'dyn_player',
+        enemy: 'dyn_enemy',
+        obstacle: 'dyn_obstacle'
+      };
+
+      Object.entries(preloaded).forEach(([key, img]) => {
+        const textureKey = textureMap[key] || key;
+        if (this.textures.exists(textureKey)) {
+          this.textures.remove(textureKey);
+        }
+        this.textures.addImage(textureKey, img);
+        console.log(`[Phaser GameManagerScene] Successfully registered preloaded texture: "${textureKey}"`);
+      });
+    }
+
     this.gameModeManager = new GameModeManager(this);
   }
 
@@ -85,6 +168,10 @@ export default class GameManagerScene extends Phaser.Scene {
 
     this.LOGICAL_FLOOR_Y = 1000;
     const floorHeight = this.secondaryTheme?.floorHeight || this.activeTheme.floorHeight || this.gameConfig.floorHeight || 100;
+
+    // Initialize improvement systems
+    this.parallaxSystem = new ParallaxGroundSystem(this);
+    this.alignmentManager = new SpriteAlignmentManager(this);
 
     // Create a smooth background gradient
     this.bgGraphics = this.add.graphics();
@@ -110,8 +197,8 @@ export default class GameManagerScene extends Phaser.Scene {
 
     // Floor - Make it wide enough to cover the world width if we are in platformer mode.
     const floorWidth = this.gameConfig.gameType === 'platformer' ? 4000 : Math.max(width * 2, 4000);
-    const floorTexture = this.secondaryTheme?.floorTexture || this.activeTheme.floorTexture || 'ground';
-    const floorFrameIndex = this.secondaryTheme?.floorFrame !== undefined ? this.secondaryTheme.floorFrame : (this.activeTheme.floorFrame !== undefined ? this.activeTheme.floorFrame : 0);
+    const floorTexture = this.gameConfig.dynamicAssetUrls ? 'dyn_floor' : (this.secondaryTheme?.floorTexture || this.activeTheme.floorTexture || 'ground');
+    const floorFrameIndex = this.gameConfig.dynamicAssetUrls ? 0 : (this.secondaryTheme?.floorFrame !== undefined ? this.secondaryTheme.floorFrame : (this.activeTheme.floorFrame !== undefined ? this.activeTheme.floorFrame : 0));
     const textureObj = this.textures.get(floorTexture);
     const frame = textureObj?.get(floorFrameIndex);
 
@@ -134,8 +221,8 @@ export default class GameManagerScene extends Phaser.Scene {
     } else {
       this.floor = this.add.tileSprite(0, this.LOGICAL_FLOOR_Y, floorWidth, floorHeight, floorTexture, floorFrameIndex).setOrigin(0, 0);
       const themeTileScale = this.secondaryTheme?.floorTileScale || this.activeTheme.floorTileScale || 0.15;
-      this.floor.tileScaleX = this.gameConfig.floorTileScale || themeTileScale;
-      this.floor.tileScaleY = this.gameConfig.floorTileScale || themeTileScale;
+      this.floor.tileScaleX = this.gameConfig.dynamicAssetUrls ? 1.0 : (this.gameConfig.floorTileScale || themeTileScale);
+      this.floor.tileScaleY = this.gameConfig.dynamicAssetUrls ? 1.0 : (this.gameConfig.floorTileScale || themeTileScale);
     }
     this.physics.add.existing(this.floor, true); // Static
 
@@ -251,7 +338,10 @@ export default class GameManagerScene extends Phaser.Scene {
     
     let playerTexture = playerType;
     let playerFrame = undefined;
-    if (playerType === 'yeti') {
+    if (this.gameConfig.dynamicAssetUrls) {
+      playerTexture = 'dyn_player';
+      playerFrame = undefined;
+    } else if (playerType === 'yeti') {
       playerTexture = 'fox';
       playerFrame = 'yeti-1';
     } else if (playerType === 'fox') {
@@ -260,22 +350,55 @@ export default class GameManagerScene extends Phaser.Scene {
     }
     
     this.player = this.physics.add.sprite(playerX, this.LOGICAL_FLOOR_Y - playerYOffset, playerTexture, playerFrame);
-    this.player.setScale(this.gameConfig.playerScale || (playerType === 'fox' || playerType === 'yeti' ? 1.8 : 1.5));
+    let scale = this.gameConfig.playerScale || (playerType === 'fox' || playerType === 'yeti' ? 1.8 : 1.5);
+    if (this.gameConfig.dynamicAssetUrls) {
+      const textureObj = this.textures.get('dyn_player');
+      const frame = textureObj?.get(0);
+      const h = frame ? frame.height : 128;
+      // Target a standardized height of 64px
+      scale = 64 / h;
+    }
+    this.player.setScale(scale);
 
-    // Set precise hitbox size and offsets to resolve asset alignment issue (floating/clipping)
-    if (playerType === 'fox') {
-      this.player.body.setSize(24, 25);
-      this.player.body.setOffset(14, 18);
-    } else if (playerType === 'yeti') {
-      this.player.body.setSize(26, 28);
-      this.player.body.setOffset(4, 5);
+    // Use SpriteAlignmentManager for better ground contact
+    if (this.alignmentManager && this.gameConfig.dynamicAssetUrls) {
+      // Apply intelligent alignment for dynamic assets
+      this.alignmentManager.initializeSprite(this.player, {
+        type: 'character',
+        groundY: this.LOGICAL_FLOOR_Y,
+        facing: 'right',
+        anchor: 'bottom-center',
+        autoScale: false // We already scaled it above
+      });
     } else {
-      // dude
-      this.player.body.setSize(20, 42);
-      this.player.body.setOffset(6, 6);
+      // Set precise hitbox size and offsets for static assets
+      if (this.gameConfig.dynamicAssetUrls) {
+        // Cropped textures fit the character content tightly, so use full texture bounds with zero offset
+        this.player.body.setSize(this.player.width, this.player.height);
+        this.player.body.setOffset(0, 0);
+        // Ensure the player faces right (prompts request right-facing sprites)
+        this.player.setFlipX(false);
+      } else if (playerType === 'fox') {
+        this.player.body.setSize(24, 25);
+        this.player.body.setOffset(14, 18);
+      } else if (playerType === 'yeti') {
+        this.player.body.setSize(26, 28);
+        this.player.body.setOffset(4, 5);
+      } else {
+        // dude
+        this.player.body.setSize(20, 42);
+        this.player.body.setOffset(6, 6);
+      }
     }
 
     this.physics.add.collider(this.player, this.floor);
+
+    // Initialize Multi-Camera Manager
+    this.cameraManager = new MultiCameraManager(this);
+    const cameraMode = this.gameConfig.gameType === 'runner' 
+      ? 'side-scrolling' 
+      : (this.gameConfig.gameType === 'platformer' ? 'follow-target' : 'fixed-arena');
+    this.cameraManager.setMode(cameraMode, this.player);
 
     // Core game mode handling
     this.gameModeManager.setMode(this.gameConfig.gameType);
@@ -435,7 +558,13 @@ export default class GameManagerScene extends Phaser.Scene {
     const theme = this.activeTheme || getTheme(this.gameConfig.themeKey);
     const width = this.scale.width;
     const height = this.scale.height;
-    const layers = theme.backgroundLayers || [];
+    
+    let layers = theme.backgroundLayers || [];
+    if (this.gameConfig.dynamicAssetUrls) {
+      layers = [
+        { key: 'dyn_bg_far', speed: 0.02, scale: 1 }
+      ];
+    }
 
     layers.forEach((layer) => {
       const texture = this.textures.get(layer.key);
@@ -476,11 +605,14 @@ export default class GameManagerScene extends Phaser.Scene {
       const width = Math.max(1, this.scale.width);
       const height = Math.max(1, this.scale.height);
 
-      // Force the viewport to update to the new valid dimensions
-      this.cameras.main.setViewport(0, 0, width, height);
+      // Delegate resizing to Multi-Camera Manager
+      if (this.cameraManager) {
+        this.cameraManager.handleResize({ width, height });
+      } else {
+        this.cameras.main.setViewport(0, 0, width, height);
+      }
 
-      const zoomFactor = 1;
-      this.cameras.main.setZoom(zoomFactor);
+      const zoomFactor = this.cameras.main.zoom;
 
       this.drawBackground(width, height);
       if (this.bgLayers && this.bgLayers.length) {
@@ -503,8 +635,8 @@ export default class GameManagerScene extends Phaser.Scene {
       if (this.floorSegments && this.floorSegments.length) {
         const floorWidth = this.gameConfig.gameType === 'platformer' ? 4000 : Math.max(width * 4, 1600);
         const floorHeight = this.activeTheme?.floorHeight || this.gameConfig.floorHeight || 100;
-        const floorTexture = this.activeTheme.floorTexture || 'ground';
-        const floorFrameIndex = this.activeTheme.floorFrame !== undefined ? this.activeTheme.floorFrame : 0;
+        const floorTexture = this.gameConfig.dynamicAssetUrls ? 'dyn_floor' : (this.activeTheme.floorTexture || 'ground');
+        const floorFrameIndex = this.gameConfig.dynamicAssetUrls ? 0 : (this.activeTheme.floorFrame !== undefined ? this.activeTheme.floorFrame : 0);
         const textureObj = this.textures.get(floorTexture);
         const frame = textureObj?.get(floorFrameIndex);
 
@@ -536,17 +668,16 @@ export default class GameManagerScene extends Phaser.Scene {
         this.gameModeManager.handleResize({ width, height });
       }
 
-      // Center camera onto the absolute static floor if in Runner Mode.
-      // In Platformer mode, the camera follows the player, so it naturally handles its own scroll Y.
-      if (this.gameConfig.gameType === 'runner') {
-        const floorHeight = this.gameConfig.floorHeight || 100;
-        this.cameras.main.scrollY = (this.LOGICAL_FLOOR_Y + floorHeight) - height;
-      }
-
     }, 150);
   }
 
   playPlayerAnim(animName) {
+    if (this.gameConfig.dynamicAssetUrls) {
+      if (this.player && this.player.anims) {
+        this.player.anims.stop();
+      }
+      return;
+    }
     const playerType = this.activeTheme.playerType || 'dude';
     if (playerType === 'fox') {
       if (animName === 'run') {
@@ -634,7 +765,17 @@ export default class GameManagerScene extends Phaser.Scene {
 
   update(time, delta) {
     if (this.isGameOver || this.isGamePaused) return;
-    
+
+    // Update parallax backgrounds if enabled
+    if (this.parallaxSystem) {
+      this.parallaxSystem.update(time, delta);
+    }
+
+    // Update sprite alignment if needed
+    if (this.alignmentManager && this.player && this.player.body) {
+      this.alignmentManager.updateFacing(this.player, this.player.body.velocity.x);
+    }
+
     if (this.gameConfig.gameType === 'runner') {
        this.virtualScrollX = (this.virtualScrollX || 0) + (this.gameModeManager?.activeMode?.runSpeed || this.gameConfig.runSpeed) * (delta / 1000);
     }
