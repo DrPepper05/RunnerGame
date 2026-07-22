@@ -5,7 +5,9 @@ import HudHeader from './components/HudHeader';
 import CreatorPanel from './components/CreatorPanel';
 import ScreenZero from './components/ScreenZero';
 import { GAME_PRESETS } from './gameConfig';
-import { generateGameConfig, compileAssetUrls } from './game/geminiService';
+import { generateGameConfig } from './game/geminiService';
+import { generateGameAssets, compileFallbackUrls } from './game/assetPipeline';
+import { generateTitle } from './game/promptUtils';
 import GameOverOverlay from './components/GameOverOverlay';
 import MobileControls from './components/MobileControls';
 
@@ -20,19 +22,7 @@ const getInitialState = () => {
         if (typeof importedConfig === 'object' && importedConfig !== null && Object.keys(importedConfig).length > 0) {
           if (!importedConfig.gameName) importedConfig.gameName = 'PlayMint Core';
           if (!importedConfig.dynamicAssetUrls) {
-            const theme = importedConfig.themeKey || 'ice';
-            const mode = importedConfig.gameType || 'runner';
-            const assets = {
-              background_far: `${theme} sky with clouds and horizon`,
-              background_mid: `${theme} scenery landscape distant mountains or hills`,
-              background_near: `${theme} foreground elements silhouettes and structures`,
-              floor: `${theme} soil ground surface texture`,
-              platform: `${theme} floating platform ledge block`,
-              player: `${mode === 'platformer' ? 'adventurer explorer hero character' : 'runner speed runner athlete character'}`,
-              enemy: `${theme} themed basic monster creature enemy`,
-              obstacle: `${theme} hazard spike or barrier obstacle`
-            };
-            importedConfig.dynamicAssetUrls = compileAssetUrls(assets);
+            importedConfig.dynamicAssetUrls = compileFallbackUrls(importedConfig);
           }
           return { presetKey: 'custom', liveParams: importedConfig, isImported: true };
         }
@@ -43,19 +33,7 @@ const getInitialState = () => {
   }
 
   const initialPreset = { ...GAME_PRESETS['standard'], gameName: 'PlayMint Core' };
-  const theme = initialPreset.themeKey || 'ice';
-  const mode = initialPreset.gameType || 'runner';
-  const assets = {
-    background_far: `${theme} sky with clouds and horizon`,
-    background_mid: `${theme} scenery landscape distant mountains or hills`,
-    background_near: `${theme} foreground elements silhouettes and structures`,
-    floor: `${theme} soil ground surface texture`,
-    platform: `${theme} floating platform ledge block`,
-    player: `${mode === 'platformer' ? 'adventurer explorer hero character' : 'runner speed runner athlete character'}`,
-    enemy: `${theme} themed basic monster creature enemy`,
-    obstacle: `${theme} hazard spike or barrier obstacle`
-  };
-  initialPreset.dynamicAssetUrls = compileAssetUrls(assets);
+  initialPreset.dynamicAssetUrls = compileFallbackUrls(initialPreset);
 
   return { presetKey: 'standard', liveParams: initialPreset, isImported: false };
 };
@@ -257,23 +235,12 @@ function App() {
     const theme = 'ice';
     const resolvedMode = key === 'action_quest' ? 'platformer' : 'runner';
 
-    const assets = {
-      background_far: `${theme} sky with clouds and horizon`,
-      background_mid: `${theme} scenery landscape distant mountains or hills`,
-      background_near: `${theme} foreground elements silhouettes and structures`,
-      floor: `${theme} soil ground surface texture`,
-      platform: `${theme} floating platform ledge block`,
-      player: `${resolvedMode === 'platformer' ? 'adventurer explorer hero character' : 'runner speed runner athlete character'}`,
-      enemy: `${theme} themed basic monster creature enemy`,
-      obstacle: `${theme} hazard spike or barrier obstacle`
-    };
-
     setPresetKey(key);
-    setLiveParams({ 
-      ...GAME_PRESETS[key], 
+    setLiveParams({
+      ...GAME_PRESETS[key],
       themeKey: theme,
       gameName: generateTitle("", mode, theme),
-      dynamicAssetUrls: compileAssetUrls(assets)
+      dynamicAssetUrls: compileFallbackUrls({ ...GAME_PRESETS[key], themeKey: theme, gameType: resolvedMode })
     });
   };
 
@@ -326,18 +293,31 @@ function App() {
     const raw = promptText.trim();
     if (!raw) return;
 
-    console.log('[App.jsx] Calling generateGameConfig...');
-    const result = await generateGameConfig(raw, (logText, progressVal) => {
-      console.log(`[App.jsx Config Progress] ${progressVal}% - ${logText}`);
-    });
-    const updatedConfig = result.config;
-    console.log('[App.jsx] Received updated game config:', updatedConfig);
+    try {
+      console.log('[App.jsx] Calling generateGameConfig...');
+      const result = await generateGameConfig(raw, (logText, progressVal) => {
+        console.log(`[App.jsx Config Progress] ${progressVal}% - ${logText}`);
+      });
+      const updatedConfig = result.config;
 
-    // Apply — force fresh Phaser instance
-    setGameKey(k => k + 1);
-    setPresetKey('custom');
-    setLiveParams(updatedConfig);
-    setIsMenuOpen(false);
+      const { preloadedImages, assetMeta } = await generateGameAssets({
+        config: updatedConfig,
+        userPrompt: raw,
+        onProgress: (logText, progressVal) => {
+          console.log(`[App.jsx Asset Progress] ${progressVal}% - ${logText}`);
+        }
+      });
+
+      // Apply — force fresh Phaser instance
+      setGameKey(k => k + 1);
+      setPresetKey('custom');
+      setLiveParams({ ...updatedConfig, preloadedImages, assetMeta });
+      setIsMenuOpen(false);
+    } catch (err) {
+      console.error('[App.jsx] Prompt generation failed:', err);
+      window.dispatchEvent(new CustomEvent('playmint-error', { detail: { message: err.message } }));
+      throw err;
+    }
   };
 
   return (

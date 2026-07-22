@@ -29,6 +29,7 @@ const config = {
 const startGame = (parent) => {
   const game = new Phaser.Game({ ...config, parent });
   game.scene.add('GameManagerScene', GameManagerScene, true);
+  window.__PHASER_GAME = game;
   return game;
 };
 

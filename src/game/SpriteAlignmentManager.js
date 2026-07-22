@@ -38,7 +38,8 @@ export class SpriteAlignmentManager {
       groundY = this.scene.LOGICAL_FLOOR_Y || 1000,
       facing = 'right',
       anchor = 'bottom-center',
-      autoScale = true
+      autoScale = true,
+      knownFacing = null
     } = options;
 
     // Add to managed sprites
@@ -57,6 +58,14 @@ export class SpriteAlignmentManager {
     // Analyze sprite texture for ground contact point
     const analysis = this.analyzeSprite(sprite);
     sprite.alignmentData.analysis = analysis;
+
+    // A pipeline-verified base facing overrides the pixel-density guess — the guess
+    // misfires on unusual silhouettes, and flipping is always computed relative to
+    // facingDirection (cached-object mutation intentional: same texture, all future
+    // enforceOrientation/updateFacing calls must use the verified value)
+    if (knownFacing && analysis) {
+      analysis.facingDirection = knownFacing;
+    }
 
     // Set anchor point
     this.setAnchorPoint(sprite, anchor);

@@ -1,8 +1,8 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { GAME_PRESETS } from '../gameConfig';
-import { parsePromptKeywords, generateTitle } from '../game/promptUtils';
-import { generateGameConfig, compileAssetUrls } from '../game/geminiService';
-import { AssetOrchestrator, PROVIDERS } from '../game/AssetOrchestrator';
+import { generateTitle } from '../game/promptUtils';
+import { generateGameConfig } from '../game/geminiService';
+import { generateGameAssets, compileFallbackUrls, isGeminiConfigured } from '../game/assetPipeline';
 
 const BANNED_WORDS = ['fuck', 'shit', 'bitch', 'cunt', 'ass', 'dick', 'pussy', 'cock', 'nigger', 'faggot'];
 
@@ -21,53 +21,31 @@ const COMING_SOON_MODES = [
   { key: 'simulator', label: 'Simulator World', desc: 'Design, manage, and optimize complex simulated environments and ecosystems.' }
 ];
 
+const HAS_ENV_GEMINI_KEY = !!import.meta.env.VITE_GEMINI_API_KEY;
+
+const API_KEY_TICK_STYLE = {
+  background: 'rgba(0, 229, 153, 0.15)',
+  border: '1px solid var(--pm-accent-teal)',
+  color: 'var(--pm-accent-teal)',
+  fontSize: '14px',
+  fontWeight: 700,
+  width: '32px',
+  height: '32px',
+  borderRadius: '8px',
+  cursor: 'pointer',
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  backdropFilter: 'blur(8px)',
+  padding: 0
+};
+
 const getRandomMode = (selectedMode) => {
   return selectedMode || (Math.random() > 0.5 ? 'action_quest' : 'standard');
 };
 
 const getRandomDifficulty = () => {
   return Math.floor(Math.random() * 10) + 1;
-};
-
-const cropCanvasToContent = (canvas) => {
-  const ctx = canvas.getContext('2d');
-  const width = canvas.width;
-  const height = canvas.height;
-  const imgData = ctx.getImageData(0, 0, width, height);
-  const data = imgData.data;
-
-  let minX = width;
-  let minY = height;
-  let maxX = -1;
-  let maxY = -1;
-
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const alpha = data[(y * width + x) * 4 + 3];
-      if (alpha > 0) {
-        if (x < minX) minX = x;
-        if (x > maxX) maxX = x;
-        if (y < minY) minY = y;
-        if (y > maxY) maxY = y;
-      }
-    }
-  }
-
-  // If fully transparent, don't crop
-  if (maxX === -1 || maxY === -1) {
-    return canvas;
-  }
-
-  const croppedWidth = maxX - minX + 1;
-  const croppedHeight = maxY - minY + 1;
-
-  const croppedCanvas = document.createElement('canvas');
-  croppedCanvas.width = croppedWidth;
-  croppedCanvas.height = croppedHeight;
-  const croppedCtx = croppedCanvas.getContext('2d');
-
-  croppedCtx.putImageData(ctx.getImageData(minX, minY, croppedWidth, croppedHeight), 0, 0);
-  return croppedCanvas;
 };
 
 const WORLDS = [
@@ -154,7 +132,9 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
   const [progress, setProgress] = useState(0);
   const [toastMessage, setToastMessage] = useState('');
   const [currentWorldIndex, setCurrentWorldIndex] = useState(0);
-  const [apiKey, setApiKey] = useState(() => localStorage.getItem('SEELE_API_KEY') || '');
+  const [apiKey, setApiKey] = useState(() => localStorage.getItem('GEMINI_API_KEY') || '');
+  const [keyInput, setKeyInput] = useState('');
+  const [isEditingKey, setIsEditingKey] = useState(false);
   const formRef = useRef(null);
   const [phaserLoaded, setPhaserLoaded] = useState(false);
 
@@ -177,24 +157,26 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
     };
   }, []);
 
+  // Two separate timers, one per phase step. They must NOT live in a single effect
+  // run: with transitionPhase as a dependency, the 'compiling'→'fading' state change
+  // re-runs the effect and its cleanup would cancel the pending "done" timer — leaving
+  // this full-screen container mounted invisibly over the game, swallowing every click.
   useEffect(() => {
     if (phaserLoaded && transitionPhase === 'compiling') {
       setProgress(100);
       setTerminalLogs(prev => [...prev, '[ENGINE] World gate synchronized! Starting game...']);
-      
+
       const fadeTimer = setTimeout(() => {
         setTransitionPhase('fading');
       }, 1000);
-
+      return () => clearTimeout(fadeTimer);
+    }
+    if (transitionPhase === 'fading') {
       const doneTimer = setTimeout(() => {
         setTransitionPhase('done');
-        onCompleteTransition();
-      }, 2000);
-
-      return () => {
-        clearTimeout(fadeTimer);
-        clearTimeout(doneTimer);
-      };
+        if (onCompleteTransition) onCompleteTransition();
+      }, 1000);
+      return () => clearTimeout(doneTimer);
     }
   }, [phaserLoaded, transitionPhase]);
 
@@ -259,206 +241,14 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
     processPrompt(exampleText);
   };
 
-  const preloadDynamicAssets = async (urls, onProgress) => {
-    const keys = Object.keys(urls);
-    const preloadedImages = {};
-    let loadedCount = 0;
-
-    const seeleKey = import.meta.env.VITE_SEELE_API_KEY || localStorage.getItem('SEELE_API_KEY') || '';
-    if (!seeleKey.trim()) {
-      throw new Error('SEELE API Key is missing. Please set VITE_SEELE_API_KEY in your .env configuration.');
-    }
-
-    // Initialize SEELE AssetOrchestrator
-    const orchestrator = new AssetOrchestrator({
-      provider: PROVIDERS.SEELE_AI,
-      apiKey: seeleKey,
-      qualityMode: 'high',
-      parallelGeneration: true
-    });
-
-    const loadSingleAsset = async (key, url, attempt = 1) => {
-      try {
-        // Extract the original prompt from the Pollinations URL
-        let promptText = '';
-        try {
-          const urlDecoded = decodeURIComponent(url);
-          const match = urlDecoded.match(/\/prompt\/([^?]+)/);
-          if (match) {
-            promptText = match[1];
-          } else {
-            promptText = urlDecoded;
-          }
-        } catch (e) {
-          promptText = url;
-        }
-
-        console.log(`[SEELE AI] Generating asset "${key}" (Attempt ${attempt}/3). Prompt: "${promptText}"`);
-        onProgress(`[SEELE AI] Generating asset: ${key}...`, 75 + Math.round((loadedCount / keys.length) * 20));
-
-        // Use SEELE AssetOrchestrator to generate the asset
-        const result = await orchestrator.client.generateImage({
-          prompt: promptText,
-          width: key.startsWith('background') ? 1024 : (key === 'platform' ? 128 : 128),
-          height: key.startsWith('background') ? 512 : (key === 'platform' ? 64 : 128),
-          format: 'png',
-          transparent: key !== 'floor' && !key.startsWith('background'),
-          groundAligned: key === 'player' || key === 'enemy' || key === 'obstacle'
-        });
-
-        // Handle SEELE response
-        if (result.format === 'url') {
-          // SEELE returns URLs, load from URL
-          return new Promise((resolve, reject) => {
-            const tempImg = new Image();
-            tempImg.crossOrigin = 'anonymous';
-
-            tempImg.onload = () => {
-              // Create canvas to scale SEELE outputs to game-appropriate sizes
-              const canvas = document.createElement('canvas');
-              let targetW = 128;
-              let targetH = 128;
-
-              if (key.startsWith('background')) {
-                targetW = 1024;
-                targetH = 512;
-              } else if (key === 'floor') {
-                targetW = 128;
-                targetH = 128;
-              } else if (key === 'platform') {
-                targetW = 128;
-                targetH = 64;
-              } else if (key === 'player' || key === 'enemy' || key === 'obstacle') {
-                targetW = 128;
-                targetH = 128;
-              }
-
-              canvas.width = targetW;
-              canvas.height = targetH;
-              const ctx = canvas.getContext('2d');
-              
-              // Use high-quality bilinear scaling for AI-generated imagery (not true pixel art)
-              ctx.imageSmoothingEnabled = true;
-              ctx.imageSmoothingQuality = 'high';
-              
-              // Scale down image on canvas
-              ctx.drawImage(tempImg, 0, 0, targetW, targetH);
-
-              let finalCanvas = canvas;
-
-              // Apply white/off-white background removal for sprites and platforms
-              if (key === 'player' || key === 'enemy' || key === 'obstacle' || key === 'platform') {
-                const imgData = ctx.getImageData(0, 0, targetW, targetH);
-                const data = imgData.data;
-
-                // Threshold for detecting off-white/light-grey pixels
-                const threshold = 200;
-
-                for (let i = 0; i < data.length; i += 4) {
-                  const r = data[i];
-                  const g = data[i + 1];
-                  const b = data[i + 2];
-
-                  // If all channels are very bright, treat as background
-                  if (r >= threshold && g >= threshold && b >= threshold) {
-                    const avg = (r + g + b) / 3;
-                    
-                    if (avg > 240) {
-                      // Pure or nearly pure white -> fully transparent
-                      data[i + 3] = 0;
-                    } else {
-                      // Blend the edges: scale alpha smoothly between threshold (200) and 240
-                      const factor = (avg - threshold) / (240 - threshold);
-                      const alpha = Math.round(255 * (1 - factor));
-                      data[i + 3] = Math.min(data[i + 3], alpha);
-                    }
-                  }
-                }
-
-                ctx.putImageData(imgData, 0, 0);
-
-                // Auto-crop dynamic assets to trim transparent margin space
-                finalCanvas = cropCanvasToContent(canvas);
-              }
-
-              const finalImg = new Image();
-              finalImg.crossOrigin = 'anonymous';
-              
-              finalImg.onload = () => {
-                preloadedImages[key] = finalImg;
-                loadedCount++;
-                const progressVal = 75 + Math.round((loadedCount / keys.length) * 20);
-                onProgress(`[Google Imagen] Loaded and scaled asset: ${key} (${loadedCount}/${keys.length})...`, progressVal);
-                resolve({ success: true });
-              };
-
-              finalImg.onerror = () => {
-                reject(new Error(`Failed to load scaled image data URL for ${key}.`));
-              };
-
-              finalImg.src = finalCanvas.toDataURL();
-            };
-
-            tempImg.onerror = () => {
-              reject(new Error('Failed to load SEELE generated image.'));
-            };
-
-            tempImg.src = result.data;
-          });
-        } else if (result.format === 'base64') {
-          // Handle base64 response (fallback)
-          return new Promise((resolve, reject) => {
-            const tempImg = new Image();
-            tempImg.crossOrigin = 'anonymous';
-
-            tempImg.onload = () => {
-              preloadedImages[key] = tempImg;
-              loadedCount++;
-              const progressVal = 75 + Math.round((loadedCount / keys.length) * 20);
-              onProgress(`[SEELE AI] Loaded asset: ${key} (${loadedCount}/${keys.length})...`, progressVal);
-              resolve({ success: true });
-            };
-
-            tempImg.onerror = () => {
-              reject(new Error('Failed to parse SEELE base64 image data.'));
-            };
-
-            tempImg.src = `data:${result.mimeType};base64,${result.data}`;
-          });
-        }
-      } catch (err) {
-        if (attempt < 3) {
-          const nextAttempt = attempt + 1;
-          const warnMsg = `[SEELE AI] Retrying "${key}" (Attempt ${nextAttempt}/3) due to: ${err.message}`;
-          console.warn(warnMsg);
-          onProgress(warnMsg, 75 + Math.round((loadedCount / keys.length) * 20));
-
-          await new Promise(resolve => setTimeout(resolve, 2000));
-          return loadSingleAsset(key, url, nextAttempt);
-        } else {
-          const errMsg = `[SEELE AI Error] Failed to generate dynamic asset "${key}" after 3 attempts.
-• Asset Key: "${key}"
-• Prompt: "${promptText}"
-• Failure Reason: ${err.message}`;
-          console.error(errMsg);
-          window.dispatchEvent(new CustomEvent('playmint-error', { detail: { message: errMsg } }));
-          throw new Error(errMsg);
-        }
-      }
-    };
-
-    await Promise.all(keys.map(key => loadSingleAsset(key, urls[key])));
-    return preloadedImages;
-  };
-
   const startCompilationSequence = async (newConfig, promptText) => {
     if (isOverlay) {
       setIsGenerating(true);
       setTransitionPhase('expanding');
-      const loadedImages = await preloadDynamicAssets(newConfig.dynamicAssetUrls, () => {});
+      const { preloadedImages, assetMeta } = await generateGameAssets({ config: newConfig });
       setTimeout(() => {
         setTransitionPhase('done');
-        onGenerate('custom', { ...newConfig, preloadedImages: loadedImages });
+        onGenerate('custom', { ...newConfig, preloadedImages, assetMeta });
       }, 700);
       return;
     }
@@ -466,7 +256,10 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
     setIsGenerating(true);
     setTransitionPhase('compiling');
     setPhaserLoaded(false);
-    onStartTransition(newConfig);
+    // NOTE: no onStartTransition(newConfig) here — booting Phaser before assets exist
+    // makes it fetch the raw Pollinations fallback URLs (bypassing the serial queue →
+    // 429s → "RUNTIME ERROR" dialog) for textures the preloaded boot replaces anyway.
+    // The single boot happens below with preloadedImages, same as the prompt path.
 
     const displayPrompt = promptText ? `"${promptText.substring(0, 32)}"` : "Quick Start Preset";
     const themeName = (newConfig.themeKey || 'default').toUpperCase();
@@ -482,23 +275,26 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
       : `Speed: ${newConfig.runSpeed || 400}px/s`;
 
     setTerminalLogs([
-      "[SYSTEM] Booting PlayMint Generative Engine v2.0 with SEELE AI...",
+      "[SYSTEM] Booting PlayMint Generative Engine v2.0...",
       `[PROMPT] Input -> ${displayPrompt}`,
       `[THEME]  Mapping assets -> [${themeName} THEME, ${modeName}]`,
       `[PHYSIC] Gravity: ${gravity}m/s² · ${speed} · Diff: ${difficulty}/10`,
       "[ENGINE] Synchronizing WebGL canvas & establishing world gate...",
-      "[SEELE]  Starting SEELE AI asset generation..."
+      `[ASSETS] Starting asset generation via ${isGeminiConfigured() ? 'Gemini AI' : 'free image engine'}...`
     ]);
     setProgress(75);
 
     try {
-      const loadedImages = await preloadDynamicAssets(newConfig.dynamicAssetUrls, (logText, progressVal) => {
-        setTerminalLogs(prev => [...prev, logText]);
-        setProgress(progressVal);
+      const { preloadedImages, assetMeta } = await generateGameAssets({
+        config: newConfig,
+        onProgress: (logText, progressVal) => {
+          setTerminalLogs(prev => [...prev, logText]);
+          setProgress(progressVal);
+        }
       });
 
       setTerminalLogs(prev => [...prev, '[ENGINE] Booting game scene and registering WebGL textures...']);
-      onStartTransition({ ...newConfig, preloadedImages: loadedImages });
+      onStartTransition({ ...newConfig, preloadedImages, assetMeta });
     } catch (err) {
       console.error('[Compilation Error] Preset loading failed:', err);
       setIsGenerating(false);
@@ -524,10 +320,10 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
       setIsGenerating(true);
       setTransitionPhase('expanding');
       const result = await generateGameConfig(text);
-      const loadedImages = await preloadDynamicAssets(result.config.dynamicAssetUrls, () => {});
+      const { preloadedImages, assetMeta } = await generateGameAssets({ config: result.config, userPrompt: text });
       setTimeout(() => {
         setTransitionPhase('done');
-        onGenerate('custom', { ...result.config, preloadedImages: loadedImages });
+        onGenerate('custom', { ...result.config, preloadedImages, assetMeta });
       }, 700);
       return;
     }
@@ -546,16 +342,20 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
         setProgress(Math.min(progressVal, 70));
       });
 
-      setTerminalLogs(prev => [...prev, '[ENGINE] Starting browser dynamic asset preloader...']);
+      setTerminalLogs(prev => [...prev, `[ENGINE] Starting asset generation via ${isGeminiConfigured() ? 'Gemini AI' : 'free image engine'}...`]);
       setProgress(75);
 
-      const loadedImages = await preloadDynamicAssets(result.config.dynamicAssetUrls, (logText, progressVal) => {
-        setTerminalLogs(prev => [...prev, logText]);
-        setProgress(progressVal);
+      const { preloadedImages, assetMeta } = await generateGameAssets({
+        config: result.config,
+        userPrompt: text,
+        onProgress: (logText, progressVal) => {
+          setTerminalLogs(prev => [...prev, logText]);
+          setProgress(progressVal);
+        }
       });
 
       setTerminalLogs(prev => [...prev, '[ENGINE] Booting game scene and registering WebGL textures...']);
-      onStartTransition({ ...result.config, preloadedImages: loadedImages });
+      onStartTransition({ ...result.config, preloadedImages, assetMeta });
     } catch (err) {
       console.error('[Compilation Error] Game generation or preloading failed:', err);
       setIsGenerating(false);
@@ -575,17 +375,8 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
     config.themeKey = theme;
     
     config.gameName = generateTitle("", mode, theme);
+    config.dynamicAssetUrls = compileFallbackUrls(config);
 
-    const assets = {
-      background_far: `${theme} complete detailed scenery landscape background backdrop`,
-      floor: `${theme} soil ground surface texture`,
-      platform: `${theme} floating platform ledge block`,
-      player: `${mode === 'action_quest' ? 'adventurer explorer hero character' : 'runner speed runner athlete character'}`,
-      enemy: `${theme} themed basic monster creature enemy`,
-      obstacle: `${theme} hazard spike or barrier obstacle`
-    };
-    config.dynamicAssetUrls = compileAssetUrls(assets);
-    
     startCompilationSequence(config, "Random Preset");
   };
 
@@ -605,6 +396,8 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
       position: 'absolute', inset: 0,
       zIndex: 9999,
       opacity: transitionPhase === 'fading' ? 0 : 1,
+      // Once faded out this overlay must never block the game UI underneath
+      pointerEvents: (transitionPhase === 'fading' || transitionPhase === 'done') ? 'none' : 'auto',
       transition: 'opacity 1.0s ease-in-out'
     }}>
       {/* Toast Notification */}
@@ -695,31 +488,70 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
         animation: 'float 18s infinite alternate-reverse', zIndex: 2
       }} />
 
-      {/* Top right settings and API key indicator */}
-      <div style={{ position: 'absolute', top: '16px', right: '16px', zIndex: 100, display: 'flex', gap: '8px' }}>
-        <button
-          onClick={!!import.meta.env.VITE_SEELE_API_KEY ? () => showToast("Using SEELE Key from environment (.env)") : () => {
-            const key = prompt("Enter your SEELE AI API Key (runs client-side only):", apiKey);
-            if (key !== null) {
-              const trimmed = key.trim();
-              localStorage.setItem('SEELE_API_KEY', trimmed);
+      {/* Top right API key control: env key → tick only; else inline input, tick after save */}
+      <div style={{ position: 'absolute', top: '16px', right: '16px', zIndex: 100, display: 'flex', gap: '8px', alignItems: 'center' }}>
+        {HAS_ENV_GEMINI_KEY ? (
+          <button
+            onClick={() => showToast('Using Gemini key from environment (.env)')}
+            title="Gemini key active (from .env)"
+            style={API_KEY_TICK_STYLE}
+          >
+            ✓
+          </button>
+        ) : (apiKey && !isEditingKey) ? (
+          <button
+            onClick={() => { setKeyInput(apiKey); setIsEditingKey(true); }}
+            title="Gemini key saved — click to change"
+            style={API_KEY_TICK_STYLE}
+          >
+            ✓
+          </button>
+        ) : (
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              const trimmed = keyInput.trim();
+              localStorage.setItem('GEMINI_API_KEY', trimmed);
               setApiKey(trimmed);
-              showToast(trimmed ? "SEELE Key saved successfully!" : "SEELE Key removed.");
-            }
-          }}
-          style={{
-            background: (!!import.meta.env.VITE_SEELE_API_KEY || apiKey) ? 'rgba(162, 89, 255, 0.15)' : 'rgba(255,255,255,0.08)',
-            border: (!!import.meta.env.VITE_SEELE_API_KEY || apiKey) ? '1px solid #a259ff' : '1px solid rgba(255,255,255,0.15)',
-            color: (!!import.meta.env.VITE_SEELE_API_KEY || apiKey) ? '#a259ff' : '#fff',
-            fontSize: '13px',
-            fontWeight: '600',
-            padding: '8px 16px', borderRadius: '8px', cursor: 'pointer',
-            transition: 'all 0.2s', backdropFilter: 'blur(8px)',
-            display: 'flex', alignItems: 'center', gap: '6px'
-          }}
-        >
-          {!!import.meta.env.VITE_SEELE_API_KEY ? '✓ SEELE Key Detected' : (apiKey ? '🤖 SEELE Key Configured' : '🤖 Configure SEELE API Key')}
-        </button>
+              setIsEditingKey(false);
+              showToast(trimmed ? 'Gemini key saved — assets will use Gemini AI.' : 'No key — using free image engine.');
+            }}
+            style={{
+              display: 'flex', gap: '6px', alignItems: 'center',
+              background: 'rgba(10, 15, 24, 0.85)',
+              border: '1px solid rgba(255,255,255,0.15)',
+              borderRadius: '8px', padding: '6px 8px',
+              backdropFilter: 'blur(8px)'
+            }}
+          >
+            <label htmlFor="pm-gemini-key-input" style={{ color: '#fff', fontSize: '12px', fontWeight: 600, whiteSpace: 'nowrap' }}>
+              Insert Gemini API key:
+            </label>
+            <input
+              id="pm-gemini-key-input"
+              type="password"
+              value={keyInput}
+              onChange={(e) => setKeyInput(e.target.value)}
+              placeholder="AIza..."
+              autoComplete="off"
+              style={{
+                width: '150px', padding: '5px 8px', fontSize: '12px',
+                background: 'rgba(0,0,0,0.4)', border: '1px solid rgba(255,255,255,0.12)',
+                borderRadius: '6px', color: '#fff', outline: 'none'
+              }}
+            />
+            <button
+              type="submit"
+              style={{
+                background: 'rgba(162, 89, 255, 0.2)', border: '1px solid #a259ff',
+                color: '#a259ff', fontSize: '12px', fontWeight: 700,
+                padding: '5px 10px', borderRadius: '6px', cursor: 'pointer'
+              }}
+            >
+              Save
+            </button>
+          </form>
+        )}
       </div>
 
       {/* Close button for overlay */}

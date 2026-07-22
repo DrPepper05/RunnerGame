@@ -1,0 +1,293 @@
+/**
+ * Asset prompt designer.
+ *
+ * Rule: code owns the invariants, the designer owns the flavor. The designer (Gemini
+ * text call, or the local theme tables as fallback) only produces short subject
+ * descriptors plus a style guide; the slot scaffolds in slotSpecs.js append the
+ * non-negotiable constraints (white background, facing right, tileability, framing).
+ */
+import { SLOT_SPECS, BASELINE_SLOTS } from './slotSpecs';
+import { isGeminiConfigured, generateJson } from './providers/geminiImage';
+
+/**
+ * Theme subject tables — the local fallback recipe.
+ * (Moved here from geminiService.generateAssetDirections so there is exactly one copy;
+ * geminiService re-imports generateAssetDirections from this module.)
+ */
+const THEMES = {
+  ice: {
+    backgrounds: 'frozen tundra with icy mountains, snow-covered peaks, glaciers, aurora borealis sky, crystalline ice formations',
+    levelElements: 'frozen ground with snow texture, icy surface, frost patterns',
+    platforms: 'ice platform block, frozen ledge, crystalline structure',
+    playerPlatformer: 'arctic warrior with fur coat, ice sword, blue armor',
+    playerRunner: 'winter athlete runner, cold weather gear, athletic build',
+    enemy: 'ice golem monster, frozen yeti creature, frost elemental',
+    hazards: 'ice spikes, frozen stalactites, sharp icicles',
+    colorPalette: 'cool blues, whites, cyans, pale purples, ice blue (#E6F3FF, #B3D9FF, #4D94FF)',
+    atmosphere: 'cold, crystalline, shimmering'
+  },
+  lava: {
+    backgrounds: 'volcanic landscape with lava flows, molten rock, ash clouds, red sky, erupting volcanos',
+    levelElements: 'volcanic rock ground, obsidian surface, cracked magma texture',
+    platforms: 'volcanic rock platform, obsidian ledge, basalt block',
+    playerPlatformer: 'fire knight with flaming sword, heat-resistant armor',
+    playerRunner: 'heat runner with protective suit, athletic stance',
+    enemy: 'lava golem, fire demon, magma elemental creature',
+    hazards: 'lava pit, fire geyser, molten rock spike',
+    colorPalette: 'reds, oranges, dark grays, yellow highlights (#FF6B35, #FF4500, #DC143C, #8B0000)',
+    atmosphere: 'hot, glowing, dangerous'
+  },
+  forest: {
+    backgrounds: 'dense forest with tall trees, canopy layers, sunlight filtering through leaves, moss and vines',
+    levelElements: 'grass and dirt ground, forest floor with leaves, natural earth texture',
+    platforms: 'wooden log platform, tree branch, moss-covered stone',
+    playerPlatformer: 'forest ranger with bow and arrow, green cloak',
+    playerRunner: 'nature runner, athletic explorer, green outfit',
+    enemy: 'forest wolf, giant spider, evil tree creature',
+    hazards: 'thorn bush, poison plant, falling branch',
+    colorPalette: 'greens, browns, earth tones (#228B22, #32CD32, #8FBC8F, #654321)',
+    atmosphere: 'natural, organic, mysterious'
+  },
+  city: {
+    backgrounds: 'urban cityscape with skyscrapers, neon signs, busy streets, night skyline, modern buildings',
+    levelElements: 'concrete sidewalk, asphalt road, urban ground texture',
+    platforms: 'metal scaffold, concrete ledge, building rooftop',
+    playerPlatformer: 'urban ninja with tech gear, cyberpunk outfit',
+    playerRunner: 'parkour runner, urban athlete, street clothes',
+    enemy: 'security robot, street thug, drone enemy',
+    hazards: 'electrical barrier, steam vent, construction hazard',
+    colorPalette: 'grays, neon colors, blues, purples (#696969, #FF00FF, #00FFFF, #1E90FF)',
+    atmosphere: 'urban, modern, neon-lit'
+  },
+  space: {
+    backgrounds: 'cosmic space with stars, nebulas, distant planets, asteroid fields, galaxy backdrop',
+    levelElements: 'metallic space station floor, alien ground surface, lunar terrain',
+    platforms: 'floating space platform, asteroid chunk, metal beam',
+    playerPlatformer: 'space marine with laser rifle, powered armor',
+    playerRunner: 'astronaut runner, space suit, jetpack',
+    enemy: 'alien creature, space pirate, robot sentinel',
+    hazards: 'laser barrier, meteor, energy field',
+    colorPalette: 'deep purples, blues, pinks, cosmic colors (#000033, #4B0082, #9400D3, #DDA0DD)',
+    atmosphere: 'cosmic, futuristic, otherworldly'
+  }
+};
+
+function extractCustomElements(promptText) {
+  const lower = promptText.toLowerCase();
+  const customElements = [];
+
+  if (lower.includes('dark')) customElements.push('dark atmosphere');
+  if (lower.includes('bright')) customElements.push('bright lighting');
+  if (lower.includes('neon')) customElements.push('neon glow effects');
+  if (lower.includes('retro')) customElements.push('retro arcade style');
+  if (lower.includes('pixel')) customElements.push('enhanced pixel art');
+  if (lower.includes('minimal')) customElements.push('minimalist design');
+  if (lower.includes('detailed')) customElements.push('highly detailed textures');
+  if (lower.includes('simple')) customElements.push('simple clean design');
+
+  return customElements.length > 0 ? customElements.join(', ') : null;
+}
+
+/**
+ * Deterministic theme-based asset directions (the shape carried on
+ * config.assetDesignDirections). Blends a secondary theme and prompt keywords.
+ */
+export function generateAssetDirections(theme, secondaryTheme, promptText, gameType) {
+  const themeData = THEMES[theme] || THEMES.forest;
+  const player = gameType === 'platformer' ? themeData.playerPlatformer : themeData.playerRunner;
+
+  const finalData = { ...themeData, player };
+  if (secondaryTheme && secondaryTheme !== theme && THEMES[secondaryTheme]) {
+    const secondaryData = THEMES[secondaryTheme];
+    finalData.backgrounds = `${themeData.backgrounds}, with elements of ${secondaryData.atmosphere} atmosphere`;
+    finalData.colorPalette = `${themeData.colorPalette}, accented with ${secondaryData.colorPalette}`;
+  }
+
+  const customElements = extractCustomElements(promptText || '');
+  if (customElements) {
+    finalData.backgrounds = `${finalData.backgrounds}, ${customElements}`;
+  }
+
+  return {
+    backgrounds: finalData.backgrounds,
+    characters: finalData.player,
+    levelElements: finalData.levelElements,
+    platforms: finalData.platforms,
+    player: finalData.player,
+    enemy: finalData.enemy,
+    hazards: finalData.hazards,
+    styleGuide: 'retro game aesthetic, clear pixel definition, vibrant colors',
+    colorPalette: finalData.colorPalette
+  };
+}
+
+const DEFAULT_SUBJECTS = {
+  background_far: 'scenery landscape background backdrop',
+  floor: 'ground surface tiling block texture',
+  platform: 'floating platform ledge block tile',
+  player: 'running character sprite',
+  enemy: 'patrolling enemy monster creature',
+  obstacle: 'danger barrier block or spike'
+};
+
+const DESIGNER_RESPONSE_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    styleSummary: { type: 'STRING', description: 'Short overall art direction, max 12 words' },
+    colorPalette: { type: 'STRING', description: 'Environment color palette description, max 10 words' },
+    accentPalette: { type: 'STRING', description: 'Contrasting saturated accent colors for characters and hazards, complementary hue to the environment, max 8 words' },
+    background_far: { type: 'STRING' },
+    background_mid: { type: 'STRING', description: 'Midground silhouette elements (optional)' },
+    background_near: { type: 'STRING', description: 'Foreground scenery elements (optional)' },
+    floor: { type: 'STRING' },
+    platform: { type: 'STRING' },
+    player: { type: 'STRING' },
+    enemy: { type: 'STRING' },
+    obstacle: { type: 'STRING' }
+  },
+  // mid/near are optional — buildFinalPrompt falls back to the far subject via subjectKey
+  required: ['styleSummary', 'colorPalette', 'accentPalette', 'background_far', 'floor', 'platform', 'player', 'enemy', 'obstacle']
+};
+
+function buildDesignerPrompt(userPrompt, gameType) {
+  const modeDesc = gameType === 'platformer'
+    ? 'a 2D side-scrolling action platformer'
+    : 'a 2D side-scrolling endless runner';
+  return (
+    `You are the art director for ${modeDesc} generated from this player request: "${userPrompt}".\n\n` +
+    `Design one cohesive visual identity and describe six game assets. Return JSON with:\n` +
+    `- styleSummary: the shared art direction (max 12 words)\n` +
+    `- colorPalette: the ENVIRONMENT palette (max 10 words)\n` +
+    `- accentPalette: saturated accent colors for the player, enemy and hazards — pick a ` +
+    `hue that CONTRASTS strongly with the environment palette (complementary or ` +
+    `near-complementary, brighter and more saturated), so gameplay elements pass the ` +
+    `squint test against the scenery (max 8 words)\n` +
+    `- background_far: the distant background scenery (max 20 words)\n` +
+    `- background_mid: midground silhouette elements, e.g. structures or terrain shapes (max 15 words)\n` +
+    `- background_near: closer foreground scenery elements (max 15 words)\n` +
+    `- floor: the ground/terrain surface material (max 15 words)\n` +
+    `- platform: a floating platform block (max 15 words)\n` +
+    `- player: the hero character (max 20 words)\n` +
+    `- enemy: a patrolling enemy creature (max 20 words)\n` +
+    `- obstacle: a stationary hazard object (max 15 words)\n\n` +
+    `Rules:\n` +
+    `- Describe SUBJECTS ONLY. Do not mention backgrounds, isolation, transparency, framing, ` +
+    `camera angle, facing direction, or tiling — those are added automatically.\n` +
+    `- For player, enemy, obstacle and platform: avoid white or near-white as a dominant color; ` +
+    `prefer saturated colors with dark outlines.\n` +
+    `- Readability comes first: backgrounds stay muted and atmospheric, gameplay elements ` +
+    `use the accentPalette and must stand out instantly.\n` +
+    `- All six must clearly belong to the same world and palette.`
+  );
+}
+
+/**
+ * Local deterministic design: subject descriptors from assetDesignDirections when the
+ * config carries them, otherwise generated from the theme tables.
+ */
+// Per-theme character accents for the local (no-LLM) path: roughly complementary to
+// each theme's environment palette, so sprites pass the squint test out of the box.
+const THEME_ACCENTS = {
+  ice: 'warm amber, coral and crimson accents',
+  lava: 'cool teal, cyan and steel-blue accents',
+  forest: 'warm crimson, orange and gold accents',
+  city: 'hot orange and golden yellow accents',
+  space: 'bright orange, gold and lime accents'
+};
+const DEFAULT_ACCENT = 'bright warm saturated contrasting accent colors';
+
+export function localDesign({ gameType, themeKey, userPrompt = '', assetDesignDirections = null }) {
+  const directions = assetDesignDirections ||
+    generateAssetDirections(themeKey || 'ice', themeKey || 'ice', userPrompt, gameType || 'runner');
+
+  const subjects = {};
+  for (const slot of BASELINE_SLOTS) {
+    subjects[slot] = SLOT_SPECS[slot].fallbackSubject(directions) || DEFAULT_SUBJECTS[slot];
+  }
+  return {
+    source: 'local',
+    styleGuide: {
+      styleSummary: directions.styleGuide || 'retro game aesthetic',
+      colorPalette: directions.colorPalette || 'standard arcade colors',
+      accentPalette: THEME_ACCENTS[themeKey] || DEFAULT_ACCENT
+    },
+    subjects
+  };
+}
+
+/**
+ * Design the style guide + per-slot subjects for a generation run.
+ * One Gemini text call when a key is available; local tables otherwise or on any failure.
+ */
+export async function designAssetPrompts({ userPrompt, gameType, themeKey, assetDesignDirections, timeoutMs = 12000 }) {
+  const fallback = () => localDesign({ gameType, themeKey, userPrompt, assetDesignDirections });
+
+  if (!isGeminiConfigured() || !userPrompt?.trim()) {
+    return fallback();
+  }
+
+  try {
+    const result = await generateJson({
+      prompt: buildDesignerPrompt(userPrompt, gameType),
+      responseSchema: DESIGNER_RESPONSE_SCHEMA,
+      timeoutMs
+    });
+    const subjects = {};
+    for (const slot of BASELINE_SLOTS) {
+      if (!result[slot] || typeof result[slot] !== 'string') return fallback();
+      subjects[slot] = result[slot];
+    }
+    for (const slot of ['background_mid', 'background_near']) {
+      if (typeof result[slot] === 'string' && result[slot].trim()) subjects[slot] = result[slot];
+    }
+    return {
+      source: 'gemini',
+      styleGuide: {
+        styleSummary: result.styleSummary || 'retro game aesthetic',
+        colorPalette: result.colorPalette || 'standard arcade colors',
+        accentPalette: result.accentPalette || DEFAULT_ACCENT
+      },
+      subjects
+    };
+  } catch (err) {
+    console.warn('[PromptDesigner] Gemini design failed, using local templates:', err.message);
+    return fallback();
+  }
+}
+
+/**
+ * Assemble the final generation prompt for one slot. Slots without a designed subject
+ * of their own borrow another slot's via spec.subjectKey (parallax layers reuse the
+ * far-background subject unless the designer provided a specific one).
+ *
+ * The style string is PER CATEGORY, not shared — one identical palette string on every
+ * slot converges all assets on the same hue and value, and gameplay elements vanish
+ * into the scenery. Industry readability rules encoded here: muted hazy backgrounds,
+ * dark silhouette tones for nearer decor planes (atmospheric perspective), and one
+ * saturated contrasting accent reserved for the player / enemy / hazards.
+ */
+const GAMEPLAY_SLOTS = new Set(['player', 'player_sheet', 'enemy', 'obstacle']);
+
+export function buildFinalPrompt(slotKey, subjects, styleGuide) {
+  const spec = SLOT_SPECS[slotKey];
+  const subject = subjects[slotKey] ?? (spec.subjectKey ? subjects[spec.subjectKey] : undefined);
+  const base = `${styleGuide.styleSummary}, 16-bit pixel art style, flat 2D game asset, sharp pixels, clear outlines`;
+  const accent = styleGuide.accentPalette || DEFAULT_ACCENT;
+
+  let style;
+  if (GAMEPLAY_SLOTS.has(slotKey)) {
+    style = `${base}, dominant colors: ${accent}, vivid and highly saturated, bold dark ` +
+      `outline, strong silhouette, must stand out instantly against a dark muted environment`;
+  } else if (slotKey === 'background_far') {
+    style = `${base}, color palette ${styleGuide.colorPalette}, muted desaturated tones, ` +
+      `soft atmospheric haze, gentle contrast so foreground gameplay elements stand out`;
+  } else if (slotKey === 'background_mid' || slotKey === 'background_near') {
+    style = `${base}, color palette ${styleGuide.colorPalette}, very dark near-black ` +
+      `silhouette tones, distinctly darker than a distant hazy background`;
+  } else {
+    // floor, platform — terrain: main palette, readable edges, medium-dark value
+    style = `${base}, color palette ${styleGuide.colorPalette}, medium-dark tones with ` +
+      `a clearly defined lighter top edge`;
+  }
+  return spec.scaffold(subject, style);
+}

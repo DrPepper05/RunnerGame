@@ -3,7 +3,7 @@ import { DEFAULT_CONFIG } from '../gameConfig';
 import { getTheme } from './themes';
 import GameModeManager from './GameModeManager';
 import MultiCameraManager from './MultiCameraManager';
-import { compileAssetUrls } from './geminiService';
+import { compileFallbackUrls } from './assetPipeline';
 import ParallaxGroundSystem from './ParallaxGroundSystem';
 import SpriteAlignmentManager from './SpriteAlignmentManager';
 
@@ -39,21 +39,9 @@ export default class GameManagerScene extends Phaser.Scene {
       console.log('[Phaser Preloader] Dynamic assets already registered via browser preloader. Bypassing loader requests.');
     } else {
       // Guarantee that dynamicAssetUrls is always present
-      if (!this.gameConfig?.dynamicAssetUrls) {
+      if (this.gameConfig && !this.gameConfig.dynamicAssetUrls) {
         console.warn('[Phaser Preloader] Config missing dynamicAssetUrls. Compiling fallback assets on the fly...');
-        const theme = this.gameConfig?.themeKey || 'ice';
-        const mode = this.gameConfig?.gameType || 'runner';
-        const assets = {
-          background_far: `${theme} complete detailed scenery landscape background backdrop`,
-          floor: `${theme} soil ground surface texture`,
-          platform: `${theme} floating platform ledge block`,
-          player: `${mode === 'platformer' ? 'adventurer explorer hero character' : 'runner speed runner athlete character'}`,
-          enemy: `${theme} themed basic monster creature enemy`,
-          obstacle: `${theme} hazard spike or barrier obstacle`
-        };
-        if (this.gameConfig) {
-          this.gameConfig.dynamicAssetUrls = compileAssetUrls(assets);
-        }
+        this.gameConfig.dynamicAssetUrls = compileFallbackUrls(this.gameConfig);
       }
 
       const urls = this.gameConfig?.dynamicAssetUrls;
@@ -132,6 +120,8 @@ export default class GameManagerScene extends Phaser.Scene {
       
       const textureMap = {
         background_far: 'dyn_bg_far',
+        background_mid: 'dyn_bg_mid',
+        background_near: 'dyn_bg_near',
         floor: 'dyn_floor',
         platform: 'dyn_platform',
         player: 'dyn_player',
@@ -144,8 +134,17 @@ export default class GameManagerScene extends Phaser.Scene {
         if (this.textures.exists(textureKey)) {
           this.textures.remove(textureKey);
         }
-        this.textures.addImage(textureKey, img);
-        console.log(`[Phaser GameManagerScene] Successfully registered preloaded texture: "${textureKey}"`);
+        const frames = this.gameConfig.assetMeta?.slots?.[key]?.frames;
+        if (frames) {
+          this.textures.addSpriteSheet(textureKey, img, {
+            frameWidth: frames.frameWidth,
+            frameHeight: frames.frameHeight
+          });
+          console.log(`[Phaser GameManagerScene] Registered preloaded SPRITESHEET: "${textureKey}" (${frames.cols}x${frames.rows} @ ${frames.frameWidth}x${frames.frameHeight})`);
+        } else {
+          this.textures.addImage(textureKey, img);
+          console.log(`[Phaser GameManagerScene] Successfully registered preloaded texture: "${textureKey}"`);
+        }
       });
     }
 
@@ -218,11 +217,15 @@ export default class GameManagerScene extends Phaser.Scene {
 
       this.floor = this.add.rectangle(0, this.LOGICAL_FLOOR_Y, floorWidth, floorHeight, 0x000000, 0);
       this.floor.setOrigin(0, 0);
+
+      this.createFloorFill(floorWidth, floorHeight, floorTexture, floorFrameIndex, scaleY);
     } else {
       this.floor = this.add.tileSprite(0, this.LOGICAL_FLOOR_Y, floorWidth, floorHeight, floorTexture, floorFrameIndex).setOrigin(0, 0);
       const themeTileScale = this.secondaryTheme?.floorTileScale || this.activeTheme.floorTileScale || 0.15;
       this.floor.tileScaleX = this.gameConfig.dynamicAssetUrls ? 1.0 : (this.gameConfig.floorTileScale || themeTileScale);
       this.floor.tileScaleY = this.gameConfig.dynamicAssetUrls ? 1.0 : (this.gameConfig.floorTileScale || themeTileScale);
+
+      this.createFloorFill(floorWidth, floorHeight, floorTexture, floorFrameIndex, this.floor.tileScaleX);
     }
     this.physics.add.existing(this.floor, true); // Static
 
@@ -230,6 +233,23 @@ export default class GameManagerScene extends Phaser.Scene {
     this.physics.world.setBounds(0, 0, floorWidth, this.LOGICAL_FLOOR_Y + floorHeight);
 
     // Animations
+    // Generated player run cycle — recreated per scene start since the texture changes
+    // with every generation
+    if (this.anims.exists('dyn_player_run')) {
+      this.anims.remove('dyn_player_run');
+    }
+    const playerFrames = this.gameConfig.assetMeta?.slots?.player?.frames;
+    if (playerFrames && this.textures.exists('dyn_player')) {
+      const runFrameCount = playerFrames.runFrameCount || (playerFrames.cols * playerFrames.rows);
+      this.anims.create({
+        key: 'dyn_player_run',
+        frames: this.anims.generateFrameNumbers('dyn_player', { start: 0, end: runFrameCount - 1 }),
+        // 8-frame cycles read naturally at 12fps; short legacy 4-frame sheets at 9fps
+        frameRate: runFrameCount >= 8 ? 12 : 9,
+        repeat: -1
+      });
+    }
+
     if (!this.anims.exists('run')) {
       this.anims.create({
         key: 'run',
@@ -368,7 +388,10 @@ export default class GameManagerScene extends Phaser.Scene {
         groundY: this.LOGICAL_FLOOR_Y,
         facing: 'right',
         anchor: 'bottom-center',
-        autoScale: false // We already scaled it above
+        autoScale: false, // We already scaled it above
+        // Vision-QA-verified sprites are guaranteed right-facing; without the override
+        // the pixel-density heuristic can wrongly re-flip them
+        knownFacing: this.gameConfig.assetMeta?.slots?.player?.facingVerified ? 'right' : null
       });
     } else {
       // Set precise hitbox size and offsets for static assets
@@ -549,6 +572,21 @@ export default class GameManagerScene extends Phaser.Scene {
     this.bgGraphics.fillRect(-width, -height, width * 3, height * 3);
   }
 
+  // Visual-only underground fill from the floor's bottom edge downward, so the floor
+  // never ends in empty space above the viewport border on tall screens. Darkened
+  // repeat of the floor texture reads as depth. Collision is untouched (this.floor).
+  createFloorFill(floorWidth, floorHeight, floorTexture, floorFrameIndex, tileScale) {
+    if (this.floorFill) {
+      this.floorFill.destroy();
+      this.floorFill = null;
+    }
+    this.floorFill = this.add.tileSprite(
+      0, this.LOGICAL_FLOOR_Y + floorHeight, floorWidth, 1000, floorTexture, floorFrameIndex
+    ).setOrigin(0, 0).setTint(0x555560);
+    this.floorFill.tileScaleX = tileScale;
+    this.floorFill.tileScaleY = tileScale;
+  }
+
   createBackgroundLayers() {
     if (this.bgLayers && this.bgLayers.length) {
       this.bgLayers.forEach((layer) => layer.destroy());
@@ -561,9 +599,15 @@ export default class GameManagerScene extends Phaser.Scene {
     
     let layers = theme.backgroundLayers || [];
     if (this.gameConfig.dynamicAssetUrls) {
+      // Far layer: classic cover-scaled sprite (a panorama can't wrap without visible
+      // seams). mid/near: bottom-anchored keyed strips that wrap as tileSprites —
+      // heightFrac controls how much of the screen they occupy. Optional layers may
+      // have been dropped by the pipeline.
       layers = [
-        { key: 'dyn_bg_far', speed: 0.02, scale: 1 }
-      ];
+        { key: 'dyn_bg_far', speed: 0.02, scale: 1 },
+        { key: 'dyn_bg_mid', speed: 0.08, tile: true, heightFrac: 0.55 },
+        { key: 'dyn_bg_near', speed: 0.18, tile: true, heightFrac: 0.35 }
+      ].filter((layer) => this.textures.exists(layer.key));
     }
 
     layers.forEach((layer) => {
@@ -571,6 +615,28 @@ export default class GameManagerScene extends Phaser.Scene {
       const source = texture.getSourceImage();
       const textureWidth = source?.width || width;
       const textureHeight = source?.height || height;
+
+      if (layer.tile) {
+        // Strip footprint = exactly one texture-height (no vertical wrap), with its
+        // BOTTOM anchored at the ground line so shapes stand on the horizon (for
+        // scrollFactor-0 objects the screen-equivalent of a world Y is worldY - scrollY;
+        // the update loop keeps this pinned every frame). Horizontal wrap = infinite scroll.
+        const tileScale = (height * (layer.heightFrac || 0.5)) / textureHeight;
+        const displayHeight = textureHeight * tileScale;
+        const groundY = this.LOGICAL_FLOOR_Y - (this.cameras?.main?.scrollY || 0);
+        const sprite = this.add.tileSprite(width / 2, groundY, width, displayHeight, layer.key)
+          .setOrigin(0.5, 1)
+          .setScrollFactor(0)
+          .setDepth(-5 + this.bgLayers.length);
+        sprite.tileScaleX = tileScale;
+        sprite.tileScaleY = tileScale;
+        sprite.__isParallaxTile = true;
+        sprite.__heightFrac = layer.heightFrac || 0.5;
+        sprite.__scrollSpeed = layer.speed || 0.1;
+        this.bgLayers.push(sprite);
+        return;
+      }
+
       const baseScaleX = width / textureWidth;
       const baseScaleY = height / textureHeight;
       const baseScale = Math.max(baseScaleX, baseScaleY);
@@ -623,6 +689,18 @@ export default class GameManagerScene extends Phaser.Scene {
           const textureHeight = source?.height || height;
           const logicalWidth = width / zoomFactor;
           const logicalHeight = height / zoomFactor;
+          if (layer.__isParallaxTile) {
+            // setScale on a TileSprite scales its footprint, not its tiles — resize the
+            // footprint and recompute the tile scale instead. Strips stay bottom-anchored
+            // at exactly one texture-height (no vertical wrap); y is re-pinned to the
+            // ground line by the update loop every frame.
+            const tileScale = (logicalHeight * (layer.__heightFrac || 0.5)) / textureHeight;
+            layer.setPosition(width / 2, layer.y);
+            layer.setSize(logicalWidth, textureHeight * tileScale);
+            layer.tileScaleX = tileScale;
+            layer.tileScaleY = tileScale;
+            return;
+          }
           const baseScaleX = logicalWidth / textureWidth;
           const baseScaleY = logicalHeight / textureHeight;
           const baseScale = Math.max(baseScaleX, baseScaleY);
@@ -661,6 +739,13 @@ export default class GameManagerScene extends Phaser.Scene {
             tile.setScale(scaleY);
             tile.setPosition(index * scaledWidth, this.LOGICAL_FLOOR_Y);
           });
+
+          if (this.floorFill) {
+            this.floorFill.setPosition(0, this.LOGICAL_FLOOR_Y + floorHeight);
+            this.floorFill.setSize(floorWidth, 1000);
+            this.floorFill.tileScaleX = scaleY;
+            this.floorFill.tileScaleY = scaleY;
+          }
         }
       }
 
@@ -671,10 +756,49 @@ export default class GameManagerScene extends Phaser.Scene {
     }, 150);
   }
 
+  startPlayerBob() {
+    if (this.playerBobTween && this.playerBobTween.isPlaying()) return;
+    this.stopPlayerBob();
+    this.playerBobTween = this.tweens.add({
+      targets: this.player,
+      angle: { from: -3, to: 3 },
+      duration: 110,
+      yoyo: true,
+      repeat: -1,
+      ease: 'Sine.easeInOut'
+    });
+  }
+
+  stopPlayerBob() {
+    if (this.playerBobTween) {
+      this.playerBobTween.stop();
+      this.playerBobTween = null;
+    }
+    if (this.player) this.player.setAngle(0);
+  }
+
   playPlayerAnim(animName) {
     if (this.gameConfig.dynamicAssetUrls) {
-      if (this.player && this.player.anims) {
+      if (!this.player || !this.player.anims) return;
+      // Generated run cycle when the pipeline delivered a sprite sheet; dedicated jump
+      // pose when the sheet carries one (jumpFrameIndex), else a mid-stride frame
+      if (this.anims.exists('dyn_player_run')) {
+        const frames = this.gameConfig.assetMeta?.slots?.player?.frames;
+        if (animName === 'run') {
+          this.player.play('dyn_player_run', true);
+        } else if (animName === 'idle') {
+          this.player.anims.stop();
+          this.player.setFrame(0);
+        } else if (animName === 'jump') {
+          this.player.anims.stop();
+          this.player.setFrame(frames?.jumpFrameIndex ?? 1);
+        }
+      } else {
+        // Static generated sprite (free path / sheet gates rejected) — a subtle
+        // procedural rocking tween so the runner doesn't look frozen mid-air
         this.player.anims.stop();
+        if (animName === 'run') this.startPlayerBob();
+        else this.stopPlayerBob();
       }
       return;
     }
@@ -783,13 +907,27 @@ export default class GameManagerScene extends Phaser.Scene {
 
     if (this.bgLayers && this.bgLayers.length) {
       const screenWidth = this.scale.width;
+      const groundY = this.LOGICAL_FLOOR_Y - (this.cameras?.main?.scrollY || 0);
       this.bgLayers.forEach((layer) => {
-        if (this.gameConfig.gameType === 'runner') {
+        if (layer.__isParallaxTile) {
+          // Wrapping scroll for generated layers — works in BOTH modes (runner uses
+          // virtualScrollX, so its background finally moves). tilePosition is in
+          // pre-scale texture pixels, hence the tileScale division. Bottom stays pinned
+          // to the ground line so the strips are visible ABOVE the floor.
+          layer.tilePositionX = (scrollX * (layer.__scrollSpeed || 0.1)) / (layer.tileScaleX || 1);
+          layer.y = groundY;
+        } else if (this.gameConfig.gameType === 'runner') {
           layer.x = screenWidth / 2;
         } else {
           layer.x = (screenWidth / 2) - (scrollX * (layer.__scrollSpeed || 0.1));
         }
       });
+    }
+
+    // Runner floor segments move; the underground fill must scroll in lockstep or its
+    // pattern visibly slides against the floor's top row
+    if (this.floorFill && this.gameConfig.gameType === 'runner') {
+      this.floorFill.tilePositionX = (this.virtualScrollX || 0) / (this.floorFill.tileScaleX || 1);
     }
     this.gameModeManager.update(time, delta);
   }
