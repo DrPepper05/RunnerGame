@@ -67,7 +67,7 @@ function enqueueRequest(task) {
  * Fetch + FileReader (rather than an <img> element) so the result is a data URL,
  * keeping downstream canvases untainted for pixel reads.
  */
-export function generateImage({ prompt, width, height, seed, timeoutMs = 90000 }) {
+export function generateImage({ prompt, width, height, seed, timeoutMs = 45000 }) {
   return enqueueRequest(async () => {
     const url = buildPollinationsUrl({ prompt, width, height, seed });
     const controller = new AbortController();

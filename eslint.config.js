@@ -5,7 +5,9 @@ import reactRefresh from 'eslint-plugin-react-refresh'
 import { defineConfig, globalIgnores } from 'eslint/config'
 
 export default defineConfig([
-  globalIgnores(['dist']),
+  // 'import' holds vendored third-party Phaser demos (phaser.min.js et al) — not our code.
+  // Linting them produced ~1480 of ~1554 errors and buried real findings in src/.
+  globalIgnores(['dist', 'import', 'scratch', 'generated_test_assets']),
   {
     files: ['**/*.{js,jsx}'],
     extends: [

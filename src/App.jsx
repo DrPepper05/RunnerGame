@@ -299,10 +299,11 @@ function App() {
     // Generation takes 15s–2min — surface it with the compiler overlay so the user
     // sees log/progress feedback instead of a silently frozen panel.
     const pushProgress = (logText, progressVal) => {
+      // Pipeline liveness ticks carry a pct with null text — keep the pct, skip the log
       setRegenState(prev => prev && {
         ...prev,
         progress: progressVal != null ? Math.max(prev.progress, progressVal) : prev.progress,
-        logs: [...prev.logs.slice(-9), logText]
+        logs: logText ? [...prev.logs.slice(-9), logText] : prev.logs
       });
     };
 

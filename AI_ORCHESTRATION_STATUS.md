@@ -1,177 +1,85 @@
-# AI Orchestration System - Status Report
+# AI Asset Generation - Status Report
+
+Updated 2026-07-20 after the from-scratch rebuild. The previous multi-provider
+orchestration (SEELE + 4 untested provider classes + CORS proxy) was deleted and replaced
+with `src/game/assetPipeline/`.
 
 ## Current State
 
-The AI orchestration system is implemented but not functioning correctly for production use. Assets are being generated but not at the required resolutions, which breaks game functionality.
+Working. One unified pipeline generates all 6 assets (background, floor, platform, player,
+enemy, obstacle) for every UI path:
 
-## What Works
+- **Primary provider:** Gemini (`gemini-2.5-flash-image`) via the official `@google/genai`
+  SDK, using `VITE_GEMINI_API_KEY` (or a key entered in the UI, stored in localStorage).
+- **Automatic fallback:** Pollinations.ai (free, keyless) whenever Gemini is missing a key,
+  hits quota, or errors. The app never hard-fails for lack of a key.
+- **Prompt design:** one `gemini-2.5-flash` text call turns the user prompt into a shared
+  style guide + six subject descriptors (structured JSON). Falls back to the local theme
+  tables on any failure. Invariant constraints (white background, facing right, tileable,
+  framing) are appended by code in `slotSpecs.js` — the LLM only supplies flavor.
 
-### Background Removal
-- Transparent backgrounds are generated correctly
-- White edges have been eliminated
-- Implementation uses proper alpha channel handling across all providers
+## How the dimension problem was solved
 
-### Multi-Provider Support
-The system successfully integrates with multiple AI providers:
-- Google Gemini + Imagen
-- SEELE AI
-- Stable Diffusion
-- DALL-E 3
-- Sprite Fusion
+No provider honors exact pixel dimensions, and none can output transparency. Instead of
+fighting that, the pipeline guarantees the contract in post-processing (`postprocess.js`):
+resize to per-slot canvas size (16:9 backgrounds center-crop to 1024×512), key out the flat
+white generation background (threshold 200/240 with edge blending), then auto-crop sprites
+to content so full-texture hitboxes stay fair. Aspect ratio is controlled at generation
+time via Gemini's `imageConfig.aspectRatio`.
 
-Provider switching can be done at runtime through the AssetOrchestrator class.
+## Phase 2 (2026-07-20): quality hardening + parallax + animation
 
-### System Architecture
-The following components are functional:
-- AssetOrchestrator.js - Handles provider abstraction and API calls
-- AssetSystemIntegration.js - Integrates with the game engine
-- ParallaxGroundSystem.js - Manages multi-layer backgrounds
-- SpriteAlignmentManager.js - Positions sprites relative to ground
-- TokenOptimizer.js - Caches responses to reduce API calls
+- **Flood-fill keying** (dominant-border-color seeded) replaced the global white threshold:
+  handles non-white backdrops, keeps white pixels inside sprites, works for layers whose
+  content touches an edge.
+- **Vision QA** on player/enemy: gemini-flash-latest checks facing + background; wrong
+  facing is mirrored client-side, dirty background re-keyed/regenerated once. Verified
+  facing overrides the in-game pixel heuristic (which caused the old random flips).
+- **Parallax**: optional `background_mid`/`background_near` keyed silhouette/prop layers,
+  rendered as three wrapping tileSprites. Runner-mode backgrounds scroll now (they were
+  static). Failed layers are dropped gracefully, never fatal.
+- **Animated player**: Gemini generates a 2×2 run-cycle sheet, union-cropped and registered
+  as a spritesheet with a 9fps run anim; transparency-gated with automatic static fallback.
 
-## What Doesn't Work
+## Cost / latency
 
-### Asset Resolution Control
-**Issue**: Assets are not generated at specified dimensions.
+- Gemini path: ~8 images + 2-4 near-free vision QA calls ≈ $0.31-0.35 per full generation,
+  ~15-25s. **Requires billing enabled on the API key** — free-tier keys have
+  zero image-model quota; the pipeline detects this in ~2s (quota circuit breaker) and
+  routes the whole run to the free path (which skips the sheet and may drop parallax
+  layers).
+- Pollinations path: free; goes through the built-in Vite proxy (Turnstile blocks direct
+  browser calls) and a strict serial queue (~1 concurrent generation allowed), so a full
+  6-asset generation takes ~1.5–2 minutes. Auth uses the `token` query param.
+- Dev flag: `localStorage.setItem('PM_FORCE_POLLINATIONS','1')` forces the free path for
+  testing even when a Gemini key is baked into the bundle.
 
-**Requested dimensions** (defined in ASSET_SPECS):
-- Player: 128x128 pixels
-- Enemy: 96x96 pixels
-- Platform: 256x64 pixels
-- Obstacle: 64x128 pixels
-- Floor: 2048x256 pixels
-- Backgrounds: 2048x768, 2048x512, 2048x384 pixels
+Verified end-to-end 2026-07-20: "lava runner" on the free path produced a cohesive 6-asset
+set (keyed sprites, tileable magma floor, 1024×512 volcanic background) and a playable game.
 
-**Actual behavior**:
-- Google Gemini returns 16:9 or 1:1 aspect ratios only
-- SEELE AI ignores dimension parameters completely
-- DALL-E 3 only generates 1024x1024, 512x512, or 1024x1792
-- Stable Diffusion has fixed preset sizes
-- Pollinations AI returns unpredictable dimensions
+## Deferred roadmap (designed, not yet implemented)
 
-**Impact**:
-- Sprites appear incorrectly sized in game
-- Collision detection fails
-- Visual consistency is broken
+- **Parallax mid/near background layers** — slot specs + white-keyed silhouette scaffolds;
+  `GameManagerScene` textureMap already carries `dyn_bg_mid`/`dyn_bg_near`.
+- **Animated player** — 2×2 sprite-sheet slot with union-bbox cropping and
+  `addSpriteSheet` registration; or Gemini image-editing for per-frame consistency.
 
-## How Current Implementation Works
+See CLAUDE.md ("Deferred roadmap") for the full designs.
 
-### Asset Generation Flow
+---
 
-1. **User Input**: Text prompt describing desired game theme
+# Historical notes (pre-rebuild, resolved)
 
-2. **Gemini Orchestration**:
-   - Generates game configuration (physics, difficulty, layout)
-   - Creates asset design directions and style guide
-   - Returns structured JSON with game parameters
+The system previously integrated SEELE AI (job/poll API via an Express CORS proxy) plus
+scaffolding for Imagen/DALL-E/Stable Diffusion/Sprite Fusion that was never exercised. The
+blocker was dimension control; the author's notes at the time:
 
-3. **Asset Generation**:
-   - System attempts to generate assets based on orchestrator output
-   - Each provider has its own class (GeminiImagenProvider, SeeleAIProvider, etc.)
-   - Requests include dimension parameters that are largely ignored
+> - seele seem to work but takes a lot of time
+> - google is in the works and possible to generate the best output out of them, but needs
+>   a lot of trial and error with teh system prompts, maybe use and sdk
+>
+> tldr status of the asset gen: finding the best recipe for asset generation
 
-4. **Current Workarounds**:
-   - Gemini uses Pollinations AI as fallback for image generation
-   - URLs are constructed with dimension hints in query parameters
-   - No post-processing to correct dimensions
-
-### Provider Integration Details
-
-**Google Gemini + Imagen**
-- API Key: VITE_GEMINI_API_KEY
-- Endpoint: generativelanguage.googleapis.com
-- Method: Uses Gemini for text generation, falls back to Pollinations for images
-- Limitation: Imagen API doesn't accept custom dimensions
-
-**SEELE AI**
-- API Key: VITE_SEELE_API_KEY
-- Endpoint: openapi.seeles.ai/v2/api/jobs
-- Method: Job-based generation with polling
-- Limitation: Dimension parameters in API calls are ignored
-- Requirement: Needs Koin credits and Standard tier for downloads
-
-**Stable Diffusion**
-- API Key: VITE_STABILITY_API_KEY
-- Endpoint: api.stability.ai/v1
-- Method: Direct API calls
-- Limitation: Limited to preset dimensions
-
-**DALL-E 3**
-- API Key: VITE_OPENAI_API_KEY
-- Endpoint: api.openai.com/v1/images/generations
-- Method: Direct generation
-- Limitation: Only three size options available
-
-## Configuration
-
-The system uses environment variables for API keys:
-
-```
-VITE_GEMINI_API_KEY=<key>
-VITE_SEELE_API_KEY=<key>
-VITE_OPENAI_API_KEY=<key>
-VITE_STABILITY_API_KEY=<key>
-```
-
-Provider selection is done through the AssetSystemIntegration class:
-
-```javascript
-const assetSystem = new AssetSystemIntegration({
-  provider: PROVIDERS.SEELE_AI,  // or GEMINI_IMAGEN, DALLE3, etc.
-  enableNewSystem: true,
-  enableParallax: true,
-  enableAlignment: true,
-  enableOptimization: true
-});
-```
-
-## Testing Status
-
-### Available Test Files
-- test-seele-correct.js - Tests SEELE API connectivity
-- SEELE_API_TEST.js - Tests SEELE generation endpoints
-- test-replicate.js - Tests Replicate.com integration
-- test_generation.cjs - General generation testing
-
-### Test Results
-- SEELE API connectivity: Working
-- SEELE generation: Returns images but wrong dimensions
-- Gemini orchestration: Working
-- Asset application to game: Fails due to dimension mismatch
-
-## Current Options Being Explored
-
-### SEELE AI
-- API integration complete
-- Generates images successfully
-- Cannot control output dimensions
-- Requires paid credits for each generation
-
-### Stable Diffusion
-- Integration code written
-- Not yet tested in production
-- May offer better control through custom deployments
-
-### DALL-E 3
-- Integration complete
-- Limited size options
-- High quality output
-- Expensive per generation
-
-### Google AI (Gemini)
-- Currently active as default
-- Using Pollinations AI for image generation
-- Works but dimensions are incorrect
-
-## Summary
-
-The system architecture is complete and functional. Multiple AI providers are integrated and can generate images. The critical failure point is that none of the current providers respect the requested asset dimensions, making the generated assets unusable in the game without additional processing. The background removal problem has been solved successfully, proving the system can work once dimension control is achieved.
-
-
-# Quick notes
-- seele seem to work but takes a lot of time
-- google is in the works and possible to generate the best output out of them, but needs a lot of trial and error with teh system prompts, maybe use and sdk
-
-
-# tldr status of the asset gen
--finding the best recipe for asset generation
+Resolution: went with Google via the SDK (as suspected, best output), moved the "recipe"
+into a structured prompt-designer call plus code-owned scaffolds, and made post-processing
+the dimension guarantee. SEELE, the proxy, and the unused provider classes were deleted.

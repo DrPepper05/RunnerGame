@@ -51,6 +51,27 @@ launches — with built-in theme artwork and a terminal line saying so.
     others in the same game. Needs a normalization pass so all assets read at the
     same fidelity level.
 
+## Deployed-version fix (2026-07-30, follow-up to Florian's report)
+
+The "stuck around 77% → Phaser `dyn_platform` load error → green collider boxes"
+behaviour was specific to the **deployed** build and had two causes, both fixed:
+
+1. **The Pollinations proxy only existed in the dev server.** The browser cannot call
+   `image.pollinations.ai` directly (Cloudflare blocks cross-origin requests), so the
+   app calls same-origin `/api/pollinations/*` and the dev server forwards it. The
+   deployed host had no such forwarding rule, so **every** free-path image request
+   failed in production — the free path could not possibly generate assets there.
+   Fixed by adding `vercel.json` with the equivalent rewrite; after redeploy the free
+   path works in production the same way it does locally.
+2. **The failure downgrade had a bug in the deployed build.** When generation failed,
+   the game was supposed to launch with built-in theme artwork — instead the deployed
+   Phaser preloader re-fetched the raw (broken) image URLs, raised the runtime error
+   dialog, and rendered green placeholder boxes for the missing textures. This was
+   already fixed locally but the fix had not been pushed; additionally the game scene
+   now double-checks at boot that its dynamic textures actually loaded and falls back
+   to built-in theme art (no error dialog) if any are missing. Failure now always
+   ends in a playable game.
+
 ## Quick guide for testing
 
 ### How to test

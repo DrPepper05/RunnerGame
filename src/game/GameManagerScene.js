@@ -21,7 +21,11 @@ export default class GameManagerScene extends Phaser.Scene {
     this.load.on('loaderror', (fileObj) => {
       const errorMsg = `Phaser Preloader failed to load asset key "${fileObj.key}" from URL: ${fileObj.url}`;
       console.error('[Phaser Preloader Error]', errorMsg);
-      window.dispatchEvent(new CustomEvent('playmint-error', { detail: { message: errorMsg } }));
+      // dyn_* failures are recoverable — create() detects the missing textures and
+      // downgrades to built-in theme art, so don't raise the fatal error dialog.
+      if (!String(fileObj.key).startsWith('dyn_')) {
+        window.dispatchEvent(new CustomEvent('playmint-error', { detail: { message: errorMsg } }));
+      }
     });
 
     this.load.on('filecomplete', (key, type, data) => {
@@ -38,8 +42,11 @@ export default class GameManagerScene extends Phaser.Scene {
     if (hasPreloaded) {
       console.log('[Phaser Preloader] Dynamic assets already registered via browser preloader. Bypassing loader requests.');
     } else {
-      // Guarantee that dynamicAssetUrls is always present
-      if (this.gameConfig && !this.gameConfig.dynamicAssetUrls) {
+      // undefined = legacy path with no URLs (share links / initial preset) → compile
+      // raw fallback URLs for the loader. EXPLICIT null = the asset pipeline failed
+      // and the UI chose the static-theme downgrade → do NOT fetch raw Pollinations
+      // URLs (they bypass the serial queue → 429s → error dialogs).
+      if (this.gameConfig && this.gameConfig.dynamicAssetUrls === undefined) {
         console.warn('[Phaser Preloader] Config missing dynamicAssetUrls. Compiling fallback assets on the fly...');
         this.gameConfig.dynamicAssetUrls = compileFallbackUrls(this.gameConfig);
       }
@@ -153,6 +160,22 @@ export default class GameManagerScene extends Phaser.Scene {
   }
 
   create() {
+    // Raw-URL boots (share links / presets, no preloadedImages) can lose every
+    // dyn_* texture to loader errors — e.g. a production host without the
+    // /api/pollinations rewrite, or Pollinations being down. dynamicAssetUrls
+    // truthiness routes EVERY texture pick to dyn_* keys, so a partial or total
+    // load failure renders green missing-texture boxes. Downgrade to built-in
+    // theme art instead (mirrors ScreenZero's toStaticThemeConfig).
+    if (this.gameConfig.dynamicAssetUrls && !this.gameConfig.preloadedImages) {
+      const required = ['dyn_bg_far', 'dyn_floor', 'dyn_player', 'dyn_enemy', 'dyn_obstacle',
+        ...(this.gameConfig.gameType === 'platformer' ? ['dyn_platform'] : [])];
+      const missing = required.filter(key => !this.textures.exists(key));
+      if (missing.length > 0) {
+        console.warn(`[Phaser GameManagerScene] Dynamic textures failed to load (${missing.join(', ')}) — falling back to built-in theme artwork.`);
+        this.gameConfig.dynamicAssetUrls = null;
+      }
+    }
+
     this.isGameOver = false;
     window.dispatchEvent(new CustomEvent('game-reset'));
     this.score = 0;
