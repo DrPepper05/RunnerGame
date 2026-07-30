@@ -37,11 +37,16 @@ user prompt
         ├─ player_sheet: STATIC player generated FIRST (full slot pipeline), then
         │                           the sheet — on Gemini as an image-EDIT call with
         │                           the static sprite as inlineData reference
-        │                           ("redraw THIS character in 9 poses") → per-cell
-        │                           key → local geometry gate + identity gate
-        │                           (per-cell color histograms) → union-crop →
-        │                           reassemble; any gate failure keeps the static
-        │                           base (already registered, no extra call)
+        │                           ("redraw THIS character in 9 poses"; free path
+        │                           asks for a 2×2 4-frame stride instead) → per-cell
+        │                           key+re-key → per-frame scoring (geometry +
+        │                           color-histogram identity), ≤2 bad run frames
+        │                           CULLED to a 1×N strip → align (center-x, shared
+        │                           baseline, capped height norm) → union-crop →
+        │                           reassemble; Gemini rung escalates to per-frame
+        │                           generation (≤10 image-edits of the reference)
+        │                           when the grid sheet fails; any terminal failure
+        │                           keeps the static base (already registered)
         └─> preloadedImages: { slot: HTMLImageElement } + assetMeta
               └─> GameManagerScene.init() registers as dyn_* textures
                   (addSpriteSheet when assetMeta.slots.player.frames is present)
@@ -130,13 +135,23 @@ with `meta.dropped` on failure — never fatal; `createBackgroundLayers` filters
   (a "clockwork castle" game is never called "Hoarfrost Path" again). ScreenZero's
   banned-word filter is whole-word (`\b`) — the old substring check silently swapped
   innocent prompts ("brASS automaton") for a random ice game.
-- **Sprite sheets are union-cropped, never per-frame** (per-frame crop makes animation
-  jitter), mirrored per-frame (whole-sheet mirror would swap cell order), and
-  transparency-gated ≥30% (a sheet with a painted scene can't be keyed → regen once →
-  static fallback). Sheets walk the normal provider ladder: Gemini is reliable;
-  Pollinations (sana) gets ONE gated attempt with no regeneration. A local geometry gate
-  (per-cell `contentBoundsOf`: no empty cells, content ≥30% of cell height, max/min
-  height ratio ≤1.35) rejects misaligned grids without needing a vision model.
+- **Sprite-sheet frames are ALIGNED per frame, then union-cropped** (`alignFrames` in
+  postprocess.js): each frame's content bbox is centered horizontally and bottom-anchored
+  to a shared baseline, run-frame heights pulled toward the median (>5% deviation only,
+  clamped ±20%) — this removes the model's per-cell drift, which WAS the main
+  "animation not continuous" complaint; the union crop (alpha≥16, so one stray pixel
+  can't inflate the box) then keeps a common frame box. Never crop per-frame to
+  content — that reintroduces jitter. Sheets are mirrored per-frame (whole-sheet mirror
+  would swap cell order), transparency-gated ≥30%, and each cell gets its own
+  key-quality pass (`keyCellWithQuality`: one tighter/looser re-key on shredded/residue
+  cells — prevents per-frame background flicker). Gating is per-frame, not
+  all-or-nothing: `evaluateAndCullCells` scores every run frame (geometry: empty or
+  <30% cell height; identity: 4×4×4 color-histogram L1 >0.9 vs the run-median) and
+  CULLS up to 2 bad run frames into a 1×N strip (`framesMeta {cols:N, rows:1, ...}`,
+  jump dropped → `jumpFrameIndex` omitted, `playPlayerAnim` falls back to frame 1);
+  ≥3 bad or <4 survivors rejects. Survivors re-checked for staticness
+  (`framesLookStatic`) and height ratio ≤1.35. Sheets walk the normal provider ladder:
+  Gemini is reliable; Pollinations (sana) gets ONE gated attempt with no regeneration.
 - **`config.dynamicAssetUrls` truthiness** is still the switch that routes every Phaser
   consumer between AI (`dyn_*`) and static-theme textures. It also serves as last-ditch
   raw URLs for paths with no preloading (`#config=` share links, initial preset) — Phaser's
@@ -294,50 +309,59 @@ output. `.env.example` is the tracked template.
   border. Visual only — collision (`this.floor`) untouched. In runner mode its
   `tilePositionX` tracks `virtualScrollX` so the pattern doesn't slide against the
   moving floor segments; resized alongside the floor in `handleResize`.
-- The player is a generated **3×3 spritesheet** whenever a provider delivers one that
-  passes the gates: cells 0-7 an 8-frame run cycle with alternating legs, cell 8 a
-  dedicated jump pose (spec `frames: {cols, rows, runFrameCount, jumpFrameIndex}` —
-  the scene reads these from assetMeta, so grid changes need no scene edits; old 2×2
-  metas still work). **`runSheetSlot` generates the STATIC player first** (full slot
-  pipeline: keying, QA, facing correction), then the sheet: on the Gemini rung the
-  sheet request is an image-EDIT call with the static sprite attached as inlineData
-  reference ("redraw THIS EXACT character") — single-shot "draw the same character
-  9 times" was the root cause of a different-looking character per cell. Sheet
-  failure keeps the already-registered static base (no extra call); sheet success
-  overwrites the player image+meta WITHOUT a second doneCount increment. The sheet
-  scaffold leads with IDENTITY ("copied nine times, only limb poses redrawn"), then
-  names all EIGHT run-cycle phases cell by cell — do NOT add "every cell must differ
-  from every other cell" pressure: a run cycle legitimately repeats its passing poses
-  (cells 2/6), and that pressure makes models redesign the character per cell
-  (regression observed 2026-07-30). Local guards: `framesLookStatic` (12×12 alpha
-  signatures, half of consecutive run-frame pairs identical → reject),
-  `gridGeometryIssue` (empty/undersized/inconsistent cells), and `cellsLookUnrelated`
-  (per-cell 4×4×4 RGB histograms over opaque pixels vs element-wise median, L1 > 0.9
-  on ≥2 run cells → "different character per frame" — the identity check the free
-  path needs because vision `gridConsistent` is Gemini-only). Vision guards (Gemini):
-  `gridConsistent`, `legsAlternate`. Registered via `addSpriteSheet`, animated as
-  `dyn_player_run` (12fps for ≥8 frames); `playPlayerAnim`: run → cycle, idle →
-  frame 0, jump → jumpFrameIndex. **Sheets are keyed PER CELL** (`processSheet`:
-  slice with a 3px inset → flood-key each cell) — a whole-sheet flood can never reach
-  an interior cell's backdrop (3×3 center), and the inset discards model-drawn grid
-  lines. One regeneration for any quality failure, then keep the static base — except
-  on the Pollinations rung, which never regenerates (one serial-queue slot max; the
-  free path now always spends 2 serialized calls on the player: static then sheet
-  attempt — same as its old typical failure case).
+- The player is a generated **spritesheet** whenever a provider delivers frames that
+  pass the gates: on Gemini a 3×3 (cells 0-7 an 8-frame run cycle with alternating
+  legs, cell 8 a dedicated jump pose); on the free path a **2×2 4-frame stride**
+  (`player_sheet.freeVariant`: 512×512, poses contact-R/pass/contact-L/pass =
+  RUN_CYCLE_POSES[0,1,4,5], `jumpFrameIndex: 1` — the pass pose doubles as the jump
+  frame, there is no dedicated jump cell). The variant follows `isGeminiConfigured()`
+  AT RUN START only — a mid-run `skipGemini` flip must NOT switch specs, the prompt
+  was already built for the other grid (`buildFinalPrompt {free}` and `runSheetSlot`
+  `activeSpec` share this rule). Spec `frames: {cols, rows, runFrameCount,
+  jumpFrameIndex}` — the scene reads these from assetMeta, so ANY grid or 1×N strip
+  needs no scene edits. **`runSheetSlot` generates the STATIC player first** (full
+  slot pipeline: keying, QA, facing correction), then the sheet: on the Gemini rung
+  the sheet request is an image-EDIT call with the static sprite attached as
+  inlineData reference ("redraw THIS EXACT character") — single-shot "draw the same
+  character 9 times" was the root cause of a different-looking character per cell.
+  Pose choreography lives in ONE place: `RUN_CYCLE_POSES`/`JUMP_POSE` in slotSpecs.js
+  (used by both scaffolds AND the per-frame escalation prompts). The scaffolds lead
+  with IDENTITY ("copied nine/four times, only limb poses redrawn") — do NOT add
+  "every cell must differ from every other cell" pressure: a run cycle legitimately
+  repeats its passing poses (cells 2/6), and that pressure makes models redesign the
+  character per cell (regression observed 2026-07-30). **Gemini escalation rung**
+  (`generatePerFrameSheet`): when the grid sheet fails its gates and Gemini is alive,
+  each pose is drawn as its OWN image-edit of the reference (worker pool 3, hard cap
+  10 calls, 1 shared retry; dead quota/auth aborts and sets `skipGemini`), keyed as
+  cells, scored/culled the same way (≥4 run frames must survive), assembled as a 1×N
+  strip, one vision call for facing only — `meta.player.perFrame: true`. Sheet
+  failure keeps the already-registered static base; sheet success overwrites the
+  player image+meta WITHOUT a second doneCount increment. Gates are per-frame
+  (`evaluateAndCullCells` — see the design-rules bullet). Vision guards (Gemini grid
+  sheets): `gridConsistent`, `legsAlternate`. Registered via `addSpriteSheet`,
+  animated as `dyn_player_run` (frameRate 12 @ ≥8 frames, 10 @ 6-7, 8 @ 4-5);
+  `playPlayerAnim`: run → cycle, idle → frame 0, jump → `jumpFrameIndex ?? 1`.
+  **Sheets are keyed PER CELL** (`processSheet`: slice with a 3px inset →
+  `keyCellWithQuality` each cell) — a whole-sheet flood can never reach an interior
+  cell's backdrop (3×3 center), and the inset discards model-drawn grid lines. One
+  regeneration for any quality failure (then per-frame escalation on Gemini, then
+  static base) — except on the Pollinations rung, which never regenerates (one
+  serial-queue slot max; the free path always spends 2 serialized calls on the
+  player: static then sheet attempt).
 - Static dynamic players (sheet gates rejected / free path) get a **procedural run bob**
   (`startPlayerBob`/`stopPlayerBob` in GameManagerScene: ±3° angle tween, 110ms yoyo) so
   the player never looks frozen; idle/jump reset the angle to 0.
 
 ## Deferred roadmap (designed, not implemented)
 
-- **Enemy animation**: reuse the `player_sheet` machinery (spec + `finalizeSheet` +
-  `addSpriteSheet` branch) for an `enemy_sheet` slot. (The image-editing-with-reference
-  approach is now IMPLEMENTED for the player sheet — an enemy_sheet gets it for free
-  via runSheetSlot.)
-- **4-frame free-path cycle**: if free-path sheets still ~never pass the gates, drop
-  the free-path ask to a 2×2 4-frame stride (contact-R / pass / contact-L / pass) —
-  fewer, larger cells are dramatically easier for sana, and the scene already reads
-  arbitrary grids from `assetMeta.slots.player.frames`.
+- **Enemy animation**: reuse the `player_sheet` machinery (spec + `finalizeSheetFrames`
+  + `addSpriteSheet` branch) for an `enemy_sheet` slot. An enemy_sheet gets the
+  reference-edit call, per-frame alignment/culling AND the per-frame Gemini
+  escalation for free via runSheetSlot — it needs its own pose table (walk/skitter,
+  not a human run cycle).
+
+(The 4-frame free-path 2×2 cycle from this list was IMPLEMENTED 2026-07-31 —
+see the player-sheet bullet above.)
 
 ## Notes for AI assistants
 

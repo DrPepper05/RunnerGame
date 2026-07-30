@@ -60,14 +60,16 @@ export function alphaFraction(canvas) {
 
 /**
  * Bounding box of non-transparent pixels in a single canvas, or null when empty.
+ * `alphaMin` raises the opacity bar — alignment passes use ≥16 so a single stray
+ * semi-transparent pixel can't skew the box.
  */
-export function contentBoundsOf(canvas) {
+export function contentBoundsOf(canvas, { alphaMin = 1 } = {}) {
   const w = canvas.width, h = canvas.height;
   const data = canvas.getContext('2d').getImageData(0, 0, w, h).data;
   let minX = Infinity, minY = Infinity, maxX = -1, maxY = -1;
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
-      if (data[(y * w + x) * 4 + 3] > 0) {
+      if (data[(y * w + x) * 4 + 3] >= alphaMin) {
         if (x < minX) minX = x;
         if (x > maxX) maxX = x;
         if (y < minY) minY = y;
@@ -448,14 +450,14 @@ export function sliceGrid(canvas, { cols, rows }) {
  * character anchored across the cycle; per-frame crops would make the animation jitter.
  * Returns null when every frame is empty.
  */
-export function unionContentBounds(frames) {
+export function unionContentBounds(frames, { alphaMin = 1 } = {}) {
   let minX = Infinity, minY = Infinity, maxX = -1, maxY = -1;
   for (const frame of frames) {
     const w = frame.width, h = frame.height;
     const data = frame.getContext('2d').getImageData(0, 0, w, h).data;
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
-        if (data[(y * w + x) * 4 + 3] > 0) {
+        if (data[(y * w + x) * 4 + 3] >= alphaMin) {
           if (x < minX) minX = x;
           if (x > maxX) maxX = x;
           if (y < minY) minY = y;
@@ -466,6 +468,62 @@ export function unionContentBounds(frames) {
   }
   if (maxX === -1) return null;
   return { minX, minY, maxX, maxY };
+}
+
+/**
+ * Normalize per-frame drift before the union crop. Image models place and size the
+ * character slightly differently in every cell; played back, that drift reads as
+ * teleporting/wobbling — the main "animation is not continuous" driver. Each frame is
+ * redrawn on a fresh cell canvas with its content bbox centered horizontally and its
+ * bottom on a shared baseline, and run-frame heights are pulled toward the median
+ * (only when >5% off, clamped to ±20%). The jump frame is aligned but never scaled —
+ * a tucked jump pose is legitimately shorter than a stride.
+ */
+export function alignFrames(frames, { runFrameCount = frames.length, alphaMin = 16 } = {}) {
+  const boxes = frames.map((frame) =>
+    contentBoundsOf(frame, { alphaMin }) || contentBoundsOf(frame));
+
+  const runHeights = boxes
+    .slice(0, runFrameCount)
+    .filter(Boolean)
+    .map((b) => b.maxY - b.minY + 1)
+    .sort((a, b) => a - b);
+  const medianH = runHeights.length
+    ? runHeights[Math.floor(runHeights.length / 2)]
+    : 0;
+
+  return frames.map((frame, i) => {
+    const box = boxes[i];
+    if (!box) return frame; // empty frame — the gates deal with it
+
+    const cellW = frame.width, cellH = frame.height;
+    const boxW = box.maxX - box.minX + 1;
+    const boxH = box.maxY - box.minY + 1;
+
+    let scale = 1;
+    if (i < runFrameCount && medianH > 0) {
+      const raw = medianH / boxH;
+      if (Math.abs(raw - 1) > 0.05) {
+        scale = Math.max(0.8, Math.min(1.2, raw));
+        // never scale the content out of its cell
+        scale = Math.min(scale, cellW / boxW, cellH / boxH);
+      }
+    }
+
+    const drawW = boxW * scale;
+    const drawH = boxH * scale;
+    const baseline = cellH - 2;
+    let dx = Math.round(cellW / 2 - drawW / 2);
+    let dy = Math.round(baseline - drawH);
+    dx = Math.max(0, Math.min(dx, Math.floor(cellW - drawW)));
+    dy = Math.max(0, Math.min(dy, Math.floor(cellH - drawH)));
+
+    const out = document.createElement('canvas');
+    out.width = cellW;
+    out.height = cellH;
+    out.getContext('2d').drawImage(frame, box.minX, box.minY, boxW, boxH, dx, dy, drawW, drawH);
+    return out;
+  });
 }
 
 /**
@@ -495,6 +553,45 @@ function insetCanvas(canvas, inset) {
   return out;
 }
 
+function cloneCanvas(canvas) {
+  const out = document.createElement('canvas');
+  out.width = canvas.width;
+  out.height = canvas.height;
+  out.getContext('2d').drawImage(canvas, 0, 0);
+  return out;
+}
+
+/**
+ * Flood-key one sheet cell with the same self-check the single-sprite path gets from
+ * enforceKeyQuality: measure coverage + near-white border residue, then ONE conditional
+ * re-key from a pristine copy (tighter when the flood shredded the sprite, looser when
+ * it left backdrop). Without this, residue appears on some cells and not others and
+ * plays back as per-frame background flicker. Cells are uncropped, so the outer band
+ * of the cell is exactly where leftover backdrop lives.
+ */
+export function keyCellWithQuality(cell) {
+  const pristine = cloneCanvas(cell);
+  const keyed = removeBorderBackground(cell);
+  const transparent = alphaFraction(keyed);
+  const residue = borderResidueFraction(keyed);
+
+  if (transparent > 0.92) {
+    const retried = removeBorderBackground(cloneCanvas(pristine), { seedTol: 26, stepTol: 10 });
+    const after = { transparent: alphaFraction(retried), residue: borderResidueFraction(retried) };
+    return after.transparent <= transparent - 0.1 && after.residue <= 0.06 ? retried : keyed;
+  }
+
+  if (transparent < 0.05 || residue > 0.06) {
+    const retried = removeBorderBackground(cloneCanvas(pristine), { seedTol: 70, stepTol: 24 });
+    const after = { transparent: alphaFraction(retried), residue: borderResidueFraction(retried) };
+    const spriteSurvived = after.transparent < 0.97;
+    const improved = after.residue < residue || (transparent < 0.05 && after.transparent >= 0.05);
+    return spriteSurvived && improved ? retried : keyed;
+  }
+
+  return keyed;
+}
+
 /**
  * Draw a raw sheet at spec size, slice it, and flood-key EACH CELL independently.
  *
@@ -509,7 +606,7 @@ export async function processSheet(rawSrc, spec, { inset = 3 } = {}) {
   const canvas = drawToCanvas(img, { ...spec.canvas, fit: spec.post.fit });
   const cells = sliceGrid(canvas, spec.frames)
     .map((cell) => insetCanvas(cell, inset))
-    .map((cell) => removeBorderBackground(cell))
+    .map((cell) => keyCellWithQuality(cell))
     .map((cell) => cleanKeyedEdges(cell, { erode: 1, outline: !!spec.post.outline }));
   const preview = assembleSheet(cells, spec.frames);
   const previewImg = await loadImage(preview.canvas.toDataURL('image/png'), { crossOrigin: null });
@@ -519,25 +616,37 @@ export async function processSheet(rawSrc, spec, { inset = 3 } = {}) {
 /**
  * Turn keyed cells into the final uniform spritesheet:
  * mirror per-frame if requested (mirroring the whole sheet would swap the cell order)
- * → crop all frames to the union bbox (per-frame crop would make animation jitter)
+ * → align frames (center-x + shared bottom baseline + capped height normalization —
+ *   removes the model's per-cell drift, the main animation-jitter source)
+ * → crop all frames to the union bbox at alpha≥16 (per-frame crop would re-introduce
+ *   jitter; the alpha bar keeps one stray pixel from inflating the box)
  * → reassemble → decoded image. Returns null when the cells have no content.
+ * `framesMeta` overrides spec.frames for culled or per-frame-generated layouts
+ * (e.g. a 1×N strip); the returned meta contract is unchanged.
  */
-export async function finalizeSheetFrames(cells, spec, { mirror = false } = {}) {
-  let frames = mirror ? cells.map(mirrorCanvas) : cells;
-  const bounds = unionContentBounds(frames);
+export async function finalizeSheetFrames(cells, spec, { mirror = false, framesMeta = null } = {}) {
+  const layout = framesMeta || spec.frames;
+  const mirrored = mirror ? cells.map(mirrorCanvas) : cells;
+  const frames = alignFrames(mirrored, { runFrameCount: layout.runFrameCount ?? cells.length });
+  const bounds = unionContentBounds(frames, { alphaMin: 16 });
   if (!bounds) return null;
-  const cw = bounds.maxX - bounds.minX + 1;
-  const ch = bounds.maxY - bounds.minY + 1;
+  const pad = 2;
+  const minX = Math.max(0, bounds.minX - pad);
+  const minY = Math.max(0, bounds.minY - pad);
+  const maxX = Math.min(frames[0].width - 1, bounds.maxX + pad);
+  const maxY = Math.min(frames[0].height - 1, bounds.maxY + pad);
+  const cw = maxX - minX + 1;
+  const ch = maxY - minY + 1;
   const cropped = frames.map((frame) => {
     const out = document.createElement('canvas');
     out.width = cw;
     out.height = ch;
-    out.getContext('2d').putImageData(frame.getContext('2d').getImageData(bounds.minX, bounds.minY, cw, ch), 0, 0);
+    out.getContext('2d').putImageData(frame.getContext('2d').getImageData(minX, minY, cw, ch), 0, 0);
     return out;
   });
-  const { canvas, frameWidth, frameHeight } = assembleSheet(cropped, spec.frames);
+  const { canvas, frameWidth, frameHeight } = assembleSheet(cropped, layout);
   const sheetImg = await loadImage(canvas.toDataURL('image/png'), { crossOrigin: null });
-  return { img: sheetImg, frames: { ...spec.frames, frameWidth, frameHeight } };
+  return { img: sheetImg, frames: { ...layout, frameWidth, frameHeight } };
 }
 
 /**

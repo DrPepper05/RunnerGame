@@ -31,6 +31,37 @@ export const GEMINI_TEXT_MODEL = 'gemini-flash-latest';
  *                      the designer (LLM or local) only supplies the subject descriptor
  *  - fallbackSubject   picks the subject out of assetDesignDirections when no designer ran
  */
+// The eight canonical run-cycle phases (contact/pass/airborne/reach, right lead then
+// left lead) — the single source for the 3×3 sheet scaffold, the free-path 2×2
+// variant, and the Gemini per-frame escalation prompts. Order matters: indices
+// 0/1/4/5 (contact-R, pass, contact-L, pass) form a valid standalone 4-frame loop.
+export const RUN_CYCLE_POSES = [
+  'right foot planted on the ground ahead, left leg trailing behind, left arm swung forward, right arm swung back',
+  'legs passing close together under the crouched body, arms pumping at the sides',
+  'airborne, left knee lifted in front, right leg trailing behind, right arm swung forward',
+  'left foot reaching forward about to land, arms passing level',
+  'left foot planted on the ground ahead, right leg trailing behind, right arm swung forward, left arm swung back — the same stride as the first contact pose with the legs swapped',
+  'legs passing close together under the crouched body, arms pumping at the sides',
+  'airborne, right knee lifted in front, left leg trailing behind, left arm swung forward',
+  'right foot reaching forward about to land, arms passing level'
+];
+
+export const JUMP_POSE = 'mid-air jump pose with both knees tucked up and arms out for balance';
+
+// Shared sheet-prompt clauses (identity first — see the design note on player_sheet).
+const SHEET_IDENTITY_CLAUSE = (count) =>
+  `IDENTICAL character in every cell — same face, same hair, same outfit, same colors, ` +
+  `same proportions, same held items — as if one drawing was copied ${count} times and ` +
+  `ONLY the arm and leg poses were redrawn.`;
+const SHEET_HELD_ITEM_CLAUSE =
+  `Any weapon or held item stays gripped in the same hand in every cell and tilts ` +
+  `with that arm as it swings.`;
+const SHEET_FRAMING_CLAUSE =
+  `Character faces right in side profile in every cell, same character size and same ` +
+  `ground line in every cell, each character centered in its own grid cell, isolated ` +
+  `on a plain pure white background in every cell, no scenery, no floor, no shadows, ` +
+  `no motion lines, no grid lines, no cell borders, no text`;
+
 export const SLOT_SPECS = {
   background_far: {
     textureKey: 'dyn_bg_far',
@@ -169,6 +200,9 @@ export const SLOT_SPECS = {
     fallbackSlot: 'player',
     subjectKey: 'player',
     qa: { facing: true, grid: true },
+    // Shared pose descriptors: the 3×3 scaffold, the free 2×2 variant, and the
+    // Gemini per-frame escalation all draw from this single source.
+    poses: { run: RUN_CYCLE_POSES, jump: JUMP_POSE },
     // The eight canonical run-cycle phases are named cell by cell — an abstract
     // "alternating legs" instruction produces eight near-identical poses; explicit
     // per-cell choreography (contact/down/passing/up, right lead then left lead)
@@ -182,26 +216,36 @@ export const SLOT_SPECS = {
     // different" pressure makes models redesign the character per cell.
     scaffold: (subject, style) =>
       `sprite sheet, a 3x3 grid of nine animation frames of the EXACT SAME video game ` +
-      `character: ${subject}. IDENTICAL character in every cell — same face, same hair, ` +
-      `same outfit, same colors, same proportions, same held items — as if one drawing ` +
-      `was copied nine times and ONLY the arm and leg poses were redrawn. ` +
+      `character: ${subject}. ${SHEET_IDENTITY_CLAUSE('nine')} ` +
       `Reading left to right, top to bottom, cells 1 to 8 are the eight phases of one ` +
       `full running stride: ` +
-      `cell 1: right foot planted on the ground ahead, left leg trailing behind, left arm swung forward, right arm swung back; ` +
-      `cell 2: legs passing close together under the crouched body, arms pumping at the sides; ` +
-      `cell 3: airborne, left knee lifted in front, right leg trailing behind, right arm swung forward; ` +
-      `cell 4: left foot reaching forward about to land, arms passing level; ` +
-      `cell 5: left foot planted on the ground ahead, right leg trailing behind, right arm swung forward, left arm swung back — the same stride as cell 1 with the legs swapped; ` +
-      `cell 6: legs passing close together under the crouched body, arms pumping at the sides; ` +
-      `cell 7: airborne, right knee lifted in front, left leg trailing behind, left arm swung forward; ` +
-      `cell 8: right foot reaching forward about to land, arms passing level; ` +
-      `cell 9 (bottom-right): mid-air jump pose with both knees tucked up and arms out for balance. ` +
-      `Any weapon or held item stays gripped in the same hand in every cell and tilts ` +
-      `with that arm as it swings. ` +
-      `Character faces right in side profile in every cell, same character size and same ` +
-      `ground line in every cell, each character centered in its own grid cell, isolated ` +
-      `on a plain pure white background in every cell, no scenery, no floor, no shadows, ` +
-      `no motion lines, no grid lines, no cell borders, no text, ${style}`,
+      RUN_CYCLE_POSES.map((pose, i) => `cell ${i + 1}: ${pose}; `).join('') +
+      `cell 9 (bottom-right): ${JUMP_POSE}. ` +
+      `${SHEET_HELD_ITEM_CLAUSE} ` +
+      `${SHEET_FRAMING_CLAUSE}, ${style}`,
+    // Free-path (sana) variant: a 2×2 four-frame stride. Nine small cells are beyond
+    // sana — four larger cells pass the gates often enough to actually animate.
+    // Poses: contact-R / pass / contact-L / pass = a complete straight loop.
+    // jumpFrameIndex 1 (the pass pose, legs gathered under a crouched body) doubles
+    // as the jump frame — there is no dedicated jump cell.
+    // The variant applies iff !isGeminiConfigured() AT RUN START (prompt and spec
+    // must agree); a mid-run skipGemini flip does NOT switch variants.
+    freeVariant: {
+      canvas: { width: 512, height: 512 },
+      gen: { aspectRatio: '1:1', pollinations: { width: 512, height: 512 } },
+      frames: { cols: 2, rows: 2, runFrameCount: 4, jumpFrameIndex: 1 },
+      scaffold: (subject, style) =>
+        `sprite sheet, a 2x2 grid of four animation frames of the EXACT SAME video game ` +
+        `character: ${subject}. ${SHEET_IDENTITY_CLAUSE('four')} ` +
+        `Reading left to right, top to bottom, the four cells are the four phases of one ` +
+        `full running stride: ` +
+        `cell 1: ${RUN_CYCLE_POSES[0]}; ` +
+        `cell 2: ${RUN_CYCLE_POSES[1]}; ` +
+        `cell 3: ${RUN_CYCLE_POSES[4]}; ` +
+        `cell 4: ${RUN_CYCLE_POSES[5]}. ` +
+        `${SHEET_HELD_ITEM_CLAUSE} ` +
+        `${SHEET_FRAMING_CLAUSE}, ${style}`
+    },
     fallbackSubject: (d) => d?.player
   },
   obstacle: {

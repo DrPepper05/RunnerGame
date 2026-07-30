@@ -8,7 +8,7 @@
  * theme art, App surfaces it in the regen overlay) — no global error event here.
  */
 import { SLOT_SPECS, BASELINE_SLOTS, GENERATED_SLOTS } from './slotSpecs';
-import { postProcessAsset, mirrorImage, drawToCanvas, alphaFraction, borderResidueFraction, topBandOpaqueFraction, contentBoundsOf, processSheet, finalizeSheetFrames } from './postprocess';
+import { postProcessAsset, mirrorImage, drawToCanvas, alphaFraction, borderResidueFraction, topBandOpaqueFraction, contentBoundsOf, processSheet, finalizeSheetFrames, loadImage, keyCellWithQuality, cleanKeyedEdges } from './postprocess';
 import { reviewSprite } from './qa';
 import * as gemini from './providers/geminiImage';
 import * as pollinations from './providers/pollinations';
@@ -24,8 +24,8 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
  * instead of each burning retries and long quota waits.
  * Returns { dataUrl, provider, attempts }.
  */
-async function generateSlotImage(slot, prompt, seed, onProgress, maxAttemptsPerProvider, runState, onAttempt = () => {}, referenceImageDataUrl = null) {
-  const spec = SLOT_SPECS[slot];
+async function generateSlotImage(slot, prompt, seed, onProgress, maxAttemptsPerProvider, runState, onAttempt = () => {}, referenceImageDataUrl = null, specOverride = null) {
+  const spec = specOverride || SLOT_SPECS[slot];
   let attempts = 0;
   let lastError = null;
 
@@ -235,6 +235,14 @@ export async function generateAssets({
     await runSlot(spec.fallbackSlot);
     const baseSrc = preloadedImages[spec.fallbackSlot]?.src || null;
 
+    // Free-path variant (e.g. the 2×2 four-frame stride): selected by the SAME
+    // run-start rule the prompt was built with (buildFinalPrompt {free}), so spec
+    // and prompt always describe the same grid. A mid-run skipGemini flip must NOT
+    // switch variants — the prompt already asked for the other layout.
+    const activeSpec = (!gemini.isGeminiConfigured() && spec.freeVariant)
+      ? { ...spec, ...spec.freeVariant }
+      : spec;
+
     report(`[ASSETS] Generating animated ${spec.outputKey || slot}...`);
     const onAttempt = attemptTicker(slot);
     try {
@@ -245,27 +253,10 @@ export async function generateAssets({
         const canvas = drawToCanvas(img, { width: img.naturalWidth, height: img.naturalHeight, fit: 'stretch' });
         return alphaFraction(canvas);
       };
-      // Local geometry gate — no vision model required (the free path has none).
-      // Misaligned grids (characters straddling cell borders, wildly varying sizes)
-      // slice into frames that pulse or show half-characters; per-cell content
-      // bounds catch that deterministically.
-      const gridGeometryIssue = (cells) => {
-        const heights = [];
-        for (const cell of cells) {
-          const bounds = contentBoundsOf(cell);
-          if (!bounds) return 'has empty cells';
-          const height = bounds.maxY - bounds.minY + 1;
-          if (height < cell.height * 0.3) return 'has undersized frames';
-          heights.push(height);
-        }
-        if (Math.max(...heights) / Math.min(...heights) > 1.35) return 'has inconsistent frame sizes';
-        return null;
-      };
       // A sheet of near-identical poses animates as a nervous shiver, not a run.
       // Compare consecutive run frames on a coarse 12×12 alpha grid; if most pairs
       // are effectively the same image, the model ignored the cycle choreography.
-      const framesLookStatic = (cells) => {
-        const runCount = Math.min(spec.frames.runFrameCount || cells.length, cells.length);
+      const framesLookStatic = (runCells) => {
         const signature = (cell) => {
           const small = document.createElement('canvas');
           small.width = 12; small.height = 12;
@@ -273,25 +264,22 @@ export async function generateAssets({
           ctx.drawImage(cell, 0, 0, 12, 12);
           return ctx.getImageData(0, 0, 12, 12).data;
         };
-        const sigs = cells.slice(0, runCount).map(signature);
+        const sigs = runCells.map(signature);
         let staticPairs = 0;
         for (let i = 1; i < sigs.length; i++) {
           let diff = 0;
           for (let p = 3; p < sigs[i].length; p += 4) diff += Math.abs(sigs[i][p] - sigs[i - 1][p]);
           if (diff / (144 * 255) < 0.015) staticPairs++;
         }
-        return staticPairs >= Math.floor((runCount - 1) / 2);
+        return staticPairs >= Math.floor((runCells.length - 1) / 2);
       };
-      // A sheet can pass every size gate while drawing a DIFFERENT character in
-      // each cell — the local gates check geometry, and the vision check that
-      // catches identity drift (gridConsistent) is Gemini-only, so on the free
-      // path incoherent sheets used to ship. Same character in a new pose keeps
-      // its palette; a redesigned character shifts it — compare per-cell coarse
-      // color histograms (4×4×4 RGB buckets over opaque pixels) against the
-      // element-wise median. L1 distance ranges 0..2; >0.9 = mostly different
-      // palette. Two or more outlier cells = not one character.
-      const cellsLookUnrelated = (cells) => {
-        const runCount = Math.min(spec.frames.runFrameCount || cells.length, cells.length);
+      // Identity drift scoring. Same character in a new pose keeps its palette; a
+      // redesigned character shifts it — compare per-cell coarse color histograms
+      // (4×4×4 RGB buckets over opaque pixels) against the element-wise median of
+      // the RUN cells. L1 distance ranges 0..2; >0.9 = mostly different palette.
+      // Returns one distance per cell (jump scored against the run median too),
+      // or null when too few cells have content (geometry's job to reject).
+      const frameHistogramDistances = (cells, runCount) => {
         const histogram = (cell) => {
           const small = document.createElement('canvas');
           small.width = 32; small.height = 32;
@@ -307,19 +295,155 @@ export async function generateAssets({
           }
           return opaque ? buckets.map(b => b / opaque) : null;
         };
-        const hists = cells.slice(0, runCount).map(histogram);
-        if (hists.some(h => !h)) return false; // empty cells are the geometry gate's job
-        const median = hists[0].map((_, i) => {
-          const col = hists.map(h => h[i]).sort((a, b) => a - b);
+        const hists = cells.map(histogram);
+        const runHists = hists.slice(0, runCount).filter(Boolean);
+        if (runHists.length < 3) return null;
+        const median = runHists[0].map((_, i) => {
+          const col = runHists.map(h => h[i]).sort((a, b) => a - b);
           return col[Math.floor(col.length / 2)];
         });
-        let outliers = 0;
-        for (const h of hists) {
+        return hists.map((h) => {
+          if (!h) return 0; // empty cell — geometry flags it
           let dist = 0;
           for (let i = 0; i < 64; i++) dist += Math.abs(h[i] - median[i]);
-          if (dist > 0.9) outliers++;
+          return dist;
+        });
+      };
+      // Per-frame quality verdict: instead of rejecting a whole sheet for one or two
+      // bad cells (the old all-or-nothing gates threw away 7 good frames), score
+      // every frame — geometry (empty/undersized) and identity (histogram outlier)
+      // — and CULL up to two bad run frames, rebuilding a 1×N strip. The scene
+      // derives its layout entirely from the frames meta, so a strip needs no scene
+      // changes. gridMeta is the meta to keep when nothing is culled; pass null for
+      // already-loose frame lists (per-frame escalation) to always get a strip.
+      const evaluateAndCullCells = (cells, gridMeta, runCountOverride = null) => {
+        const runCount = Math.min(runCountOverride ?? gridMeta?.runFrameCount ?? cells.length, cells.length);
+        const hasJump = cells.length > runCount;
+        const jumpCell = hasJump ? cells[cells.length - 1] : null;
+
+        const bad = new Array(cells.length).fill(false);
+        let geomIssue = null;
+        cells.forEach((cell, i) => {
+          const bounds = contentBoundsOf(cell);
+          const issue = !bounds ? 'has empty cells'
+            : (bounds.maxY - bounds.minY + 1 < cell.height * 0.3 ? 'has undersized frames' : null);
+          if (issue) { bad[i] = true; geomIssue = geomIssue || issue; }
+        });
+        const dists = frameHistogramDistances(cells, runCount);
+        let identityIssue = false;
+        if (dists) {
+          cells.forEach((_, i) => {
+            if (dists[i] > 0.9) { bad[i] = true; if (i < runCount) identityIssue = true; }
+          });
         }
-        return outliers >= 2;
+
+        const badRunCount = bad.slice(0, runCount).filter(Boolean).length;
+        const keptRun = cells.slice(0, runCount).filter((_, i) => !bad[i]);
+        if (badRunCount > 2 || keptRun.length < 4) {
+          return { issue: identityIssue ? 'draws a different character per frame' : (geomIssue || 'has inconsistent frames') };
+        }
+        // Survivors must still read as one coherent cycle (same thresholds as the
+        // old whole-sheet gates, applied to what actually ships).
+        if (framesLookStatic(keptRun)) return { issue: 'has near-identical frames' };
+        const heights = keptRun.map((c) => {
+          const b = contentBoundsOf(c);
+          return b.maxY - b.minY + 1;
+        });
+        if (Math.max(...heights) / Math.min(...heights) > 1.35) return { issue: 'has inconsistent frame sizes' };
+
+        const jumpKept = hasJump && !bad[cells.length - 1];
+        if (badRunCount === 0 && (!hasJump || jumpKept) && gridMeta) {
+          return { keptCells: cells, framesMeta: gridMeta, dropped: 0 };
+        }
+        const keptCells = jumpKept ? [...keptRun, jumpCell] : keptRun;
+        const framesMeta = {
+          cols: keptCells.length,
+          rows: 1,
+          runFrameCount: keptRun.length,
+          // jump dropped → omit jumpFrameIndex; playPlayerAnim falls back to frame 1
+          ...(jumpKept ? { jumpFrameIndex: keptRun.length } : {})
+        };
+        return { keptCells, framesMeta, dropped: cells.length - keptCells.length };
+      };
+
+      // Escalation rung: the cheap single-grid sheet failed its gates — draw every
+      // pose as its OWN Gemini image-edit of the static reference. Per-frame identity
+      // is far stronger than one grid image (each call re-anchors to the reference),
+      // and the alignment pass in finalizeSheetFrames makes the independent frames
+      // cohere. Hard-capped at 10 calls; Gemini-only (Pollinations has no image
+      // conditioning). Returns null on abort/insufficient frames → static fallback.
+      const generatePerFrameSheet = async () => {
+        const runPoses = spec.poses?.run || [];
+        const poses = spec.poses?.jump ? [...runPoses, spec.poses.jump] : [...runPoses];
+        if (poses.length < 5) return null;
+        report(`[ASSETS] Sheet failed its quality gates — drawing ${poses.length} poses individually via Gemini...`);
+        const framePrompt = (poseText) =>
+          `Use the character in the attached reference image. Redraw THIS EXACT character — identical design, ` +
+          `colors, outfit and held items, do not reinvent anything — in a new pose: ${poseText}. ` +
+          `Full body in side profile facing right, same size and style as the reference, centered, ` +
+          `isolated on a plain pure white background, no shadow, no ground, no motion lines, no text.`;
+
+        const results = new Array(poses.length).fill(null);
+        let calls = 0;
+        let retryBudget = 1;
+        let done = 0;
+        let aborted = false;
+        const runFrame = async (idx) => {
+          for (let frameAttempt = 1; frameAttempt <= 2 && !results[idx] && !aborted; frameAttempt++) {
+            if (calls >= 10) return;
+            if (frameAttempt === 2) {
+              if (retryBudget <= 0) return;
+              retryBudget--;
+            }
+            calls++;
+            try {
+              const raw = await gemini.generateImage({
+                prompt: framePrompt(poses[idx]),
+                aspectRatio: '1:1',
+                referenceImageDataUrl: baseSrc
+              });
+              const img = await loadImage(raw.dataUrl);
+              const cell = drawToCanvas(img, { width: 128, height: 128, fit: 'stretch' });
+              results[idx] = cleanKeyedEdges(keyCellWithQuality(cell), { erode: 1, outline: !!spec.post.outline });
+              done++;
+              noteSlotProgress(slot, 0.5 + (done / poses.length) * 0.3);
+              report(null);
+            } catch (err) {
+              console.warn(`[AssetPipeline] Per-frame pose ${idx + 1} failed: ${err.message}`);
+              if (err.kind === 'auth' || err.kind === 'no-key') { runState.skipGemini = true; aborted = true; return; }
+              if (err.kind === 'quota') {
+                if (!err.retryDelayMs || err.retryDelayMs > 10000) { runState.skipGemini = true; aborted = true; return; }
+                await sleep(err.retryDelayMs);
+              }
+            }
+          }
+        };
+        const queue = poses.map((_, i) => i);
+        await Promise.all(Array.from({ length: 3 }, async () => {
+          while (queue.length && !aborted) await runFrame(queue.shift());
+        }));
+        if (aborted) return null;
+
+        // Preserve run order; a missing jump frame just omits the trailing cell.
+        const runCells = results.slice(0, runPoses.length).filter(Boolean);
+        const jumpCell = spec.poses?.jump ? results[runPoses.length] : null;
+        const candidate = jumpCell ? [...runCells, jumpCell] : runCells;
+        const verdict = evaluateAndCullCells(candidate, null, runCells.length);
+        if (verdict.issue) {
+          console.warn(`[AssetPipeline] Per-frame sheet rejected: ${verdict.issue}.`);
+          return null;
+        }
+        // One cheap vision check for facing only — the frames are individually
+        // choreographed, so gridConsistent/legsAlternate whole-sheet judgments
+        // don't apply here.
+        const previewSheet = await finalizeSheetFrames(verdict.keptCells, activeSpec, { framesMeta: verdict.framesMeta });
+        if (!previewSheet) return null;
+        const pfReview = await reviewSprite(previewSheet.img.src, { kind: 'sheet', grid: verdict.framesMeta });
+        const pfMirrored = !!(pfReview && pfReview.facingRight === false);
+        const finalSheet = pfMirrored
+          ? await finalizeSheetFrames(verdict.keptCells, activeSpec, { mirror: true, framesMeta: verdict.framesMeta })
+          : previewSheet;
+        return finalSheet && { sheet: finalSheet, review: pfReview, mirrored: pfMirrored, calls };
       };
 
       let sheet = null;
@@ -327,6 +451,7 @@ export async function generateAssets({
       let mirrored = false;
       let provider = null;
       let attempts = 0;
+      let perFrame = false;
       let lastIssue = 'unknown';
       for (let attempt = 1; attempt <= 2 && !sheet; attempt++) {
         if (attempt > 1) report(`[ASSETS] Sheet ${lastIssue}, regenerating...`);
@@ -338,34 +463,49 @@ export async function generateAssets({
           ? `Use the character in the attached reference image. Redraw THIS EXACT character — identical design, ` +
             `colors, outfit and held items, do not reinvent anything about it — as the following sprite sheet. ${prompt}`
           : prompt;
-        const raw = await generateSlotImage(slot, sheetPrompt, seed + attempt * 13, report, maxAttemptsPerProvider, runState, onAttempt, useReference ? baseSrc : null);
+        const raw = await generateSlotImage(slot, sheetPrompt, seed + attempt * 13, report, maxAttemptsPerProvider, runState, onAttempt, useReference ? baseSrc : null, activeSpec);
         noteSlotProgress(slot, 0.8);
         provider = raw.provider;
         attempts += raw.attempts;
         // Cells are keyed INDIVIDUALLY — whole-sheet flood keying can never reach the
         // backdrop of interior cells (e.g. the center of a 3×3)
-        const { previewImg, cells } = await processSheet(raw.dataUrl, spec);
-        const localIssue = sheetTransparency(previewImg) < spec.post.minAlphaFraction
-          ? 'kept a painted background'
-          : (gridGeometryIssue(cells)
-            || (framesLookStatic(cells) ? 'has near-identical frames' : null)
-            || (cellsLookUnrelated(cells) ? 'draws a different character per frame' : null));
-        if (localIssue) {
-          lastIssue = localIssue;
+        const { previewImg, cells } = await processSheet(raw.dataUrl, activeSpec);
+        if (sheetTransparency(previewImg) < activeSpec.post.minAlphaFraction) {
+          lastIssue = 'kept a painted background';
           if (provider === 'pollinations') break; // one free-path attempt only
           continue;
         }
-        review = await reviewSprite(previewImg.src, { kind: 'sheet', grid: spec.frames });
+        const verdict = evaluateAndCullCells(cells, activeSpec.frames);
+        if (verdict.issue) {
+          lastIssue = verdict.issue;
+          if (provider === 'pollinations') break;
+          continue;
+        }
+        review = await reviewSprite(previewImg.src, { kind: 'sheet', grid: activeSpec.frames });
         if (review && (review.gridConsistent === false || review.legsAlternate === false)) {
           lastIssue = review.gridConsistent === false ? 'grid inconsistent' : 'legs not alternating';
           if (provider === 'pollinations') break;
           continue;
         }
         mirrored = !!(review && !review.facingRight);
-        sheet = await finalizeSheetFrames(cells, spec, { mirror: mirrored });
+        sheet = await finalizeSheetFrames(verdict.keptCells, activeSpec, { mirror: mirrored, framesMeta: verdict.framesMeta });
         if (!sheet) {
           lastIssue = 'had no visible content';
           if (provider === 'pollinations') break;
+        } else if (verdict.dropped) {
+          report(`[ASSETS] Dropped ${verdict.dropped} inconsistent frame(s) from the run cycle`);
+        }
+      }
+
+      if (!sheet && baseSrc && gemini.isGeminiConfigured() && !runState.skipGemini) {
+        const escalated = await generatePerFrameSheet();
+        if (escalated) {
+          sheet = escalated.sheet;
+          review = escalated.review;
+          mirrored = escalated.mirrored;
+          provider = 'gemini';
+          attempts += escalated.calls;
+          perFrame = true;
         }
       }
       if (!sheet) throw new Error(`sheet ${lastIssue}`);
@@ -375,12 +515,12 @@ export async function generateAssets({
       meta[outKey] = {
         provider, attempts, promptUsed: prompt,
         qa: review, mirrored, facingVerified: !!review,
-        sheet: true, frames: sheet.frames
+        sheet: true, perFrame, frames: sheet.frames
       };
       delete slotFraction[slot];
       // No doneCount++ here: the static base already counted this slot when it
       // landed; the sheet is an upgrade of the same output key, not a new slot.
-      report(`[ASSETS] Upgraded: animated ${outKey} via ${provider}`);
+      report(`[ASSETS] Upgraded: animated ${outKey} via ${provider}${perFrame ? ' (per-frame)' : ''}`);
     } catch (err) {
       // The static base is already generated, keyed and registered — keep it.
       console.warn(`[AssetPipeline] Sprite sheet failed (${err.message}) — keeping the static "${spec.fallbackSlot}" sprite.`);
@@ -501,9 +641,12 @@ export async function generateGameAssets({ config, userPrompt = '', onProgress =
   });
   onProgress(`[DESIGN] Asset prompts composed via ${DESIGN_SOURCE_LABELS[design.source] || design.source}...`, 73);
 
+  // Free-variant scaffolds (e.g. the 2×2 sheet) follow the same run-start rule
+  // runSheetSlot uses to pick its variant spec — prompt and spec must agree.
+  const free = !gemini.isGeminiConfigured();
   const finalPrompts = {};
   for (const slot of [...GENERATED_SLOTS, 'player_sheet', 'projectile']) {
-    finalPrompts[slot] = buildFinalPrompt(slot, design.subjects, design.styleGuide);
+    finalPrompts[slot] = buildFinalPrompt(slot, design.subjects, design.styleGuide, { free });
   }
 
   // The player is always attempted as an animated sprite sheet (stored under the
@@ -553,14 +696,15 @@ export async function regenerateAssetSlots({ config, instruction = '', slots, on
   });
   onProgress(`[DESIGN] Asset prompts composed via ${DESIGN_SOURCE_LABELS[design.source] || design.source}...`, 73);
 
+  const free = !gemini.isGeminiConfigured();
   const finalPrompts = {};
   for (const slot of slots) {
-    finalPrompts[slot] = buildFinalPrompt(slot, design.subjects, design.styleGuide);
+    finalPrompts[slot] = buildFinalPrompt(slot, design.subjects, design.styleGuide, { free });
     // Sheet slots fall back to their static slot on gate failure — that fallback
     // run needs its own prompt present.
     const fallbackSlot = SLOT_SPECS[slot].fallbackSlot;
     if (fallbackSlot && !finalPrompts[fallbackSlot]) {
-      finalPrompts[fallbackSlot] = buildFinalPrompt(fallbackSlot, design.subjects, design.styleGuide);
+      finalPrompts[fallbackSlot] = buildFinalPrompt(fallbackSlot, design.subjects, design.styleGuide, { free });
     }
   }
 

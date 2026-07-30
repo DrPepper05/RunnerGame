@@ -95,6 +95,34 @@ producing on-theme but off-prompt assets. Two changes:
    art director starts working with no code change (log line: "[DESIGN] Asset
    prompts composed via free AI art director").
 
+## Character animation continuity overhaul (2026-07-31)
+
+The run animation looked discontinuous for a stack of reasons that are now each
+addressed:
+
+1. **Frame alignment (both providers, no extra cost).** The AI draws the character
+   at a slightly different position and size in every frame; played back, that
+   reads as teleporting/wobbling. Every frame is now re-centered, anchored to a
+   shared ground baseline, and size-normalized toward the median (capped at ±20%)
+   before the sheet is assembled.
+2. **Per-frame background cleanup.** Each frame now gets its own keying quality
+   check and corrective re-key, so background residue no longer flickers in and
+   out between frames.
+3. **Bad frames are dropped, not fatal.** Previously one bad frame threw away the
+   whole sheet (and the player fell back to a static sprite). Now up to two
+   inconsistent frames are culled and the remaining 6–7 frame cycle ships, with
+   playback speed adjusted automatically.
+4. **Gemini escalation: per-frame generation.** If the one-shot sprite sheet still
+   fails its quality gates, the Gemini path now draws each pose as a separate
+   image-edit of the already-generated character (up to 10 calls, only when the
+   cheap path failed) — the strongest identity/continuity method available; look
+   for "drawing 9 poses individually" in the generation log and
+   `perFrame: true` in the asset metadata.
+5. **Free path: 4-frame cycle instead of none.** Pollinations' model almost never
+   produced an acceptable 9-cell sheet, so free-path players were almost always
+   static. The free path now asks for a simpler 2×2, 4-frame stride with larger
+   cells — choppier than 8 frames, but it actually animates.
+
 ## Quick guide for testing
 
 ### How to test

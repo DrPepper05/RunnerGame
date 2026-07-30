@@ -364,7 +364,7 @@ export async function designAssetPrompts({ userPrompt, gameType, themeKey, asset
  */
 const GAMEPLAY_SLOTS = new Set(['player', 'player_sheet', 'enemy', 'obstacle', 'projectile']);
 
-export function buildFinalPrompt(slotKey, subjects, styleGuide) {
+export function buildFinalPrompt(slotKey, subjects, styleGuide, { free = false } = {}) {
   const spec = SLOT_SPECS[slotKey];
   const subject = subjects[slotKey] ?? (spec.subjectKey ? subjects[spec.subjectKey] : undefined);
   const base = `${styleGuide.styleSummary}, 16-bit pixel art style, flat 2D game asset, sharp pixels, clear outlines`;
@@ -385,5 +385,8 @@ export function buildFinalPrompt(slotKey, subjects, styleGuide) {
     style = `${base}, color palette ${styleGuide.colorPalette}, medium-dark tones with ` +
       `a clearly defined lighter top edge`;
   }
-  return spec.scaffold(subject, style);
+  // Free-path variant scaffold (e.g. player_sheet's 2×2 four-frame ask) — must stay
+  // in lockstep with the variant spec runSheetSlot selects.
+  const scaffold = (free && spec.freeVariant?.scaffold) || spec.scaffold;
+  return scaffold(subject, style);
 }

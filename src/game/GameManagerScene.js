@@ -269,7 +269,10 @@ export default class GameManagerScene extends Phaser.Scene {
         key: 'dyn_player_run',
         frames: this.anims.generateFrameNumbers('dyn_player', { start: 0, end: runFrameCount - 1 }),
         // 8-frame cycles read naturally at 12fps; short legacy 4-frame sheets at 9fps
-        frameRate: runFrameCount >= 8 ? 12 : 9,
+        // Scale playback speed to the cycle length: full 8-frame cycles at 12fps,
+        // culled 6-7 frame strips at 10, free-path 4-frame strides at 8 — keeps the
+        // stride tempo roughly constant regardless of how many frames survived.
+        frameRate: runFrameCount >= 8 ? 12 : (runFrameCount >= 6 ? 10 : 8),
         repeat: -1
       });
     }
