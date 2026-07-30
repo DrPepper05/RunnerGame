@@ -19,6 +19,19 @@ const SPRITE_SCHEMA = {
   required: ['facingRight', 'backgroundClean']
 };
 
+// Parallax layers fail differently than sprites: the model paints "props" as framed
+// rectangular vignettes (mini landscape paintings), which keep enough transparency
+// between them to pass the deterministic gates but read as ugly floating rectangles
+// in-game. Only vision can tell a cutout object from a picture-of-an-object.
+const LAYER_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    backgroundClean: { type: 'BOOLEAN', description: 'Is everything outside the shapes fully transparent/empty (no leftover backdrop or color field)?' },
+    cutoutShapes: { type: 'BOOLEAN', description: 'Do the opaque areas consist ONLY of irregular cutout silhouettes/objects? Answer false if any opaque area is a rectangular panel, framed picture, painted sky patch, or full scene.' }
+  },
+  required: ['backgroundClean', 'cutoutShapes']
+};
+
 const SHEET_SCHEMA = {
   type: 'OBJECT',
   properties: {
@@ -48,6 +61,18 @@ function buildPrompt(kind, grid) {
       'pose repeats or the legs never swap.'
     );
   }
+  if (kind === 'layer') {
+    return (
+      'This image should be a decorative parallax strip for a side-scrolling game: only ' +
+      'isolated cutout shapes (silhouettes, props, objects) on a transparent background ' +
+      '(shown as checkerboard or empty). Answer strictly:\n' +
+      '- backgroundClean: is everything outside the shapes transparent/empty, with no ' +
+      'leftover backdrop color or color field?\n' +
+      '- cutoutShapes: are ALL opaque areas irregular object/silhouette cutouts? Answer ' +
+      'false if ANY opaque area is a rectangular panel, a framed picture, a painted sky ' +
+      'or gradient patch, or a full miniature scene.'
+    );
+  }
   return (
     'This image should be a single game sprite on a transparent background. Answer strictly:\n' +
     '- facingRight: is the subject facing the RIGHT side of the image? (profile/side view; ' +
@@ -63,14 +88,14 @@ function buildPrompt(kind, grid) {
  */
 export async function reviewSprite(dataUrl, { kind = 'sprite', grid = null } = {}) {
   try {
+    const schema = kind === 'sheet' ? SHEET_SCHEMA : kind === 'layer' ? LAYER_SCHEMA : SPRITE_SCHEMA;
     const result = await generateJson({
       prompt: buildPrompt(kind, grid),
-      responseSchema: kind === 'sheet' ? SHEET_SCHEMA : SPRITE_SCHEMA,
+      responseSchema: schema,
       imageDataUrl: dataUrl
     });
-    if (typeof result?.facingRight !== 'boolean' || typeof result?.backgroundClean !== 'boolean') {
-      return null;
-    }
+    if (typeof result?.backgroundClean !== 'boolean') return null;
+    if (kind !== 'layer' && typeof result?.facingRight !== 'boolean') return null;
     return result;
   } catch (err) {
     console.warn('[AssetQA] Vision review failed, proceeding unverified:', err.message);

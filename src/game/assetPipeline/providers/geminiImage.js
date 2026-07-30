@@ -23,9 +23,14 @@ export function getGeminiKey() {
 }
 
 export function isGeminiConfigured() {
-  // Dev escape hatch: the VITE_ key is baked into the bundle, so this flag is the only
-  // way to exercise the Pollinations fallback at runtime.
-  if (localStorage.getItem('PM_FORCE_POLLINATIONS') === '1') return false;
+  // Provider selection, three states: the ScreenZero toggle writes '1' (force free
+  // path) or '0' (force Gemini) to localStorage and that choice is authoritative;
+  // only when the user has never touched the toggle (null) does the baked-in
+  // VITE_FORCE_POLLINATIONS env flag decide. Without the '0' override the env flag
+  // would silently veto the UI's "Gemini" option (Vite inlines env at build time).
+  const override = localStorage.getItem('PM_FORCE_POLLINATIONS');
+  if (override === '1') return false;
+  if (override === null && import.meta.env.VITE_FORCE_POLLINATIONS === '1') return false;
   return !!getGeminiKey();
 }
 
@@ -68,15 +73,33 @@ function withTimeout(promise, timeoutMs, label) {
 
 /**
  * Generate a single image. Returns { dataUrl, provider: 'gemini' }.
+ * Pass `referenceImageDataUrl` for image-editing calls: the reference rides along as
+ * an inlineData part so the model redraws THAT character instead of imagining a new
+ * one (the identity anchor for sprite-sheet generation).
  */
-export async function generateImage({ prompt, aspectRatio = '1:1', timeoutMs = 45000 }) {
+export async function generateImage({ prompt, aspectRatio = '1:1', timeoutMs = 45000, referenceImageDataUrl = null }) {
   const ai = getClient();
+
+  let contents = prompt;
+  if (referenceImageDataUrl) {
+    const match = referenceImageDataUrl.match(/^data:([^;]+);base64,(.*)$/s);
+    if (match) {
+      contents = [{
+        parts: [
+          { text: prompt },
+          { inlineData: { mimeType: match[1], data: match[2] } }
+        ]
+      }];
+      timeoutMs = Math.max(timeoutMs, 60000);
+    }
+  }
+
   let response;
   try {
     response = await withTimeout(
       ai.models.generateContent({
         model: GEMINI_IMAGE_MODEL,
-        contents: prompt,
+        contents,
         config: {
           responseModalities: ['IMAGE'],
           imageConfig: { aspectRatio }

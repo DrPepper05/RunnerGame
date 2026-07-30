@@ -414,11 +414,12 @@ export default class PlatformerMode extends BaseMode {
     if (!atk) return;   // Pool exhausted – silently skip
 
     const isFacingLeft = this.scene.player.flipX;
-    // Place the slash in front of the player
+    // Place the slash in front of the player. Use the body center — dynamic-asset
+    // players have origin (0.5, 1), so player.y is the FEET, not the torso.
     const offsetX = isFacingLeft ? -72 : 72;
     atk.swing(
       this.scene.player.x + offsetX,
-      this.scene.player.y,
+      this.scene.player.body.center.y,
       isFacingLeft
     );
   }
@@ -432,13 +433,19 @@ export default class PlatformerMode extends BaseMode {
     if (projectile) {
       const isFacingLeft = this.scene.player.flipX;
       const offsetX = isFacingLeft ? -20 : 20;
-      
-      // Set the themed texture, defaulting to 'projectile'
-      const textureKey = this.scene.gameConfig.actionProjectileType || 'projectile';
-      projectile.setTexture(textureKey);
 
-      // Fire it
-      projectile.fire(this.scene.player.x + offsetX, this.scene.player.y, isFacingLeft);
+      // Prefer the AI-generated projectile; themed SVG bolt otherwise
+      const useDynamic = this.scene.gameConfig.dynamicAssetUrls && this.scene.textures.exists('dyn_projectile');
+      const textureKey = useDynamic
+        ? 'dyn_projectile'
+        : (this.scene.gameConfig.actionProjectileType || 'projectile');
+      projectile.setTexture(textureKey);
+      // Generated textures come content-cropped at arbitrary sizes — normalize to the
+      // SVG bolt's on-screen width (~44px); arcade bodies follow the sprite scale
+      projectile.setScale(useDynamic ? 44 / projectile.frame.width : 1);
+
+      // Fire from the body center — player.y is the feet on the dynamic path (origin 0.5,1)
+      projectile.fire(this.scene.player.x + offsetX, this.scene.player.body.center.y, isFacingLeft);
     }
   }
 

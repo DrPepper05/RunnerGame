@@ -105,6 +105,60 @@ export function borderResidueFraction(canvas, { band = 0.12, threshold = 228 } =
 }
 
 /**
+ * Stretch each column's opaque span to the full canvas height, alpha forced solid.
+ * For platform art: the game shows the texture inside a fixed physics rectangle, so
+ * rounded "pill" shapes with transparent corners read as a platform floating off its
+ * hitbox. Column-wise stretching keeps the texture while guaranteeing the art edge
+ * IS the collision edge. Fully-empty columns stay transparent.
+ */
+export function solidifyColumns(canvas) {
+  const w = canvas.width, h = canvas.height;
+  const ctx = canvas.getContext('2d');
+  const src = ctx.getImageData(0, 0, w, h).data;
+  const out = ctx.createImageData(w, h);
+  const dst = out.data;
+  for (let x = 0; x < w; x++) {
+    let top = -1, bottom = -1;
+    for (let y = 0; y < h; y++) {
+      if (src[(y * w + x) * 4 + 3] > 0) {
+        if (top < 0) top = y;
+        bottom = y;
+      }
+    }
+    if (top < 0) continue;
+    const span = bottom - top + 1;
+    for (let y = 0; y < h; y++) {
+      const srcY = top + Math.min(span - 1, Math.floor((y / h) * span));
+      const si = (srcY * w + x) * 4;
+      const di = (y * w + x) * 4;
+      dst[di] = src[si];
+      dst[di + 1] = src[si + 1];
+      dst[di + 2] = src[si + 2];
+      dst[di + 3] = 255;
+    }
+  }
+  ctx.putImageData(out, 0, 0);
+  return canvas;
+}
+
+/**
+ * Fraction of the canvas's TOP band occupied by opaque pixels. The parallax layer
+ * scaffolds promise "everything above the shapes is empty white", so an opaque top
+ * band after keying means the model painted a full scene and the flood couldn't
+ * clear it — the deterministic layer counterpart of borderResidueFraction.
+ */
+export function topBandOpaqueFraction(canvas, { band = 0.45 } = {}) {
+  const w = canvas.width, h = canvas.height;
+  const bandH = Math.max(1, Math.round(h * band));
+  const data = canvas.getContext('2d').getImageData(0, 0, w, bandH).data;
+  let opaque = 0;
+  for (let i = 3; i < data.length; i += 4) {
+    if (data[i] > 0) opaque++;
+  }
+  return opaque / (data.length / 4);
+}
+
+/**
  * Return a horizontally mirrored copy of the canvas.
  */
 export function mirrorCanvas(canvas) {
@@ -638,9 +692,21 @@ function applyKeying(canvas, keying, keyOverrides) {
   if (keying === 'flood+white') {
     // For silhouette/prop layers: flood removes the border-connected backdrop, then the
     // global white pass clears white pockets ENCLOSED between shapes (which flood-fill
-    // deliberately keeps for character sprites, but which read as leftovers on layers)
+    // deliberately keeps for character sprites, but which read as leftovers on layers).
+    // The white pass runs strict (near-pure white only) — at the default threshold it
+    // also ate light-colored prop details, not just leftover pockets.
     removeBorderBackground(canvas, keyOverrides);
-    return removeWhiteBackground(canvas);
+    const ctx = canvas.getContext('2d');
+    const beforeWhite = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const keptBefore = 1 - alphaFraction(canvas);
+    removeWhiteBackground(canvas, { threshold: 236, hardCut: 248 });
+    const removedByWhite = keptBefore - (1 - alphaFraction(canvas));
+    // Dissolve guard: a pocket-clearing pass should nibble, not devour. If it removed
+    // more than 20% of what the flood had kept, it was eating content — revert it.
+    if (keptBefore > 0 && removedByWhite / keptBefore > 0.2) {
+      ctx.putImageData(beforeWhite, 0, 0);
+    }
+    return canvas;
   }
   return canvas;
 }
@@ -675,5 +741,10 @@ export async function postProcessAsset(rawSrc, spec, opts = {}) {
   }
   if (spec.post.darken) darkenCanvas(canvas, spec.post.darken);
   if (spec.post.crop) canvas = cropCanvasToContent(canvas);
+  // Re-fill the spec canvas after cropping: consumers that tile the texture into a
+  // fixed-size physics box (platforms) need the art to exactly fill the frame, or the
+  // visible shape and the hitbox drift apart.
+  if (spec.post.fillAfterCrop) canvas = drawToCanvas(canvas, { ...spec.canvas, fit: 'stretch' });
+  if (spec.post.solidify) solidifyColumns(canvas);
   return loadImage(canvas.toDataURL('image/png'), { crossOrigin: null });
 }

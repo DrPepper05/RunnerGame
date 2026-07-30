@@ -10,11 +10,46 @@ live and verified on both provider paths:
 | Path | Provider | Speed | Cost |
 |---|---|---|---|
 | **Primary** | Google Gemini (`gemini-2.5-flash-image`) | ~15–25 s per game | ≈ $0.35 per game |
-| **Fallback** | Pollinations (free, keyless) | ~1.5–2 min per game | free |
+| **Fallback** | Pollinations (free, keyless) | ~3–8 min per game (varies with Pollinations load) | free |
 
 No API key is required to play — without a key the app automatically uses the free
 fallback. With a Gemini key you get faster generation, prompt-aware art direction,
 vision quality control, and an animated player character.
+
+**Generation never dead-ends.** The progress bar ticks continuously during the free
+path (per-attempt progress, "attempt N/M" log lines on retries), the free path runs
+on a bounded retry budget, and if asset generation fails outright the game still
+launches — with built-in theme artwork and a terminal line saying so.
+
+## Direct answers to the open questions
+
+- **Is the 75% progress blocking issue resolved?** Yes. The free path now runs on a
+  bounded retry budget (2 attempts per asset, 45-second request cap), the progress bar
+  ticks continuously with per-attempt partial credit, and if generation fails outright
+  the game still launches with built-in theme artwork and a terminal line saying so.
+  The bar can no longer freeze at 75%.
+- **Does the Gemini path reach the playable game screen?** Yes — prompt → generated
+  assets → playable game in roughly 15–25 seconds, verified end-to-end in both modes
+  (Runner and Action Quest).
+- **Is the Pollinations fallback working or still unstable?** Working. It is slow by
+  nature (~3–8 minutes — Pollinations only allows about one generation at a time, an
+  upstream limit) but it is bounded and completes. For testing purposes it is
+  separated from the Gemini path via a temporary development toggle (the Provider
+  dropdown in the top-right corner of the start screen), so each path can be
+  evaluated in isolation.
+- **What still needs improvement?**
+  - **Character animation** — the sprite-sheet run cycle is the weakest asset. The
+    Gemini path now anchors the sheet to a reference image of the already-generated
+    character (should greatly improve frame-to-frame consistency; pending live
+    validation), but the free path rarely produces a usable sheet and falls back to
+    a static sprite with procedural motion.
+  - **Foreground creation** — the near/mid parallax layers are inconsistent: quality
+    gates now reject painted backdrops and incoherent layers rather than shipping
+    them, but the underlying generation quality still varies from run to run.
+  - **Resolution consistency** — perceived resolution/pixel density is not yet
+    uniform across assets; some assets render noticeably sharper or blurrier than
+    others in the same game. Needs a normalization pass so all assets read at the
+    same fidelity level.
 
 ## Quick guide for testing
 
@@ -32,26 +67,75 @@ vision quality control, and an animated player character.
    - The compile terminal lists each asset with its provider, e.g.
      `Ready: player via gemini (4/8)`, and ends with a summary line.
    - The player has an 8-frame run cycle with alternating legs plus a jump pose.
+   - In Action Quest: **F** fires a generated projectile, and platform artwork lines
+     up with where you actually land (the texture is normalized to the hitbox).
    - Sprites have a dark outline and contrasting colors; no white edges or boxes;
      three background layers scroll at different speeds.
    - In DevTools: `window.__GAME_LIVE_CONFIG.assetMeta` shows per-asset provider,
      attempts, QA verdicts (`facingRight`, `backgroundClean`, `legsAlternate`), and
      animation frame data.
-5. To test the free path explicitly: run `localStorage.PM_FORCE_POLLINATIONS='1'` in
-   DevTools, reload, generate again (expect ~2 min, static or occasionally animated
-   player, no vision QA fields).
+5. To test the free path explicitly: set `VITE_FORCE_POLLINATIONS=1` in `.env` and
+   restart `npm run dev` (Vite bakes env vars in at server start). Remove the line
+   (or set it to `0`) and restart to re-enable Gemini. No-restart alternative: run
+   `localStorage.PM_FORCE_POLLINATIONS='1'` in DevTools and reload. Expect ~3–8 min (varies with load)
+   with a continuously ticking progress bar, static or occasionally animated player,
+   no vision QA fields.
 
-### Which API key / provider
+### Provider Selection & API Key Setup
 
-- **Recommended: Google Gemini** — set `VITE_GEMINI_API_KEY` in `.env` (template in
-  `.env.example`) or paste it in the start-screen field. Get a key at
-  https://aistudio.google.com/apikey — it must be on a **billing-enabled** project,
-  otherwise image quota is zero and everything silently falls back to the free engine.
-  Cost is roughly $0.35 per generated game, ~15–25 s.
-- **Pollinations** is the automatic free fallback — no key needed. An optional
-  `VITE_POLLINATIONS_API_KEY` token speeds up its rate limits slightly.
-- The key runs client-side by design (accepted tradeoff for this app; see
-  Known limitations).
+The start screen offers a **Provider Toggle** in the top-right corner, allowing users to choose between:
+
+#### **Gemini (Recommended)**
+- **Fastest**: 15–25 seconds per game
+- **Best quality**: Vision QA, prompt-aware art direction, reliable animated players
+- **Cost**: ~$0.35 per game (billing required)
+- **Setup**:
+  1. Set `VITE_GEMINI_API_KEY` in `.env` (template in `.env.example`) before starting dev server, OR
+  2. Paste key directly in the start-screen input field (stored in localStorage, survives reload)
+  3. Get a key at https://aistudio.google.com/apikey — must be on a **billing-enabled** project
+- **Status indicator**: Top-right shows ✓ when key is active
+
+#### **Pollinations (Free Fallback)**
+- **Speed**: 3–8 minutes per game (serial queue, load-dependent)
+- **Cost**: Free, keyless (no auth required)
+- **Quality**: Single-image-per-asset, local geometry gates only (no vision QA)
+- **Force mode**: Toggle to **explicitly test the free path** even with Gemini key active
+  - Useful for: load testing, free-path validation, demos without API spend
+  - Persists in localStorage until toggled off
+- **Optional**: Set `VITE_POLLINATIONS_API_KEY` in `.env` for slightly improved rate limits
+
+#### **Decision Logic** (Applied at Generation Time)
+
+1. **Toggle set to "Pollinations"** → Always the free path; ALL Gemini calls are off
+   (images, prompt design, vision QA, Creator-Panel editor LLM)
+2. **Toggle set to "Gemini"** → Gemini-primary (overrides `VITE_FORCE_POLLINATIONS`
+   in `.env` — the UI choice wins): uses the `.env` key or the localStorage/UI key;
+   each asset still falls back to Pollinations if Gemini errors or runs out of quota
+3. **Toggle never touched** → `.env`'s `VITE_FORCE_POLLINATIONS=1` (if present)
+   selects the free path; otherwise Gemini when a key exists, free path when not
+
+#### **In-App Controls**
+
+Top-right corner of start screen:
+- **Provider selector** (dropdown/toggle): "Gemini" vs "Force Pollinations"
+- **API Key field** (when Gemini selected & no key found):
+  - Labeled "Insert Gemini API key:"
+  - Paste key + press Save
+  - Collapses to ✓ once active
+  - Click ✓ to change/update key
+
+#### **Environment Variables**
+
+- `VITE_GEMINI_API_KEY` — loaded at server start, pre-fills key field, auto-activates
+- `VITE_POLLINATIONS_API_KEY` — optional auth suffix for Pollinations (improves rate limits)
+- `VITE_FORCE_POLLINATIONS=1` — forces free path at compile time (requires dev server restart)
+
+#### **Notes**
+
+- Keys run client-side by design (accepted tradeoff for demos/prototypes; production should proxy)
+- Without any key, Pollinations is automatic and free (no setup needed)
+- Pollinations blocks browser CORS; dev server proxies to `https://image.pollinations.ai`
+- Vision QA (facing check, background cleanliness, sheet consistency) only runs with Gemini configured
 
 ### What is currently working
 
@@ -65,11 +149,41 @@ vision quality control, and an animated player character.
   against the scenery.
 - Edge cleanup pipeline (erode → outline → color bleed) that removes white fringes both
   from the images and from GPU texture filtering.
-- Animated player: 8-phase run cycle with alternating legs + dedicated jump pose,
-  gated by geometry checks and vision QA (`legsAlternate`); free path gets one gated
-  sheet attempt and a procedural motion fallback otherwise.
+- Animated player: 8-phase run cycle with alternating legs + dedicated jump pose.
+  The static character is generated first, then (on Gemini) the sprite sheet is an
+  image-editing call that redraws THAT exact character in nine poses — anchoring
+  identity to a reference image instead of hoping the model draws "the same
+  character" nine times. Gated by geometry checks, a local identity check (rejects
+  sheets that draw a different-looking character per frame — works keyless), and
+  vision QA (`gridConsistent`, `legsAlternate`); if the sheet fails any gate the
+  already-finished static sprite ships with procedural motion instead.
 - Vision QA (facing, background cleanliness, sheet consistency) with client-side
   corrections; runs whenever a key is present, even if image quota is exhausted.
+- Action Quest combat: projectiles are on by default, fire a game-specific generated
+  projectile sprite (static SVG fallback) from the player's torso, and platform visuals
+  match their hitboxes.
+- AI live editing: the Creator Panel's "Regenerate with Prompt" box understands natural
+  language ("make it much faster and lower the gravity") and patches the running game's
+  variables instantly — full regeneration only when new artwork is actually needed.
+- Cherry-pick art regeneration: "change the foreground" / "make the enemy a robot"
+  redraws ONLY the named elements (~15s on the free path instead of a 2-minute full
+  rebuild) and keeps everything else — including your slider tweaks. Full re-themes
+  ("turn this into a lava world") re-skin all artwork but keep the mode, layout and
+  tuned variables. Mode-switch requests get a polite explanation instead of nuking
+  the game (switching modes = start a new game, by design).
+- Any prompt theme, not just the 5 presets: prompts that match no predefined theme get
+  their art direction and title derived from the prompt itself (a "clockwork castle"
+  game no longer comes out as ice, and the profanity filter no longer false-positives
+  on words like "brass").
+- Parallax layer quality gates: layers whose top band kept a painted sky are re-keyed,
+  retried with a stricter prompt, then dropped rather than shipped as opaque rectangles;
+  on the Gemini path a vision check also rejects "vignette" layers (props drawn as
+  framed mini-paintings). The white-pocket cleanup pass is now strict enough to stop
+  eating light-colored prop details.
+- Characters stand exactly on the ground and platforms: a long-standing double-scaling
+  bug in the collision-box sizing (which sank sprites up to ~27px into the floor) is
+  fixed, and platform art is column-solidified so the visible platform edge IS the
+  collision edge.
 - Three-layer parallax, under-floor fill, share links, live tuning panel.
 
 ### What is still unstable / needs improvement
@@ -86,8 +200,10 @@ vision quality control, and an animated player character.
   gradient backdrops may leave minor artifacts despite the self-check.
 - **Enemy is static** — animation machinery is built and reusable, not yet applied to
   the enemy slot.
-- **Free path is slow (~2 min)** due to Pollinations' one-request-at-a-time limit;
-  upstream constraint.
+- **Free path is slow (~3–8 min, load-dependent)** due to Pollinations' one-request-at-a-time limit
+  (upstream constraint). It now runs on a bounded retry budget (2 attempts per asset,
+  45s request cap) with continuous progress feedback, so a slow run is visibly alive
+  and always ends — in the worst case by launching with built-in theme artwork.
 - **Production hosting** needs a `/api/pollinations/*` → `https://image.pollinations.ai`
   rewrite (the dev server provides it automatically); without it only the Gemini path
   works in production.
@@ -98,7 +214,7 @@ vision quality control, and an animated player character.
 
 ### 1. Asset generation pipeline (`src/game/assetPipeline/`)
 
-Every new game generates up to **8 assets** from your prompt:
+Every new game generates up to **9 assets** from your prompt:
 
 - `background_far` — wide scenery backdrop
 - `background_mid` — silhouette skyline strip (parallax middle layer)
@@ -108,6 +224,7 @@ Every new game generates up to **8 assets** from your prompt:
 - `player` — the character (animated sprite sheet on the Gemini path)
 - `enemy` — patrolling enemy sprite
 - `obstacle` — hazard object
+- `projectile` — the hero's ranged shot (Action Quest games only)
 
 Key properties:
 
@@ -216,12 +333,22 @@ Without a key everything still works on the free engine — just slower.
 5. In game:
    - **Menu (top-right)** opens the Creator Panel: live physics/difficulty tuning,
      game type browser, export/import config, share link.
+   - **"Regenerate with Prompt" box (Creator Panel)** is an AI live editor: describe a
+     change in plain language and Gemini decides whether it's a **variable tweak**
+     ("make it faster", "double the enemies", "disable shooting", "rename it Frost
+     Fury") — applied instantly to the running game with a ✓ summary of what changed,
+     no regeneration, no waiting — or a **new game** ("turn this into a lava world"),
+     which runs the full asset pipeline behind a compiler-style progress overlay
+     (log lines + progress bar) so you always see that generation is underway. Without a Gemini key, common keywords (fast,
+     slow, high jump, low gravity, hardcore) still tweak live; anything else
+     regenerates.
    - **Logo click** reopens the prompt screen to generate a new world.
    - On game over: **Play Again** or **Tweak Settings**.
 
 ### Dev tricks
 
-- Force the free path with a key configured: run
+- Force the free path with a key configured: `VITE_FORCE_POLLINATIONS=1` in `.env`
+  (+ dev-server restart; survives builds), or without a restart run
   `localStorage.PM_FORCE_POLLINATIONS = '1'` in the console and reload.
 - Inspect generation results: `window.__GAME_LIVE_CONFIG.assetMeta`.
 - Share links (`#config=...`) replay a game config; they load raw fallback URLs directly
@@ -233,8 +360,9 @@ Without a key everything still works on the free engine — just slower.
 - Enemy is static (animation machinery exists and is designed for reuse — deferred).
 - Enclosed background pockets between a character's limbs can occasionally survive
   keying (deliberate trade-off that protects white details like visors).
-- The free path is serial and slow (~1.5–2 min) due to Pollinations' one-at-a-time rate
-  limit; that's an upstream constraint, not a bug.
+- The free path is serial and slow (~3–8 min, load-dependent) due to Pollinations' one-at-a-time rate
+  limit; that's an upstream constraint, not a bug. Generation is budget-bounded and
+  never dead-ends: on total failure the game launches with built-in theme artwork.
 - Pollinations blocks direct browser calls (Cloudflare Turnstile), so production hosting
   needs a `/api/pollinations/*` → `https://image.pollinations.ai` rewrite, same as the
   built-in Vite dev proxy.

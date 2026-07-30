@@ -3,6 +3,7 @@ import { GAME_PRESETS } from '../gameConfig';
 import { generateTitle } from '../game/promptUtils';
 import { generateGameConfig } from '../game/geminiService';
 import { generateGameAssets, compileFallbackUrls, isGeminiConfigured } from '../game/assetPipeline';
+import { THEMES } from '../game/themes';
 
 const BANNED_WORDS = ['fuck', 'shit', 'bitch', 'cunt', 'ass', 'dick', 'pussy', 'cock', 'nigger', 'faggot'];
 
@@ -135,6 +136,15 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
   const [apiKey, setApiKey] = useState(() => localStorage.getItem('GEMINI_API_KEY') || '');
   const [keyInput, setKeyInput] = useState('');
   const [isEditingKey, setIsEditingKey] = useState(false);
+  // Three-state init: an explicit toggle choice ('1'/'0') wins; untouched (null)
+  // falls back to the baked-in env flag — must mirror isGeminiConfigured() exactly
+  // or the dropdown lies about which provider will actually run.
+  const [forcePollinations, setForcePollinations] = useState(() => {
+    const ls = localStorage.getItem('PM_FORCE_POLLINATIONS');
+    if (ls === '1') return true;
+    if (ls === '0') return false;
+    return import.meta.env.VITE_FORCE_POLLINATIONS === '1';
+  });
   const formRef = useRef(null);
   const [phaserLoaded, setPhaserLoaded] = useState(false);
 
@@ -241,15 +251,42 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
     processPrompt(exampleText);
   };
 
+  // Terminal pipeline failure never dead-ends the flow: boot the game on built-in
+  // theme art instead. dynamicAssetUrls MUST be explicit null (not deleted):
+  // GameManagerScene.preload treats undefined as "compile raw Pollinations URLs",
+  // which is exactly the network path that just failed. Custom prompts have
+  // themeKey null — pick 'ice' (the generateRandom precedent, full multi-layer art).
+  const toStaticThemeConfig = (config) => ({
+    ...config,
+    themeKey: THEMES[config.themeKey] ? config.themeKey : 'ice',
+    dynamicAssetUrls: null,
+    preloadedImages: null,
+    assetMeta: null
+  });
+
+  // Shared asset-phase progress handler: pipeline liveness ticks carry a pct with
+  // null text (skip the log), and the bar must never move backwards mid-compile
+  // (the pipeline's design-step report of 73 lands after the UI already showed 75).
+  const assetProgressHandler = (logText, progressVal) => {
+    if (logText) setTerminalLogs(prev => [...prev, logText]);
+    if (progressVal != null) setProgress(p => Math.max(p, progressVal));
+  };
+
   const startCompilationSequence = async (newConfig, promptText) => {
     if (isOverlay) {
       setIsGenerating(true);
       setTransitionPhase('expanding');
-      const { preloadedImages, assetMeta } = await generateGameAssets({ config: newConfig });
-      setTimeout(() => {
+      try {
+        const { preloadedImages, assetMeta } = await generateGameAssets({ config: newConfig });
+        setTimeout(() => {
+          setTransitionPhase('done');
+          onGenerate('custom', { ...newConfig, preloadedImages, assetMeta });
+        }, 700);
+      } catch (err) {
+        console.error('[Compilation Error] Overlay generation failed, using static theme:', err);
         setTransitionPhase('done');
-        onGenerate('custom', { ...newConfig, preloadedImages, assetMeta });
-      }, 700);
+        onGenerate('custom', toStaticThemeConfig(newConfig));
+      }
       return;
     }
 
@@ -287,19 +324,17 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
     try {
       const { preloadedImages, assetMeta } = await generateGameAssets({
         config: newConfig,
-        onProgress: (logText, progressVal) => {
-          setTerminalLogs(prev => [...prev, logText]);
-          setProgress(progressVal);
-        }
+        onProgress: assetProgressHandler
       });
 
       setTerminalLogs(prev => [...prev, '[ENGINE] Booting game scene and registering WebGL textures...']);
       onStartTransition({ ...newConfig, preloadedImages, assetMeta });
     } catch (err) {
-      console.error('[Compilation Error] Preset loading failed:', err);
-      setIsGenerating(false);
-      setTransitionPhase('idle');
-      setProgress(0);
+      // Stay in the 'compiling' phase: the static boot fires phaser-load-complete,
+      // which drives the normal 100% → fade sequence.
+      console.error('[Compilation Error] Preset asset generation failed, using static theme:', err);
+      setTerminalLogs(prev => [...prev, '[ASSETS] AI generation unavailable — launching with built-in theme artwork instead.']);
+      onStartTransition(toStaticThemeConfig(newConfig));
     }
   };
 
@@ -310,7 +345,9 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
       return;
     }
 
-    const isUnsafe = BANNED_WORDS.some(word => text.toLowerCase().includes(word));
+    // Whole-word match only: a substring check silently rejected innocent prompts
+    // ("brASS automaton", "cASSette", "coCOCKpit") and swapped in a random ice game
+    const isUnsafe = BANNED_WORDS.some(word => new RegExp(`\\b${word}\\b`, 'i').test(text));
     if (isUnsafe) {
       generateRandom();
       return;
@@ -320,11 +357,17 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
       setIsGenerating(true);
       setTransitionPhase('expanding');
       const result = await generateGameConfig(text);
-      const { preloadedImages, assetMeta } = await generateGameAssets({ config: result.config, userPrompt: text });
-      setTimeout(() => {
+      try {
+        const { preloadedImages, assetMeta } = await generateGameAssets({ config: result.config, userPrompt: text });
+        setTimeout(() => {
+          setTransitionPhase('done');
+          onGenerate('custom', { ...result.config, preloadedImages, assetMeta });
+        }, 700);
+      } catch (err) {
+        console.error('[Compilation Error] Overlay generation failed, using static theme:', err);
         setTransitionPhase('done');
-        onGenerate('custom', { ...result.config, preloadedImages, assetMeta });
-      }, 700);
+        onGenerate('custom', toStaticThemeConfig(result.config));
+      }
       return;
     }
 
@@ -335,12 +378,15 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
     setProgress(0);
     setPhaserLoaded(false);
 
+    // Hoisted so the catch can downgrade to static art once a config exists
+    let generatedConfig = null;
     try {
       const result = await generateGameConfig(text, (logText, progressVal) => {
         console.log(`[ScreenZero Progress Callback] Log: "${logText}", Progress: ${progressVal}%`);
         setTerminalLogs(prev => [...prev, logText]);
         setProgress(Math.min(progressVal, 70));
       });
+      generatedConfig = result.config;
 
       setTerminalLogs(prev => [...prev, `[ENGINE] Starting asset generation via ${isGeminiConfigured() ? 'Gemini AI' : 'free image engine'}...`]);
       setProgress(75);
@@ -348,19 +394,24 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
       const { preloadedImages, assetMeta } = await generateGameAssets({
         config: result.config,
         userPrompt: text,
-        onProgress: (logText, progressVal) => {
-          setTerminalLogs(prev => [...prev, logText]);
-          setProgress(progressVal);
-        }
+        onProgress: assetProgressHandler
       });
 
       setTerminalLogs(prev => [...prev, '[ENGINE] Booting game scene and registering WebGL textures...']);
       onStartTransition({ ...result.config, preloadedImages, assetMeta });
     } catch (err) {
       console.error('[Compilation Error] Game generation or preloading failed:', err);
-      setIsGenerating(false);
-      setTransitionPhase('idle');
-      setProgress(0);
+      if (generatedConfig) {
+        // Asset generation died — launch on built-in theme art instead of dead-ending.
+        // Stay in 'compiling': the static boot fires phaser-load-complete → 100% → fade.
+        setTerminalLogs(prev => [...prev, '[ASSETS] AI generation unavailable — launching with built-in theme artwork instead.']);
+        onStartTransition(toStaticThemeConfig(generatedConfig));
+      } else {
+        // Config generation itself failed (local, near-infallible) — plain reset
+        setIsGenerating(false);
+        setTransitionPhase('idle');
+        setProgress(0);
+      }
     }
   };
 
@@ -488,69 +539,105 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
         animation: 'float 18s infinite alternate-reverse', zIndex: 2
       }} />
 
-      {/* Top right API key control: env key → tick only; else inline input, tick after save */}
-      <div style={{ position: 'absolute', top: '16px', right: '16px', zIndex: 100, display: 'flex', gap: '8px', alignItems: 'center' }}>
-        {HAS_ENV_GEMINI_KEY ? (
-          <button
-            onClick={() => showToast('Using Gemini key from environment (.env)')}
-            title="Gemini key active (from .env)"
-            style={API_KEY_TICK_STYLE}
-          >
-            ✓
-          </button>
-        ) : (apiKey && !isEditingKey) ? (
-          <button
-            onClick={() => { setKeyInput(apiKey); setIsEditingKey(true); }}
-            title="Gemini key saved — click to change"
-            style={API_KEY_TICK_STYLE}
-          >
-            ✓
-          </button>
-        ) : (
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              const trimmed = keyInput.trim();
-              localStorage.setItem('GEMINI_API_KEY', trimmed);
-              setApiKey(trimmed);
-              setIsEditingKey(false);
-              showToast(trimmed ? 'Gemini key saved — assets will use Gemini AI.' : 'No key — using free image engine.');
+      {/* Top right: Provider toggle + API key control */}
+      <div style={{ position: 'absolute', top: '16px', right: '16px', zIndex: 100, display: 'flex', gap: '12px', alignItems: 'center' }}>
+        {/* Provider Toggle */}
+        <div style={{
+          display: 'flex', gap: '6px', alignItems: 'center',
+          background: 'rgba(10, 15, 24, 0.85)',
+          border: '1px solid rgba(255,255,255,0.15)',
+          borderRadius: '8px', padding: '6px 8px',
+          backdropFilter: 'blur(8px)'
+        }}>
+          <label htmlFor="pm-provider-toggle" style={{ color: '#fff', fontSize: '12px', fontWeight: 600, whiteSpace: 'nowrap' }}>
+            Provider:
+          </label>
+          <select
+            id="pm-provider-toggle"
+            value={forcePollinations ? 'pollinations' : 'gemini'}
+            onChange={(e) => {
+              const isPoll = e.target.value === 'pollinations';
+              setForcePollinations(isPoll);
+              localStorage.setItem('PM_FORCE_POLLINATIONS', isPoll ? '1' : '0');
+              showToast(isPoll ? 'Using Pollinations (free, slower)' : 'Using Gemini (if key available)');
             }}
             style={{
-              display: 'flex', gap: '6px', alignItems: 'center',
-              background: 'rgba(10, 15, 24, 0.85)',
-              border: '1px solid rgba(255,255,255,0.15)',
-              borderRadius: '8px', padding: '6px 8px',
-              backdropFilter: 'blur(8px)'
+              padding: '4px 6px', fontSize: '12px',
+              background: 'rgba(0,0,0,0.4)', border: '1px solid rgba(255,255,255,0.12)',
+              borderRadius: '4px', color: '#fff', outline: 'none', cursor: 'pointer'
             }}
           >
-            <label htmlFor="pm-gemini-key-input" style={{ color: '#fff', fontSize: '12px', fontWeight: 600, whiteSpace: 'nowrap' }}>
-              Insert Gemini API key:
-            </label>
-            <input
-              id="pm-gemini-key-input"
-              type="password"
-              value={keyInput}
-              onChange={(e) => setKeyInput(e.target.value)}
-              placeholder="AIza..."
-              autoComplete="off"
-              style={{
-                width: '150px', padding: '5px 8px', fontSize: '12px',
-                background: 'rgba(0,0,0,0.4)', border: '1px solid rgba(255,255,255,0.12)',
-                borderRadius: '6px', color: '#fff', outline: 'none'
-              }}
-            />
-            <button
-              type="submit"
-              style={{
-                background: 'rgba(162, 89, 255, 0.2)', border: '1px solid #a259ff',
-                color: '#a259ff', fontSize: '12px', fontWeight: 700,
-                padding: '5px 10px', borderRadius: '6px', cursor: 'pointer'
-              }}
-            >
-              Save
-            </button>
-          </form>
+            <option value="gemini">Gemini</option>
+            <option value="pollinations">Pollinations</option>
+          </select>
+        </div>
+
+        {/* API Key Control */}
+        {!forcePollinations && (
+          <>
+            {HAS_ENV_GEMINI_KEY ? (
+              <button
+                onClick={() => showToast('Using Gemini key from environment (.env)')}
+                title="Gemini key active (from .env)"
+                style={API_KEY_TICK_STYLE}
+              >
+                ✓
+              </button>
+            ) : (apiKey && !isEditingKey) ? (
+              <button
+                onClick={() => { setKeyInput(apiKey); setIsEditingKey(true); }}
+                title="Gemini key saved — click to change"
+                style={API_KEY_TICK_STYLE}
+              >
+                ✓
+              </button>
+            ) : (
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  const trimmed = keyInput.trim();
+                  localStorage.setItem('GEMINI_API_KEY', trimmed);
+                  setApiKey(trimmed);
+                  setIsEditingKey(false);
+                  showToast(trimmed ? 'Gemini key saved — assets will use Gemini AI.' : 'No key — using free image engine.');
+                }}
+                style={{
+                  display: 'flex', gap: '6px', alignItems: 'center',
+                  background: 'rgba(10, 15, 24, 0.85)',
+                  border: '1px solid rgba(255,255,255,0.15)',
+                  borderRadius: '8px', padding: '6px 8px',
+                  backdropFilter: 'blur(8px)'
+                }}
+              >
+                <label htmlFor="pm-gemini-key-input" style={{ color: '#fff', fontSize: '12px', fontWeight: 600, whiteSpace: 'nowrap' }}>
+                  Insert Gemini API key:
+                </label>
+                <input
+                  id="pm-gemini-key-input"
+                  type="password"
+                  value={keyInput}
+                  onChange={(e) => setKeyInput(e.target.value)}
+                  placeholder="AIza..."
+                  autoComplete="off"
+                  style={{
+                    width: '150px', padding: '5px 8px', fontSize: '12px',
+                    background: 'rgba(0,0,0,0.4)', border: '1px solid rgba(255,255,255,0.12)',
+                    borderRadius: '6px', color: '#fff', outline: 'none'
+                  }}
+                />
+                <button
+                  type="submit"
+                  style={{
+                    background: 'rgba(162, 89, 255, 0.2)', border: '1px solid #a259ff',
+                    color: '#a259ff', fontSize: '12px', fontWeight: 700,
+                    padding: '5px 10px', borderRadius: '6px', cursor: 'pointer'
+                  }}
+                >
+                  Save
+                </button>
+              </form>
+            )}
+          </>
         )}
       </div>
 

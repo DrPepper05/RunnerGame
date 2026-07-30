@@ -126,7 +126,8 @@ export default class GameManagerScene extends Phaser.Scene {
         platform: 'dyn_platform',
         player: 'dyn_player',
         enemy: 'dyn_enemy',
-        obstacle: 'dyn_obstacle'
+        obstacle: 'dyn_obstacle',
+        projectile: 'dyn_projectile'
       };
 
       Object.entries(preloaded).forEach(([key, img]) => {

@@ -191,6 +191,7 @@ const CreatorPanel = ({
   const isCustom = presetKey === 'custom';
   const [promptText, setPromptText] = useState('');
   const [promptBusy, setPromptBusy] = useState(false);
+  const [promptResult, setPromptResult] = useState(null);
   const [apiKey, setApiKey] = useState(() => localStorage.getItem('GEMINI_API_KEY') || '');
 
   const handlePromptSubmit = async () => {
@@ -202,9 +203,14 @@ const CreatorPanel = ({
     }
 
     setPromptBusy(true);
+    setPromptResult(null);
     try {
-      await onPromptGenerate(promptText.trim());
+      const result = await onPromptGenerate(promptText.trim());
       setPromptText('');
+      // Live tweaks return a summary of what changed; full regenerations reboot the game
+      if (result && result.summary) {
+        setPromptResult({ ok: result.applied !== false, text: result.summary });
+      }
     } finally {
       setPromptBusy(false);
     }
@@ -368,6 +374,14 @@ const CreatorPanel = ({
               {promptBusy ? '…' : '▶'}
             </button>
           </div>
+          {promptResult && (
+            <div style={{
+              marginTop: '8px', fontSize: '12px', lineHeight: 1.4,
+              color: promptResult.ok ? 'var(--pm-accent-teal)' : 'var(--pm-accent-orange)'
+            }}>
+              {promptResult.ok ? '✓ ' : ''}{promptResult.text}
+            </div>
+          )}
         </div>
 
         {/* 3. Share Game button (primary CTA at top) */}

@@ -23,6 +23,7 @@ const THEMES = {
     playerRunner: 'winter athlete runner, cold weather gear, athletic build',
     enemy: 'ice golem monster, frozen yeti creature, frost elemental',
     hazards: 'ice spikes, frozen stalactites, sharp icicles',
+    projectile: 'jagged glowing ice shard bolt',
     colorPalette: 'cool blues, whites, cyans, pale purples, ice blue (#E6F3FF, #B3D9FF, #4D94FF)',
     atmosphere: 'cold, crystalline, shimmering'
   },
@@ -34,6 +35,7 @@ const THEMES = {
     playerRunner: 'heat runner with protective suit, athletic stance',
     enemy: 'lava golem, fire demon, magma elemental creature',
     hazards: 'lava pit, fire geyser, molten rock spike',
+    projectile: 'blazing fireball with molten orange core',
     colorPalette: 'reds, oranges, dark grays, yellow highlights (#FF6B35, #FF4500, #DC143C, #8B0000)',
     atmosphere: 'hot, glowing, dangerous'
   },
@@ -45,6 +47,7 @@ const THEMES = {
     playerRunner: 'nature runner, athletic explorer, green outfit',
     enemy: 'forest wolf, giant spider, evil tree creature',
     hazards: 'thorn bush, poison plant, falling branch',
+    projectile: 'sharp wooden arrow with glowing green fletching',
     colorPalette: 'greens, browns, earth tones (#228B22, #32CD32, #8FBC8F, #654321)',
     atmosphere: 'natural, organic, mysterious'
   },
@@ -56,6 +59,7 @@ const THEMES = {
     playerRunner: 'parkour runner, urban athlete, street clothes',
     enemy: 'security robot, street thug, drone enemy',
     hazards: 'electrical barrier, steam vent, construction hazard',
+    projectile: 'neon plasma bolt with electric sparks',
     colorPalette: 'grays, neon colors, blues, purples (#696969, #FF00FF, #00FFFF, #1E90FF)',
     atmosphere: 'urban, modern, neon-lit'
   },
@@ -67,6 +71,7 @@ const THEMES = {
     playerRunner: 'astronaut runner, space suit, jetpack',
     enemy: 'alien creature, space pirate, robot sentinel',
     hazards: 'laser barrier, meteor, energy field',
+    projectile: 'bright cyan laser beam bolt',
     colorPalette: 'deep purples, blues, pinks, cosmic colors (#000033, #4B0082, #9400D3, #DDA0DD)',
     atmosphere: 'cosmic, futuristic, otherworldly'
   }
@@ -89,10 +94,39 @@ function extractCustomElements(promptText) {
 }
 
 /**
+ * No predefined theme matched the prompt — build the directions from the prompt
+ * text itself instead of silently defaulting to a canned theme. Free-path quality
+ * varies with the prompt, but at least it depicts what the player asked for.
+ */
+function customDirectionsFromPrompt(promptText, gameType) {
+  const subject = promptText.trim().slice(0, 140);
+  const player = gameType === 'platformer'
+    ? `the armed hero character of "${subject}"`
+    : `the athletic running hero of "${subject}"`;
+  return {
+    backgrounds: `distant scenery landscape of "${subject}"`,
+    characters: player,
+    levelElements: `ground terrain surface matching "${subject}"`,
+    platforms: `floating platform block matching "${subject}"`,
+    player,
+    enemy: `menacing enemy creature from "${subject}"`,
+    hazards: `dangerous stationary hazard object from "${subject}"`,
+    projectile: `small glowing energy projectile matching "${subject}"`,
+    styleGuide: 'retro game aesthetic, clear pixel definition, vibrant colors',
+    colorPalette: `a cohesive palette that fits "${subject}"`
+  };
+}
+
+/**
  * Deterministic theme-based asset directions (the shape carried on
  * config.assetDesignDirections). Blends a secondary theme and prompt keywords.
+ * `theme` may be null: prompts that match no predefined theme design from the
+ * prompt text instead of defaulting to a canned theme.
  */
 export function generateAssetDirections(theme, secondaryTheme, promptText, gameType) {
+  if (!THEMES[theme] && promptText?.trim()) {
+    return customDirectionsFromPrompt(promptText, gameType);
+  }
   const themeData = THEMES[theme] || THEMES.forest;
   const player = gameType === 'platformer' ? themeData.playerPlatformer : themeData.playerRunner;
 
@@ -116,6 +150,7 @@ export function generateAssetDirections(theme, secondaryTheme, promptText, gameT
     player: finalData.player,
     enemy: finalData.enemy,
     hazards: finalData.hazards,
+    projectile: finalData.projectile,
     styleGuide: 'retro game aesthetic, clear pixel definition, vibrant colors',
     colorPalette: finalData.colorPalette
   };
@@ -127,7 +162,8 @@ const DEFAULT_SUBJECTS = {
   platform: 'floating platform ledge block tile',
   player: 'running character sprite',
   enemy: 'patrolling enemy monster creature',
-  obstacle: 'danger barrier block or spike'
+  obstacle: 'danger barrier block or spike',
+  projectile: 'glowing energy bolt'
 };
 
 const DESIGNER_RESPONSE_SCHEMA = {
@@ -143,10 +179,11 @@ const DESIGNER_RESPONSE_SCHEMA = {
     platform: { type: 'STRING' },
     player: { type: 'STRING' },
     enemy: { type: 'STRING' },
-    obstacle: { type: 'STRING' }
+    obstacle: { type: 'STRING' },
+    projectile: { type: 'STRING', description: 'The small ranged attack shot the hero fires' }
   },
   // mid/near are optional — buildFinalPrompt falls back to the far subject via subjectKey
-  required: ['styleSummary', 'colorPalette', 'accentPalette', 'background_far', 'floor', 'platform', 'player', 'enemy', 'obstacle']
+  required: ['styleSummary', 'colorPalette', 'accentPalette', 'background_far', 'floor', 'platform', 'player', 'enemy', 'obstacle', 'projectile']
 };
 
 function buildDesignerPrompt(userPrompt, gameType) {
@@ -169,7 +206,8 @@ function buildDesignerPrompt(userPrompt, gameType) {
     `- platform: a floating platform block (max 15 words)\n` +
     `- player: the hero character (max 20 words)\n` +
     `- enemy: a patrolling enemy creature (max 20 words)\n` +
-    `- obstacle: a stationary hazard object (max 15 words)\n\n` +
+    `- obstacle: a stationary hazard object (max 15 words)\n` +
+    `- projectile: the small ranged shot the hero fires, matching the accentPalette (max 10 words)\n\n` +
     `Rules:\n` +
     `- Describe SUBJECTS ONLY. Do not mention backgrounds, isolation, transparency, framing, ` +
     `camera angle, facing direction, or tiling — those are added automatically.\n` +
@@ -198,10 +236,10 @@ const DEFAULT_ACCENT = 'bright warm saturated contrasting accent colors';
 
 export function localDesign({ gameType, themeKey, userPrompt = '', assetDesignDirections = null }) {
   const directions = assetDesignDirections ||
-    generateAssetDirections(themeKey || 'ice', themeKey || 'ice', userPrompt, gameType || 'runner');
+    generateAssetDirections(themeKey, themeKey, userPrompt, gameType || 'runner');
 
   const subjects = {};
-  for (const slot of BASELINE_SLOTS) {
+  for (const slot of [...BASELINE_SLOTS, 'projectile']) {
     subjects[slot] = SLOT_SPECS[slot].fallbackSubject(directions) || DEFAULT_SUBJECTS[slot];
   }
   return {
@@ -233,7 +271,7 @@ export async function designAssetPrompts({ userPrompt, gameType, themeKey, asset
       timeoutMs
     });
     const subjects = {};
-    for (const slot of BASELINE_SLOTS) {
+    for (const slot of [...BASELINE_SLOTS, 'projectile']) {
       if (!result[slot] || typeof result[slot] !== 'string') return fallback();
       subjects[slot] = result[slot];
     }
@@ -266,7 +304,7 @@ export async function designAssetPrompts({ userPrompt, gameType, themeKey, asset
  * dark silhouette tones for nearer decor planes (atmospheric perspective), and one
  * saturated contrasting accent reserved for the player / enemy / hazards.
  */
-const GAMEPLAY_SLOTS = new Set(['player', 'player_sheet', 'enemy', 'obstacle']);
+const GAMEPLAY_SLOTS = new Set(['player', 'player_sheet', 'enemy', 'obstacle', 'projectile']);
 
 export function buildFinalPrompt(slotKey, subjects, styleGuide) {
   const spec = SLOT_SPECS[slotKey];

@@ -342,11 +342,13 @@ export class SpriteAlignmentManager {
       return;
     }
 
-    // Calculate the offset from sprite bottom to foot position
-    const footOffset = sprite.height - (analysis.footY * sprite.scaleY);
+    // Distance from the frame's bottom edge to the detected foot row, in DISPLAY
+    // pixels (both terms must be scaled together — mixing unscaled frame height
+    // with a scaled foot position used to shove characters into the floor).
+    const footOffset = (sprite.height - 1 - analysis.footY) * sprite.scaleY;
 
-    // Position sprite so feet touch the ground
-    sprite.y = groundY - footOffset;
+    // Origin is bottom-center: sprite.y is the frame bottom, feet sit footOffset above
+    sprite.y = groundY + footOffset;
 
     // Store the calculated position
     sprite.alignmentData.alignedY = sprite.y;
@@ -384,26 +386,21 @@ export class SpriteAlignmentManager {
 
     const bbox = analysis.boundingBox;
 
-    // Calculate actual sprite dimensions after scaling
-    const actualWidth = (bbox.right - bbox.left) * sprite.scaleX;
-    const actualHeight = (bbox.bottom - bbox.top) * sprite.scaleY;
+    // Arcade's setSize/setOffset take UNSCALED frame pixels — the body is scaled by
+    // the sprite's scale automatically. Passing pre-scaled values here double-scaled
+    // the body (a 0.58x player got a 0.33x body), so physics rested a shrunken box
+    // on the floor and the sprite's legs rendered inside the ground.
+    const actualWidth = bbox.right - bbox.left + 1;
+    const actualHeight = bbox.bottom - bbox.top + 1;
 
     // Set collision box to match visible pixels
     sprite.body.setSize(actualWidth, actualHeight);
-
-    // Offset collision box to match visible area
-    const offsetX = (bbox.left * sprite.scaleX) -
-                    ((sprite.width * sprite.scaleX - actualWidth) / 2);
-    const offsetY = (bbox.top * sprite.scaleY) -
-                    ((sprite.height * sprite.scaleY - actualHeight) / 2);
-
-    sprite.body.setOffset(offsetX, offsetY);
+    sprite.body.setOffset(bbox.left, bbox.top);
 
     // For ground-based sprites, ensure bottom of collision box aligns with feet
     if (sprite.alignmentData.type === 'character' ||
         sprite.alignmentData.type === 'enemy') {
-      const footOffset = analysis.footY * sprite.scaleY;
-      sprite.body.setOffset(offsetX, footOffset - actualHeight);
+      sprite.body.setOffset(bbox.left, analysis.footY + 1 - actualHeight);
     }
   }
 

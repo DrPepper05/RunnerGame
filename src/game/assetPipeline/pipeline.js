@@ -4,20 +4,18 @@
  *
  * Per slot: Gemini (when configured) with retry → Pollinations fallback with retry
  * → post-process to the exact contract the game expects. Terminal failure of any
- * slot dispatches the existing 'playmint-error' window event and rejects.
+ * required slot rejects; every caller handles it (ScreenZero downgrades to static
+ * theme art, App surfaces it in the regen overlay) — no global error event here.
  */
 import { SLOT_SPECS, BASELINE_SLOTS, GENERATED_SLOTS } from './slotSpecs';
-import { postProcessAsset, mirrorImage, drawToCanvas, alphaFraction, borderResidueFraction, contentBoundsOf, processSheet, finalizeSheetFrames } from './postprocess';
+import { postProcessAsset, mirrorImage, drawToCanvas, alphaFraction, borderResidueFraction, topBandOpaqueFraction, contentBoundsOf, processSheet, finalizeSheetFrames } from './postprocess';
 import { reviewSprite } from './qa';
 import * as gemini from './providers/geminiImage';
 import * as pollinations from './providers/pollinations';
 import { designAssetPrompts, localDesign, buildFinalPrompt } from './promptDesigner';
+import { parsePromptKeywords } from '../promptUtils';
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-function dispatchPipelineError(message) {
-  window.dispatchEvent(new CustomEvent('playmint-error', { detail: { message } }));
-}
 
 /**
  * Generate one slot's raw image, walking the provider ladder.
@@ -26,7 +24,7 @@ function dispatchPipelineError(message) {
  * instead of each burning retries and long quota waits.
  * Returns { dataUrl, provider, attempts }.
  */
-async function generateSlotImage(slot, prompt, seed, onProgress, maxAttemptsPerProvider, runState) {
+async function generateSlotImage(slot, prompt, seed, onProgress, maxAttemptsPerProvider, runState, onAttempt = () => {}, referenceImageDataUrl = null) {
   const spec = SLOT_SPECS[slot];
   let attempts = 0;
   let lastError = null;
@@ -34,8 +32,11 @@ async function generateSlotImage(slot, prompt, seed, onProgress, maxAttemptsPerP
   if (gemini.isGeminiConfigured() && !runState.skipGemini) {
     for (let attempt = 1; attempt <= maxAttemptsPerProvider; attempt++) {
       attempts++;
+      onAttempt({ provider: 'gemini', attempt, total: maxAttemptsPerProvider });
       try {
-        const result = await gemini.generateImage({ prompt, aspectRatio: spec.gen.aspectRatio });
+        // referenceImageDataUrl is Gemini-only (image editing); Pollinations has no
+        // image-conditioning API, so the fallback below runs from the prompt alone.
+        const result = await gemini.generateImage({ prompt, aspectRatio: spec.gen.aspectRatio, referenceImageDataUrl });
         return { ...result, attempts };
       } catch (err) {
         lastError = err;
@@ -62,9 +63,15 @@ async function generateSlotImage(slot, prompt, seed, onProgress, maxAttemptsPerP
 
   // Retries re-enter the serialized Pollinations queue, which already spaces and
   // penalty-delays requests — no extra backoff sleep needed for 429s here.
-  const fallbackAttempts = maxAttemptsPerProvider + 2;
+  // When Gemini can't rescue this run (keyless, or quota/key already dead), every
+  // retry costs a serialized free-path slot (~15s gap each) — keep the ladder short
+  // so a full game stays minutes, not tens of minutes.
+  const fallbackAttempts = (gemini.isGeminiConfigured() && !runState.skipGemini)
+    ? maxAttemptsPerProvider + 2
+    : 2;
   for (let attempt = 1; attempt <= fallbackAttempts; attempt++) {
     attempts++;
+    onAttempt({ provider: 'pollinations', attempt, total: fallbackAttempts });
     try {
       const result = await pollinations.generateImage({ prompt, ...spec.gen.pollinations, seed });
       return { ...result, attempts };
@@ -94,9 +101,34 @@ export async function generateAssets({
   const meta = {};
   const runState = { skipGemini: false };
   let doneCount = 0;
+  // A required slot that dies rejects the whole run — stop idle workers from
+  // feeding the serial Pollinations queue for minutes after the UI has moved on.
+  let fatal = false;
 
-  const progressFor = () => 75 + Math.round((doneCount / slots.length) * 20);
+  // Partial credit for in-flight slots so the bar moves between completions. On the
+  // serialized free path the FIRST completed slot can take minutes, and a bar frozen
+  // at exactly 75 reads as a hang. Fractions are capped per slot, and the total is
+  // clamped to 94 — 95 is reserved for the caller's pipeline-complete report.
+  const slotFraction = {};
+  const noteSlotProgress = (slot, f) => {
+    slotFraction[slot] = Math.max(slotFraction[slot] || 0, Math.min(f, 0.85));
+  };
+  const progressFor = () => {
+    const partial = Object.values(slotFraction).reduce((a, b) => a + b, 0);
+    return Math.min(94, 75 + Math.round(((doneCount + partial) / slots.length) * 20));
+  };
   const report = (text, pct) => onProgress(text, pct ?? progressFor());
+  // Attempt-level ticker for one slot: attempt 1 is a silent progress-only tick
+  // (text null — UI callbacks skip the log, keep the pct); retries emit a visible
+  // "attempt N/M" line so a slow run demonstrably isn't a hung one.
+  const attemptTicker = (slot) => {
+    let ticks = 0;
+    return ({ provider, attempt, total }) => {
+      ticks++;
+      noteSlotProgress(slot, 0.1 + ticks * 0.12);
+      report(attempt > 1 ? `[ASSETS] ${slot}: ${provider} attempt ${attempt}/${total}...` : null);
+    };
+  };
 
   // Deterministic keying self-check — no vision model, works on the keyless free
   // path. Two failure smells after keying+cropping: almost nothing was removed
@@ -105,12 +137,38 @@ export async function generateAssets({
   // trigger one re-key with looser tolerances; the looser result is kept only when
   // it measurably improves without dissolving the sprite.
   const enforceKeyQuality = async (slot, spec, raw, img) => {
-    if (!spec.post.keying || !spec.post.crop) return img;
+    if (!spec.post.keying) return img;
     const measure = (image) => {
       const canvas = drawToCanvas(image, { width: image.naturalWidth, height: image.naturalHeight, fit: 'stretch' });
-      return { transparent: alphaFraction(canvas), residue: borderResidueFraction(canvas) };
+      return {
+        transparent: alphaFraction(canvas),
+        residue: spec.post.crop ? borderResidueFraction(canvas) : 0,
+        topBand: spec.post.crop ? 0 : topBandOpaqueFraction(canvas)
+      };
     };
     const before = measure(img);
+
+    // Non-cropped keyed slots are the parallax layers: their contract is "everything
+    // above the shapes is empty", so surviving backdrop shows as an opaque top band.
+    if (!spec.post.crop) {
+      if (before.topBand <= 0.10) return img;
+      report(`[ASSETS] Re-keying ${slot} (backdrop left in the top band)...`);
+      const retried = await postProcessAsset(raw.dataUrl, spec, { keyOverrides: { seedTol: 70, stepTol: 24 } });
+      const after = measure(retried);
+      return after.transparent < 0.97 && after.topBand < before.topBand ? retried : img;
+    }
+
+    // A cropped sprite that is >92% transparent inside its own bounding box got
+    // shredded by the flood (it rode a gradient into the interior) — one TIGHTER
+    // re-key, kept only when it restores real coverage without leaving residue.
+    if (before.transparent > 0.92) {
+      report(`[ASSETS] Re-keying ${slot} (keying removed too much)...`);
+      const retried = await postProcessAsset(raw.dataUrl, spec, { keyOverrides: { seedTol: 26, stepTol: 10 } });
+      const after = measure(retried);
+      const restored = after.transparent <= before.transparent - 0.1;
+      return restored && after.residue <= 0.06 ? retried : img;
+    }
+
     if (before.transparent >= 0.05 && before.residue <= 0.06) return img;
     report(`[ASSETS] Re-keying ${slot} (background leftovers detected)...`);
     const retried = await postProcessAsset(raw.dataUrl, spec, { keyOverrides: { seedTol: 70, stepTol: 24 } });
@@ -131,18 +189,22 @@ export async function generateAssets({
     // provider (weaker facing/pose adherence) but vision review still works.
     if (!spec.qa || !gemini.isGeminiConfigured()) return { img, outcome };
 
-    let review = await reviewSprite(img.src);
-    if (review && !review.backgroundClean) {
+    // Layers get their own review kind: their failure mode is rectangular vignette
+    // "props" (mini paintings) rather than a wrong facing.
+    const kind = spec.qa.clean ? 'layer' : 'sprite';
+    const failed = (r) => r && (!r.backgroundClean || r.cutoutShapes === false);
+    let review = await reviewSprite(img.src, { kind });
+    if (failed(review)) {
       report(`[ASSETS] QA: re-keying ${slot} background...`);
       img = await postProcessAsset(raw.dataUrl, spec, { keyOverrides: { seedTol: 60, stepTol: 20 } });
-      review = (await reviewSprite(img.src)) || review;
-      if (!review.backgroundClean) {
+      review = (await reviewSprite(img.src, { kind })) || review;
+      if (failed(review)) {
         report(`[ASSETS] QA: regenerating ${slot}...`);
         try {
           const retryRaw = await generateSlotImage(slot, prompt, seed + 1, report, maxAttemptsPerProvider, runState);
           const retryImg = await postProcessAsset(retryRaw.dataUrl, spec);
           img = retryImg;
-          review = (await reviewSprite(img.src)) || review;
+          review = (await reviewSprite(img.src, { kind })) || review;
         } catch (err) {
           console.warn(`[AssetPipeline] QA regeneration failed for "${slot}", keeping previous:`, err.message);
         }
@@ -154,7 +216,7 @@ export async function generateAssets({
       outcome.mirrored = true;
     }
     outcome.qa = review;
-    outcome.facingVerified = !!review;
+    outcome.facingVerified = !!review && !!spec.qa.facing;
     return { img, outcome };
   };
 
@@ -163,7 +225,18 @@ export async function generateAssets({
   // single attempt with no regeneration — its sheets pass the gates often enough to
   // be worth one serial-queue slot, but not two.
   const runSheetSlot = async (slot, spec, prompt) => {
+    // Static base FIRST, sheet second. The finished static sprite (keyed, QA'd,
+    // facing-corrected) is both (a) the identity reference for the sheet call —
+    // on Gemini the sheet request is an image EDIT ("redraw this exact character
+    // in nine poses") instead of a from-scratch imagination, which is what keeps
+    // one consistent character across cells — and (b) the instant fallback when
+    // the sheet fails any gate, with no third generation call.
+    // If the static base itself dies, the whole slot rejects (player is required).
+    await runSlot(spec.fallbackSlot);
+    const baseSrc = preloadedImages[spec.fallbackSlot]?.src || null;
+
     report(`[ASSETS] Generating animated ${spec.outputKey || slot}...`);
+    const onAttempt = attemptTicker(slot);
     try {
       // A sheet whose cells kept a painted scene can't be keyed (non-uniform backdrop)
       // and would render the player as an opaque card — gate on transparency
@@ -209,6 +282,45 @@ export async function generateAssets({
         }
         return staticPairs >= Math.floor((runCount - 1) / 2);
       };
+      // A sheet can pass every size gate while drawing a DIFFERENT character in
+      // each cell — the local gates check geometry, and the vision check that
+      // catches identity drift (gridConsistent) is Gemini-only, so on the free
+      // path incoherent sheets used to ship. Same character in a new pose keeps
+      // its palette; a redesigned character shifts it — compare per-cell coarse
+      // color histograms (4×4×4 RGB buckets over opaque pixels) against the
+      // element-wise median. L1 distance ranges 0..2; >0.9 = mostly different
+      // palette. Two or more outlier cells = not one character.
+      const cellsLookUnrelated = (cells) => {
+        const runCount = Math.min(spec.frames.runFrameCount || cells.length, cells.length);
+        const histogram = (cell) => {
+          const small = document.createElement('canvas');
+          small.width = 32; small.height = 32;
+          const ctx = small.getContext('2d');
+          ctx.drawImage(cell, 0, 0, 32, 32);
+          const data = ctx.getImageData(0, 0, 32, 32).data;
+          const buckets = new Array(64).fill(0);
+          let opaque = 0;
+          for (let i = 0; i < data.length; i += 4) {
+            if (data[i + 3] < 128) continue;
+            buckets[(data[i] >> 6) * 16 + (data[i + 1] >> 6) * 4 + (data[i + 2] >> 6)]++;
+            opaque++;
+          }
+          return opaque ? buckets.map(b => b / opaque) : null;
+        };
+        const hists = cells.slice(0, runCount).map(histogram);
+        if (hists.some(h => !h)) return false; // empty cells are the geometry gate's job
+        const median = hists[0].map((_, i) => {
+          const col = hists.map(h => h[i]).sort((a, b) => a - b);
+          return col[Math.floor(col.length / 2)];
+        });
+        let outliers = 0;
+        for (const h of hists) {
+          let dist = 0;
+          for (let i = 0; i < 64; i++) dist += Math.abs(h[i] - median[i]);
+          if (dist > 0.9) outliers++;
+        }
+        return outliers >= 2;
+      };
 
       let sheet = null;
       let review = null;
@@ -218,7 +330,16 @@ export async function generateAssets({
       let lastIssue = 'unknown';
       for (let attempt = 1; attempt <= 2 && !sheet; attempt++) {
         if (attempt > 1) report(`[ASSETS] Sheet ${lastIssue}, regenerating...`);
-        const raw = await generateSlotImage(slot, prompt, seed + attempt * 13, report, maxAttemptsPerProvider, runState);
+        // On the Gemini rung the sheet is an image-editing call anchored to the
+        // static base; the prompt preamble tells the model the attachment IS the
+        // character. Pollinations ignores the reference (prompt-only model).
+        const useReference = baseSrc && gemini.isGeminiConfigured() && !runState.skipGemini;
+        const sheetPrompt = useReference
+          ? `Use the character in the attached reference image. Redraw THIS EXACT character — identical design, ` +
+            `colors, outfit and held items, do not reinvent anything about it — as the following sprite sheet. ${prompt}`
+          : prompt;
+        const raw = await generateSlotImage(slot, sheetPrompt, seed + attempt * 13, report, maxAttemptsPerProvider, runState, onAttempt, useReference ? baseSrc : null);
+        noteSlotProgress(slot, 0.8);
         provider = raw.provider;
         attempts += raw.attempts;
         // Cells are keyed INDIVIDUALLY — whole-sheet flood keying can never reach the
@@ -226,7 +347,9 @@ export async function generateAssets({
         const { previewImg, cells } = await processSheet(raw.dataUrl, spec);
         const localIssue = sheetTransparency(previewImg) < spec.post.minAlphaFraction
           ? 'kept a painted background'
-          : (gridGeometryIssue(cells) || (framesLookStatic(cells) ? 'has near-identical frames' : null));
+          : (gridGeometryIssue(cells)
+            || (framesLookStatic(cells) ? 'has near-identical frames' : null)
+            || (cellsLookUnrelated(cells) ? 'draws a different character per frame' : null));
         if (localIssue) {
           lastIssue = localIssue;
           if (provider === 'pollinations') break; // one free-path attempt only
@@ -254,12 +377,15 @@ export async function generateAssets({
         qa: review, mirrored, facingVerified: !!review,
         sheet: true, frames: sheet.frames
       };
-      doneCount++;
-      report(`[ASSETS] Ready: animated ${outKey} via ${provider} (${doneCount}/${slots.length})`);
+      delete slotFraction[slot];
+      // No doneCount++ here: the static base already counted this slot when it
+      // landed; the sheet is an upgrade of the same output key, not a new slot.
+      report(`[ASSETS] Upgraded: animated ${outKey} via ${provider}`);
     } catch (err) {
-      console.warn(`[AssetPipeline] Sprite sheet failed (${err.message}) — falling back to static "${spec.fallbackSlot}".`);
-      report(`[ASSETS] Animated player unavailable, generating static sprite...`);
-      await runSlot(spec.fallbackSlot);
+      // The static base is already generated, keyed and registered — keep it.
+      console.warn(`[AssetPipeline] Sprite sheet failed (${err.message}) — keeping the static "${spec.fallbackSlot}" sprite.`);
+      report(`[ASSETS] Animated player unavailable, keeping static sprite.`);
+      delete slotFraction[slot];
     }
   };
 
@@ -269,6 +395,7 @@ export async function generateAssets({
     const spec = SLOT_SPECS[slot];
     if (spec.frames) return runSheetSlot(slot, spec, prompt);
     report(`[ASSETS] Generating ${slot}...`);
+    const onAttempt = attemptTicker(slot);
     try {
       // Overlay layers that failed to key out (still mostly opaque) would cover the
       // layers behind them — reject so the optional-slot path drops them. The model
@@ -277,33 +404,52 @@ export async function generateAssets({
         if (!spec.post.minAlphaFraction) return null;
         const canvas = drawToCanvas(img, { width: img.naturalWidth, height: img.naturalHeight, fit: 'stretch' });
         const fraction = alphaFraction(canvas);
-        return fraction < spec.post.minAlphaFraction
-          ? `layer kept too little transparency (${Math.round(fraction * 100)}% transparent)`
+        if (fraction < spec.post.minAlphaFraction) {
+          return `layer kept too little transparency (${Math.round(fraction * 100)}% transparent)`;
+        }
+        // A layer can pass the global transparency bar and still carry a painted sky —
+        // the strip contract is a mostly-empty top band, so gate on that too.
+        const topBand = topBandOpaqueFraction(canvas);
+        return topBand > 0.35
+          ? `layer kept a painted sky (${Math.round(topBand * 100)}% of the top band opaque)`
           : null;
       };
       const attemptOnce = async (attemptSeed, attemptPrompt) => {
-        const raw = await generateSlotImage(slot, attemptPrompt, attemptSeed, report, maxAttemptsPerProvider, runState);
+        const raw = await generateSlotImage(slot, attemptPrompt, attemptSeed, report, maxAttemptsPerProvider, runState, onAttempt);
+        noteSlotProgress(slot, 0.8);
         let img = await postProcessAsset(raw.dataUrl, spec);
         img = await enforceKeyQuality(slot, spec, raw, img);
         const { img: finalImg, outcome } = await applyQualityAssurance(slot, spec, raw, img, attemptPrompt);
         return { raw, finalImg, outcome };
       };
 
+      // Vision verdict "not cutout shapes" (vignette panels) is as disqualifying for a
+      // layer as failed keying — both feed the same retry-then-drop ladder.
+      const layerIssue = (res) => checkTransparency(res.finalImg) ||
+        (spec.optional && res.outcome.qa?.cutoutShapes === false
+          ? 'layer is picture panels, not cutout shapes (vision QA)'
+          : null);
+
       let result = await attemptOnce(seed, prompt);
-      let transparencyIssue = checkTransparency(result.finalImg);
-      if (transparencyIssue && spec.optional) {
-        report(`[ASSETS] Retrying ${slot} (${transparencyIssue})...`);
+      let qualityIssue = layerIssue(result);
+      // The strict-prompt retry is another full ladder walk — cheap on Gemini, but a
+      // second serialized slot on the free path. Mirror the sheet's one-free-path-
+      // attempt rule: a Pollinations layer that fails the gates is dropped, not redone.
+      if (qualityIssue && spec.optional && result.raw.provider !== 'pollinations') {
+        report(`[ASSETS] Retrying ${slot} (${qualityIssue})...`);
         // Harsher variant: the model painted a full scene — demand cutouts explicitly
         const strictPrompt = prompt +
           ', IMPORTANT: only flat solid silhouette cutout shapes on an empty pure white background, ' +
-          'like paper cutouts, at least the upper half of the image must be completely blank white';
+          'like paper cutouts, at least the upper half of the image must be completely blank white, ' +
+          'absolutely no rectangular panels, no framed pictures, no scenery patches';
         result = await attemptOnce(seed + 7, strictPrompt);
-        transparencyIssue = checkTransparency(result.finalImg);
+        qualityIssue = layerIssue(result);
       }
-      if (transparencyIssue) throw new Error(transparencyIssue);
+      if (qualityIssue) throw new Error(qualityIssue);
 
       preloadedImages[slot] = result.finalImg;
       meta[slot] = { provider: result.raw.provider, attempts: result.raw.attempts, promptUsed: prompt, ...result.outcome };
+      delete slotFraction[slot];
       doneCount++;
       report(`[ASSETS] Ready: ${slot} via ${result.raw.provider} (${doneCount}/${slots.length})`);
     } catch (err) {
@@ -311,13 +457,14 @@ export async function generateAssets({
         // Optional layers degrade gracefully — the game filters missing textures
         console.warn(`[AssetPipeline] Dropping optional slot "${slot}": ${err.message}`);
         meta[slot] = { dropped: true, reason: err.message };
+        delete slotFraction[slot];
         doneCount++;
         report(`[ASSETS] Skipped optional layer ${slot} (${doneCount}/${slots.length})`);
         return;
       }
       const message = `[Asset Pipeline Error] Failed to generate "${slot}".\n• Prompt: "${prompt}"\n• Reason: ${err.message}`;
       console.error(message);
-      dispatchPipelineError(message);
+      fatal = true;
       throw new Error(message);
     }
   };
@@ -326,7 +473,7 @@ export async function generateAssets({
   // low on free tier; a full 6-wide burst just converts into 429s)
   const queue = [...slots];
   const workers = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
-    while (queue.length > 0) {
+    while (queue.length > 0 && !fatal) {
       await runSlot(queue.shift());
     }
   });
@@ -349,14 +496,20 @@ export async function generateGameAssets({ config, userPrompt = '', onProgress =
   onProgress(`[DESIGN] Asset prompts composed via ${design.source === 'gemini' ? 'Gemini art director' : 'local templates'}...`, 73);
 
   const finalPrompts = {};
-  for (const slot of [...GENERATED_SLOTS, 'player_sheet']) {
+  for (const slot of [...GENERATED_SLOTS, 'player_sheet', 'projectile']) {
     finalPrompts[slot] = buildFinalPrompt(slot, design.subjects, design.styleGuide);
   }
 
   // The player is always attempted as an animated sprite sheet (stored under the
   // 'player' key). Gemini produces reliable sheets; the free path gets one gated
   // attempt and falls back to a static player sprite when the gates reject it.
+  // GENERATED_SLOTS order matters: required gameplay slots precede the optional
+  // parallax layers, so the FIFO worker pool finishes the playable core first
+  // (crucial on the serialized free path) — keep it that way.
   const slots = GENERATED_SLOTS.map(s => (s === 'player' ? 'player_sheet' : s));
+  // Platformer games shoot — generate their projectile too (optional slot: on failure
+  // the game keeps its static SVG bolt). Runners never fire, skip the cost.
+  if (config.gameType === 'platformer') slots.push('projectile');
 
   const { preloadedImages, meta } = await generateAssets({ finalPrompts, slots, onProgress });
 
@@ -372,6 +525,49 @@ export async function generateGameAssets({ config, userPrompt = '', onProgress =
   // generation (DevTools: window.__GAME_LIVE_CONFIG.assetMeta)
   const assetMeta = { designSource: design.source, slots: meta };
   return { preloadedImages, meta, promptSet: finalPrompts, design, assetMeta };
+}
+
+/**
+ * Cherry-pick regeneration: redo ONLY the requested slots for an already-running
+ * game (Creator Panel "restyle" intent). The edit instruction steers the prompt
+ * designer so the new art follows the request; the caller merges the returned
+ * images/meta over the retained ones and remounts the game.
+ */
+export async function regenerateAssetSlots({ config, instruction = '', slots, onProgress = () => {} }) {
+  // The instruction IS the art direction for a restyle. Reusing the original
+  // assetDesignDirections would make the keyless path regenerate the same subjects
+  // and silently ignore the request; a theme word in the instruction ("lava world")
+  // selects the matching local theme table instead.
+  const parsedTheme = instruction.trim() ? parsePromptKeywords(instruction).themeKey : null;
+  const design = await designAssetPrompts({
+    userPrompt: instruction,
+    gameType: config.gameType,
+    themeKey: parsedTheme || config.themeKey,
+    assetDesignDirections: instruction.trim() ? null : config.assetDesignDirections
+  });
+  onProgress(`[DESIGN] Asset prompts composed via ${design.source === 'gemini' ? 'Gemini art director' : 'local templates'}...`, 73);
+
+  const finalPrompts = {};
+  for (const slot of slots) {
+    finalPrompts[slot] = buildFinalPrompt(slot, design.subjects, design.styleGuide);
+    // Sheet slots fall back to their static slot on gate failure — that fallback
+    // run needs its own prompt present.
+    const fallbackSlot = SLOT_SPECS[slot].fallbackSlot;
+    if (fallbackSlot && !finalPrompts[fallbackSlot]) {
+      finalPrompts[fallbackSlot] = buildFinalPrompt(fallbackSlot, design.subjects, design.styleGuide);
+    }
+  }
+
+  const { preloadedImages, meta } = await generateAssets({ finalPrompts, slots, onProgress });
+
+  const providers = Object.values(meta).filter(m => !m.dropped).map(m => m.provider);
+  const geminiCount = providers.filter(p => p === 'gemini').length;
+  onProgress(
+    `[ASSETS] Updated ${providers.length}/${slots.length} slot(s) — ` +
+    `${geminiCount} via Gemini, ${providers.length - geminiCount} via free engine.`,
+    95
+  );
+  return { preloadedImages, meta, design };
 }
 
 /**

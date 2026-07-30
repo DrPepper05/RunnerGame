@@ -6,9 +6,11 @@ import CreatorPanel from './components/CreatorPanel';
 import ScreenZero from './components/ScreenZero';
 import { GAME_PRESETS } from './gameConfig';
 import { generateGameConfig } from './game/geminiService';
-import { generateGameAssets, compileFallbackUrls } from './game/assetPipeline';
+import { generateGameAssets, regenerateAssetSlots, compileFallbackUrls } from './game/assetPipeline';
 import { generateTitle } from './game/promptUtils';
+import { interpretEditPrompt, resolveAssetTargets } from './game/gameEditor';
 import GameOverOverlay from './components/GameOverOverlay';
+import RegenOverlay from './components/RegenOverlay';
 import MobileControls from './components/MobileControls';
 
 const getInitialState = () => {
@@ -43,6 +45,7 @@ function App() {
   const [presetKey, setPresetKey] = useState(initialConfig.presetKey);
   const [liveParams, setLiveParams] = useState(initialConfig.liveParams);
   const [hasStarted, setHasStarted] = useState(initialConfig.isImported);
+  const [regenState, setRegenState] = useState(null);
   const [isTransitioning, setIsTransitioning] = useState(false);
   const fullscreenContainerRef = useRef(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -293,10 +296,100 @@ function App() {
     const raw = promptText.trim();
     if (!raw) return;
 
+    // Generation takes 15s–2min — surface it with the compiler overlay so the user
+    // sees log/progress feedback instead of a silently frozen panel.
+    const pushProgress = (logText, progressVal) => {
+      setRegenState(prev => prev && {
+        ...prev,
+        progress: progressVal != null ? Math.max(prev.progress, progressVal) : prev.progress,
+        logs: [...prev.logs.slice(-9), logText]
+      });
+    };
+
+    // A running game first goes through the AI editor: variable tweaks apply live
+    // (no asset generation, no reboot) via the existing update-game-config channel;
+    // restyles redraw ONLY the targeted slots and keep everything else.
+    if (hasStarted) {
+      const edit = await interpretEditPrompt(liveParams, raw);
+      console.log('[App.jsx] Edit interpretation:', edit);
+      if (edit.intent === 'tweak') {
+        if (!Object.keys(edit.changes).length) {
+          return { applied: false, summary: edit.summary || 'No recognized changes — try rephrasing or describe a new game.' };
+        }
+        setLiveParams(prev => ({ ...prev, ...edit.changes }));
+        setPresetKey('custom');
+        return { applied: true, summary: edit.summary };
+      }
+      // Cherry-pick regeneration: only possible when we still hold the previous
+      // run's preloaded images (preset/share-link games only have raw URLs — those
+      // fall through to the full pipeline so every slot exists afterwards).
+      if (edit.intent === 'restyle' && liveParams.preloadedImages) {
+        const slots = resolveAssetTargets(edit.assetTargets, liveParams);
+        if (!slots.length) {
+          return { applied: false, summary: 'Nothing to redraw for this game mode — try naming another element.' };
+        }
+        setIsMenuOpen(false);
+        setRegenState({
+          title: 'Updating Artwork',
+          progress: 5,
+          logs: [`[EDITOR] ${edit.summary || `Redrawing ${edit.assetTargets.join(', ')}`} (${slots.length} slot${slots.length > 1 ? 's' : ''})...`]
+        });
+        try {
+          const { preloadedImages: newImages, meta: newMeta } = await regenerateAssetSlots({
+            config: liveParams,
+            instruction: raw,
+            slots,
+            onProgress: (logText, progressVal) => pushProgress(logText, progressVal)
+          });
+          pushProgress('[ENGINE] Artwork updated! Restarting world...', 100);
+          const keptOld = Object.entries(newMeta)
+            .filter(([slot, m]) => m.dropped && liveParams.preloadedImages[slot])
+            .map(([slot]) => slot);
+          setGameKey(k => k + 1);
+          setPresetKey('custom');
+          setLiveParams(prev => {
+            const mergedImages = { ...prev.preloadedImages };
+            const mergedMeta = { ...(prev.assetMeta?.slots || {}) };
+            for (const [slot, m] of Object.entries(newMeta)) {
+              if (m.dropped) {
+                // New version failed the quality gates — keep the old art if we had it
+                if (mergedImages[slot]) continue;
+                mergedMeta[slot] = m;
+                continue;
+              }
+              mergedImages[slot] = newImages[slot];
+              mergedMeta[slot] = m;
+            }
+            return {
+              ...prev,
+              ...edit.changes,
+              preloadedImages: mergedImages,
+              assetMeta: { ...(prev.assetMeta || {}), slots: mergedMeta }
+            };
+          });
+          const summary = keptOld.length
+            ? `${edit.summary} — kept the previous ${keptOld.join(', ')} (new version failed quality checks)`
+            : edit.summary;
+          return { applied: true, summary };
+        } catch (err) {
+          console.error('[App.jsx] Restyle failed:', err);
+          return { applied: false, summary: err.message };
+        } finally {
+          setRegenState(null);
+        }
+      }
+      // intent === 'regenerate' (or restyle with no retained images) → full pipeline below
+    }
+
+    setIsMenuOpen(false);
+    setRegenState({ progress: 3, logs: [`[EDITOR] New world required for "${raw}" — regenerating...`] });
+
     try {
       console.log('[App.jsx] Calling generateGameConfig...');
       const result = await generateGameConfig(raw, (logText, progressVal) => {
         console.log(`[App.jsx Config Progress] ${progressVal}% - ${logText}`);
+        // Config is the fast local phase — cap it so asset progress (73+) takes over
+        pushProgress(logText, Math.min(progressVal ?? 0, 70));
       });
       const updatedConfig = result.config;
 
@@ -305,25 +398,31 @@ function App() {
         userPrompt: raw,
         onProgress: (logText, progressVal) => {
           console.log(`[App.jsx Asset Progress] ${progressVal}% - ${logText}`);
+          pushProgress(logText, progressVal);
         }
       });
+
+      pushProgress('[ENGINE] World gate synchronized! Starting game...', 100);
 
       // Apply — force fresh Phaser instance
       setGameKey(k => k + 1);
       setPresetKey('custom');
       setLiveParams({ ...updatedConfig, preloadedImages, assetMeta });
-      setIsMenuOpen(false);
     } catch (err) {
       console.error('[App.jsx] Prompt generation failed:', err);
       window.dispatchEvent(new CustomEvent('playmint-error', { detail: { message: err.message } }));
       throw err;
+    } finally {
+      setRegenState(null);
     }
   };
 
   return (
     <div ref={fullscreenContainerRef} style={{ position: 'relative', width: '100%', height: '100dvh', overflow: 'hidden' }}>
-      
-      {/* Game view rendered if started OR if transitioning */}
+
+      {/* In-place world regeneration progress (Creator Panel prompt) */}
+      <RegenOverlay state={regenState} />
+
       {/* Game view rendered if started OR if transitioning */}
       {(hasStarted || isTransitioning) && (
         <>

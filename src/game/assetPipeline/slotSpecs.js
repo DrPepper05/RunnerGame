@@ -47,13 +47,16 @@ export const SLOT_SPECS = {
     canvas: { width: 1024, height: 512 },
     gen: { aspectRatio: '16:9', pollinations: { width: 1024, height: 576 } },
     post: { fit: 'cover', keying: 'flood+white', trimBorder: false, crop: false, minAlphaFraction: 0.15, edgeErode: 2, darken: 0.85 },
+    qa: { clean: true },
     optional: true,
     subjectKey: 'background_far',
     scaffold: (subject, style) =>
       `a flat dark silhouette skyline strip themed after ${subject}, solid silhouette ` +
       `cutout shapes like paper cutouts along the bottom edge of the frame, reaching at ` +
-      `most half the frame height, on a plain pure white background, everything above the ` +
-      `shapes is empty pure white, no scene, no interior, no sky, ` +
+      `most half the frame height, on a plain pure white background, the entire upper ` +
+      `half of the image is completely blank solid white with nothing in it, this is NOT ` +
+      `a landscape painting: no scene, no interior, no sky, no clouds, no aurora, no ` +
+      `stars, no gradient backdrop of any kind, ` +
       `seamless horizontally tileable, no text, ${style}`,
     fallbackSubject: (d) => d?.backgrounds
   },
@@ -61,14 +64,19 @@ export const SLOT_SPECS = {
     textureKey: 'dyn_bg_near',
     canvas: { width: 1024, height: 512 },
     gen: { aspectRatio: '16:9', pollinations: { width: 1024, height: 576 } },
-    post: { fit: 'cover', keying: 'flood+white', trimBorder: false, crop: false, minAlphaFraction: 0.15, edgeErode: 2, darken: 0.72 },
+    // edgeErode 1 (not 2): near props are detailed decor, 2px erosion shreds thin
+    // details; bleedEdgeColors still covers the halo
+    post: { fit: 'cover', keying: 'flood+white', trimBorder: false, crop: false, minAlphaFraction: 0.15, edgeErode: 1, darken: 0.72 },
+    qa: { clean: true },
     optional: true,
     subjectKey: 'background_far',
     scaffold: (subject, style) =>
       `three or four separate standalone decorative props themed after ${subject}, each a ` +
       `distinct isolated object with gaps between them, on a plain pure white background, ` +
       `props stand on the bottom edge of the frame, small, reaching at most one third of ` +
-      `the frame height, the rest of the image is empty pure white, no scene, no landscape, ` +
+      `the frame height, everything else in the image is completely blank solid white, ` +
+      `this is NOT a landscape painting: no scene, no landscape, no sky, no clouds, no ` +
+      `aurora, no gradient backdrop of any kind, only the isolated objects themselves, ` +
       `seamless horizontally tileable, no text, ${style}`,
     fallbackSubject: (d) => d?.backgrounds
   },
@@ -87,11 +95,33 @@ export const SLOT_SPECS = {
     textureKey: 'dyn_platform',
     canvas: { width: 128, height: 64 },
     gen: { aspectRatio: '1:1', pollinations: { width: 128, height: 64 } },
-    post: { fit: 'stretch', keying: 'flood', trimBorder: false, crop: true, outline: true },
+    // fillAfterCrop: the game tiles this texture into a fixed 64×32 physics box —
+    // cropped-to-content textures of arbitrary size leave the visible art misaligned
+    // with the hitbox. Crop to content, then stretch back to exactly fill the canvas,
+    // so the visual and the body rectangle are always the same shape.
+    // solidify: stretch each column's art to the full frame height so the texture edge
+    // IS the collision edge (rounded pill shapes read as floating off their hitbox)
+    post: { fit: 'stretch', keying: 'flood', trimBorder: false, crop: true, fillAfterCrop: true, solidify: true, outline: true },
     scaffold: (subject, style) =>
-      `a single wide flat rectangular floating platform, ${subject}, side view, centered, ` +
-      `isolated on a plain pure white background, no shadow, no reflection, ${style}`,
+      `a single wide flat rectangular floating platform, ${subject}, side view, the ` +
+      `platform spans the full width of the frame from the left edge to the right edge, ` +
+      `flat level top surface, isolated on a plain pure white background, no shadow, ` +
+      `no reflection, ${style}`,
     fallbackSubject: (d) => d?.platforms
+  },
+  // Ranged-attack projectile — generated only for platformer games (runner never
+  // shoots). Optional: on failure the game keeps its static SVG bolt.
+  projectile: {
+    textureKey: 'dyn_projectile',
+    canvas: { width: 128, height: 64 },
+    gen: { aspectRatio: '1:1', pollinations: { width: 128, height: 64 } },
+    post: { fit: 'stretch', keying: 'flood', trimBorder: false, crop: true, outline: true },
+    optional: true,
+    scaffold: (subject, style) =>
+      `a single small 2d video game projectile sprite, ${subject}, flying to the right, ` +
+      `elongated horizontal shape, side view, centered, isolated on a plain pure white ` +
+      `background, no shadow, no motion trail, no text, ${style}`,
+    fallbackSubject: (d) => d?.projectile
   },
   player: {
     textureKey: 'dyn_player',
@@ -143,26 +173,35 @@ export const SLOT_SPECS = {
     // "alternating legs" instruction produces eight near-identical poses; explicit
     // per-cell choreography (contact/down/passing/up, right lead then left lead)
     // is what actually makes the legs swap.
+    // Identity FIRST, choreography second: the failure mode that ships is not "poses
+    // too subtle" but "a different-looking character in every cell" — so the prompt
+    // leads with copied-nine-times identity language, then gives the eight canonical
+    // run phases cell by cell (contact/pass/airborne/reach, right lead then left
+    // lead). Do NOT demand every cell differ from every OTHER cell: a run cycle
+    // legitimately repeats its passing poses (cells 2/6), and "dramatically
+    // different" pressure makes models redesign the character per cell.
     scaffold: (subject, style) =>
-      `sprite sheet, a 3x3 grid of nine evenly spaced animation frames of the SAME ` +
-      `character: ${subject}. Reading left to right, top to bottom, the first eight ` +
-      `cells are the eight phases of one full run cycle, each pose clearly different ` +
-      `from the previous cell: ` +
-      `cell 1 RIGHT foot planted forward on the ground, left leg trailing far behind; ` +
-      `cell 2 body low, pushing off, legs passing close together under the body; ` +
-      `cell 3 fully airborne, left knee driving up in front, right leg trailing; ` +
-      `cell 4 left foot reaching far forward about to land; ` +
-      `cell 5 LEFT foot planted forward on the ground, right leg trailing far behind; ` +
-      `cell 6 body low, pushing off, legs passing close together under the body; ` +
-      `cell 7 fully airborne, right knee driving up in front, left leg trailing; ` +
-      `cell 8 right foot reaching far forward about to land; ` +
-      `arms always swinging opposite to the legs. ` +
-      `The ninth cell (bottom-right) is a mid-air jumping pose with both knees bent. ` +
-      `Character facing right in side profile in every cell, identical character size ` +
-      `and vertical position in every cell, each character centered in its own grid ` +
-      `cell, completely isolated on a plain pure white background in every cell, ` +
-      `absolutely no scenery, no environment, no room, no floor, no shadows, no motion ` +
-      `lines, nothing behind the character, no grid lines, no borders, no text, ${style}`,
+      `sprite sheet, a 3x3 grid of nine animation frames of the EXACT SAME video game ` +
+      `character: ${subject}. IDENTICAL character in every cell — same face, same hair, ` +
+      `same outfit, same colors, same proportions, same held items — as if one drawing ` +
+      `was copied nine times and ONLY the arm and leg poses were redrawn. ` +
+      `Reading left to right, top to bottom, cells 1 to 8 are the eight phases of one ` +
+      `full running stride: ` +
+      `cell 1: right foot planted on the ground ahead, left leg trailing behind, left arm swung forward, right arm swung back; ` +
+      `cell 2: legs passing close together under the crouched body, arms pumping at the sides; ` +
+      `cell 3: airborne, left knee lifted in front, right leg trailing behind, right arm swung forward; ` +
+      `cell 4: left foot reaching forward about to land, arms passing level; ` +
+      `cell 5: left foot planted on the ground ahead, right leg trailing behind, right arm swung forward, left arm swung back — the same stride as cell 1 with the legs swapped; ` +
+      `cell 6: legs passing close together under the crouched body, arms pumping at the sides; ` +
+      `cell 7: airborne, right knee lifted in front, left leg trailing behind, left arm swung forward; ` +
+      `cell 8: right foot reaching forward about to land, arms passing level; ` +
+      `cell 9 (bottom-right): mid-air jump pose with both knees tucked up and arms out for balance. ` +
+      `Any weapon or held item stays gripped in the same hand in every cell and tilts ` +
+      `with that arm as it swings. ` +
+      `Character faces right in side profile in every cell, same character size and same ` +
+      `ground line in every cell, each character centered in its own grid cell, isolated ` +
+      `on a plain pure white background in every cell, no scenery, no floor, no shadows, ` +
+      `no motion lines, no grid lines, no cell borders, no text, ${style}`,
     fallbackSubject: (d) => d?.player
   },
   obstacle: {

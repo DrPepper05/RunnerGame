@@ -26,8 +26,10 @@ export async function generateGameConfig(promptText, onProgress = () => {}) {
     // Determine game mode
     const gameType = parsed.mode === 'action_quest' ? 'platformer' : 'runner';
 
-    // Determine theme (default to ice if none found)
-    const theme = parsed.themeKey || 'ice';
+    // Theme may be null: prompts matching none of the predefined themes get their
+    // art direction and title derived from the prompt text itself (no more
+    // everything-defaults-to-ice).
+    const theme = parsed.themeKey;
     const secondaryTheme = parsed.secondaryThemeKey || theme;
 
     // Generate game name
@@ -50,7 +52,10 @@ export async function generateGameConfig(promptText, onProgress = () => {}) {
     let actionJumpHeight = 600;
     let actionGravity = 1400;
     let actionEnemyCount = 5;
-    let actionProjectileEnabled = false;
+    // Projectiles default ON for action quest (matches GAME_PRESETS) — prompt-generated
+    // platformer games were shipping without their ranged attack unless the prompt
+    // happened to contain a combat keyword. Runner mode ignores this flag.
+    let actionProjectileEnabled = true;
     let worldWidth = 4000;
 
     // Apply tuning parameters from table
@@ -142,7 +147,7 @@ export async function generateGameConfig(promptText, onProgress = () => {}) {
     return {
       success: true,
       config,
-      logs: [`Generated locally: ${gameName} (${theme} theme, difficulty ${difficulty})`]
+      logs: [`Generated locally: ${gameName} (${theme || 'custom'} theme, difficulty ${difficulty})`]
     };
 
   } catch (error) {

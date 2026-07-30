@@ -305,11 +305,24 @@ export function parsePromptKeywords(text) {
  */
 export function generateTitle(text, mode, themeKey) {
   const trimmed = text.trim();
+  const cap = (w) => w.charAt(0).toUpperCase() + w.slice(1);
   if (trimmed.length > 4 && trimmed.length < 36) {
-    return trimmed
-      .split(/\s+/)
-      .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-      .join(' ');
+    return trimmed.split(/\s+/).map(cap).join(' ');
+  }
+
+  // Long prompts: title from the prompt's own distinctive words, not a canned
+  // theme table (a "clockwork castle" game should never be called "Hoarfrost Path")
+  const STOP_WORDS = new Set([
+    'a', 'an', 'the', 'with', 'and', 'or', 'of', 'in', 'on', 'at', 'to', 'for',
+    'game', 'mode', 'style', 'themed', 'theme', 'some', 'lots', 'many', 'where',
+    'runner', 'platformer', 'quest', 'action', 'run', 'make', 'create', 'please'
+  ]);
+  const words = trimmed.split(/\s+/).filter((w) => w.length > 2 && !STOP_WORDS.has(w.toLowerCase()));
+  const modeWordsList = mode === 'action_quest'
+    ? ['Quest', 'Raid', 'Path', 'Saga']
+    : ['Run', 'Sprint', 'Rush', 'Dash'];
+  if (words.length >= 2) {
+    return `${cap(words[0])} ${cap(words[1])} ${modeWordsList[Math.floor(Math.random() * modeWordsList.length)]}`;
   }
 
   const themeWords = {
