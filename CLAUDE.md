@@ -19,8 +19,12 @@ user prompt
         └─ compileFallbackUrls()    assetPipeline/pipeline.js — raw Pollinations URLs
               └─> config.dynamicAssetUrls   (also the "dynamic asset mode" flag — see below)
   └─> generateGameAssets()          src/game/assetPipeline/pipeline.js — ALL UI paths
-        ├─ designAssetPrompts()     promptDesigner.js — ONE gemini-flash-latest JSON call
-        │                           (style guide + subjects; local tables on any failure)
+        ├─ designAssetPrompts()     promptDesigner.js — ONE LLM JSON call for the style
+        │                           guide + subjects: gemini-flash-latest when configured,
+        │                           else Pollinations text 'openai-fast' attempt (currently
+        │                           402-paywalled — see proxy section); fallback is local
+        │                           and PROMPT-FIRST: prompt drives subjects, matched
+        │                           theme contributes only palette/mood
         ├─ per slot: Gemini image (gemini-2.5-flash-image, aspectRatio control, 2×retry)
         │            → Pollinations fallback (free/keyless, retries)
         ├─ postProcessAsset()       postprocess.js — resize → flood-key → edge chain
@@ -232,7 +236,19 @@ the hard way (all handled in `providers/pollinations.js`):
 - This token tier exposes exactly ONE image model (`sana` — `/models` returns
   `["sana"]`); `model=`/`transparent=`/`gptimage` params are ignored or unavailable, and
   the text tier has only `openai-fast` with NO vision — so free-path QA must be local
-  (geometry gates, residue checks), not model-based. Sana responds strongly to
+  (geometry gates, residue checks), not model-based. When Gemini is off,
+  `designAssetPrompts` first attempts the design step on the text tier via
+  `/api/pollinations-text` (`generateDesignJson` in providers/pollinations.js — NOT
+  routed through the image serial queue; different upstream, runs before images start;
+  `design.source: 'free-llm'`). **BUT as of 2026-07-31 text.pollinations.ai returns
+  402 for everything nontrivial** (anonymous AND token — "pollen" credit paywall;
+  `jsonMode`/POST/referrer all verified 402), so this attempt fails fast (<1s) and
+  exists as self-healing wiring. The fidelity guarantee is therefore LOCAL:
+  `generateAssetDirections` is prompt-first — a non-empty prompt always builds
+  subjects from the prompt text (matched theme contributes only palette + mood);
+  canned theme tables apply ONLY to promptless runs (presets/quick start). Do not
+  restore theme-table precedence: "on-theme but off-prompt" assets were a client
+  complaint (2026-07-31). Sana responds strongly to
   front-loaded pose language ("mid-run stride") and needs "no ground, no motion lines"
   to suppress baked-in floor streaks.
 

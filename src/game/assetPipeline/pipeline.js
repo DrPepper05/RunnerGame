@@ -482,6 +482,12 @@ export async function generateAssets({
   return { preloadedImages, meta };
 }
 
+const DESIGN_SOURCE_LABELS = {
+  gemini: 'Gemini art director',
+  'free-llm': 'free AI art director',
+  local: 'local templates'
+};
+
 /**
  * Full generation for a game config: design prompts (LLM or local), then generate
  * all baseline assets. The ONE call every UI path uses.
@@ -493,7 +499,7 @@ export async function generateGameAssets({ config, userPrompt = '', onProgress =
     themeKey: config.themeKey,
     assetDesignDirections: config.assetDesignDirections
   });
-  onProgress(`[DESIGN] Asset prompts composed via ${design.source === 'gemini' ? 'Gemini art director' : 'local templates'}...`, 73);
+  onProgress(`[DESIGN] Asset prompts composed via ${DESIGN_SOURCE_LABELS[design.source] || design.source}...`, 73);
 
   const finalPrompts = {};
   for (const slot of [...GENERATED_SLOTS, 'player_sheet', 'projectile']) {
@@ -545,7 +551,7 @@ export async function regenerateAssetSlots({ config, instruction = '', slots, on
     themeKey: parsedTheme || config.themeKey,
     assetDesignDirections: instruction.trim() ? null : config.assetDesignDirections
   });
-  onProgress(`[DESIGN] Asset prompts composed via ${design.source === 'gemini' ? 'Gemini art director' : 'local templates'}...`, 73);
+  onProgress(`[DESIGN] Asset prompts composed via ${DESIGN_SOURCE_LABELS[design.source] || design.source}...`, 73);
 
   const finalPrompts = {};
   for (const slot of slots) {

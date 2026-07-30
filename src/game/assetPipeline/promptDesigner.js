@@ -8,6 +8,7 @@
  */
 import { SLOT_SPECS, BASELINE_SLOTS } from './slotSpecs';
 import { isGeminiConfigured, generateJson } from './providers/geminiImage';
+import { generateDesignJson } from './providers/pollinations';
 
 /**
  * Theme subject tables — the local fallback recipe.
@@ -94,12 +95,18 @@ function extractCustomElements(promptText) {
 }
 
 /**
- * No predefined theme matched the prompt — build the directions from the prompt
- * text itself instead of silently defaulting to a canned theme. Free-path quality
- * varies with the prompt, but at least it depicts what the player asked for.
+ * Build asset directions from the prompt text itself. Free-path quality varies
+ * with the prompt, but at least it depicts what the player asked for.
  */
 function customDirectionsFromPrompt(promptText, gameType) {
-  const subject = promptText.trim().slice(0, 140);
+  // Strip instruction filler ("make me a ... game about") so the image model sees
+  // the world description, not the request phrasing.
+  const subject = promptText.trim()
+    .replace(/^(?:please\s+)?(?:make|create|generate|build|give)\s+(?:me\s+)?(?:a|an)?\s*/i, '')
+    .replace(/\b(?:video\s*)?game\s*(?:about|with|of|set in)?\s*/i, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+    .slice(0, 140) || promptText.trim().slice(0, 140);
   const player = gameType === 'platformer'
     ? `the armed hero character of "${subject}"`
     : `the athletic running hero of "${subject}"`;
@@ -124,8 +131,19 @@ function customDirectionsFromPrompt(promptText, gameType) {
  * prompt text instead of defaulting to a canned theme.
  */
 export function generateAssetDirections(theme, secondaryTheme, promptText, gameType) {
-  if (!THEMES[theme] && promptText?.trim()) {
-    return customDirectionsFromPrompt(promptText, gameType);
+  // A written prompt ALWAYS drives the subjects — a matched theme only contributes
+  // its curated palette and mood. The old precedence (theme match → canned tables,
+  // prompt discarded) is why free-path assets came out on-theme but off-prompt:
+  // "underground dungeon with skeleton enemies" must depict dungeons and skeletons,
+  // not whichever canned theme a keyword happened to match.
+  if (promptText?.trim()) {
+    const custom = customDirectionsFromPrompt(promptText, gameType);
+    const themeData = THEMES[theme];
+    if (themeData) {
+      custom.colorPalette = themeData.colorPalette;
+      custom.styleGuide = `retro game aesthetic, ${themeData.atmosphere} mood, clear pixel definition, vibrant colors`;
+    }
+    return custom;
   }
   const themeData = THEMES[theme] || THEMES.forest;
   const player = gameType === 'platformer' ? themeData.playerPlatformer : themeData.playerRunner;
@@ -254,41 +272,81 @@ export function localDesign({ gameType, themeKey, userPrompt = '', assetDesignDi
 }
 
 /**
+ * Extract and validate the per-slot subjects from a designer LLM response.
+ * Returns null when any required slot is missing — callers fall back locally.
+ */
+function subjectsFromDesignerResult(result) {
+  if (!result || typeof result !== 'object') return null;
+  const subjects = {};
+  for (const slot of [...BASELINE_SLOTS, 'projectile']) {
+    if (!result[slot] || typeof result[slot] !== 'string') return null;
+    subjects[slot] = result[slot];
+  }
+  for (const slot of ['background_mid', 'background_near']) {
+    if (typeof result[slot] === 'string' && result[slot].trim()) subjects[slot] = result[slot];
+  }
+  return subjects;
+}
+
+function styleGuideFromDesignerResult(result) {
+  return {
+    styleSummary: result.styleSummary || 'retro game aesthetic',
+    colorPalette: result.colorPalette || 'standard arcade colors',
+    accentPalette: result.accentPalette || DEFAULT_ACCENT
+  };
+}
+
+// openai-fast has no schema-constrained output like Gemini, so the free-path
+// designer prompt must spell the contract out explicitly.
+const FREE_DESIGNER_JSON_SUFFIX =
+  '\n\nRespond with ONLY a raw JSON object — no markdown fences, no commentary — ' +
+  'with exactly these string keys: styleSummary, colorPalette, accentPalette, ' +
+  'background_far, background_mid, background_near, floor, platform, player, ' +
+  'enemy, obstacle, projectile.';
+
+/**
  * Design the style guide + per-slot subjects for a generation run.
- * One Gemini text call when a key is available; local tables otherwise or on any failure.
+ * One Gemini text call when a key is available; otherwise one free Pollinations
+ * text call (openai-fast) so free-path assets still follow the user's prompt
+ * instead of canned theme tables; local tables on any failure or empty prompt.
  */
 export async function designAssetPrompts({ userPrompt, gameType, themeKey, assetDesignDirections, timeoutMs = 12000 }) {
   const fallback = () => localDesign({ gameType, themeKey, userPrompt, assetDesignDirections });
 
-  if (!isGeminiConfigured() || !userPrompt?.trim()) {
+  if (!userPrompt?.trim()) {
     return fallback();
   }
 
+  if (isGeminiConfigured()) {
+    try {
+      const result = await generateJson({
+        prompt: buildDesignerPrompt(userPrompt, gameType),
+        responseSchema: DESIGNER_RESPONSE_SCHEMA,
+        timeoutMs
+      });
+      const subjects = subjectsFromDesignerResult(result);
+      if (!subjects) return fallback();
+      return { source: 'gemini', styleGuide: styleGuideFromDesignerResult(result), subjects };
+    } catch (err) {
+      console.warn('[PromptDesigner] Gemini design failed, using local templates:', err.message);
+      return fallback();
+    }
+  }
+
+  // Free path: same art-director step on Pollinations' keyless text tier.
   try {
-    const result = await generateJson({
-      prompt: buildDesignerPrompt(userPrompt, gameType),
-      responseSchema: DESIGNER_RESPONSE_SCHEMA,
-      timeoutMs
+    const result = await generateDesignJson({
+      prompt: buildDesignerPrompt(userPrompt, gameType) + FREE_DESIGNER_JSON_SUFFIX,
+      timeoutMs: Math.max(timeoutMs, 20000)
     });
-    const subjects = {};
-    for (const slot of [...BASELINE_SLOTS, 'projectile']) {
-      if (!result[slot] || typeof result[slot] !== 'string') return fallback();
-      subjects[slot] = result[slot];
+    const subjects = subjectsFromDesignerResult(result);
+    if (!subjects) {
+      console.warn('[PromptDesigner] Free designer returned incomplete JSON, using local templates.');
+      return fallback();
     }
-    for (const slot of ['background_mid', 'background_near']) {
-      if (typeof result[slot] === 'string' && result[slot].trim()) subjects[slot] = result[slot];
-    }
-    return {
-      source: 'gemini',
-      styleGuide: {
-        styleSummary: result.styleSummary || 'retro game aesthetic',
-        colorPalette: result.colorPalette || 'standard arcade colors',
-        accentPalette: result.accentPalette || DEFAULT_ACCENT
-      },
-      subjects
-    };
+    return { source: 'free-llm', styleGuide: styleGuideFromDesignerResult(result), subjects };
   } catch (err) {
-    console.warn('[PromptDesigner] Gemini design failed, using local templates:', err.message);
+    console.warn('[PromptDesigner] Free designer failed, using local templates:', err.message);
     return fallback();
   }
 }

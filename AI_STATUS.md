@@ -72,6 +72,29 @@ behaviour was specific to the **deployed** build and had two causes, both fixed:
    to built-in theme art (no error dialog) if any are missing. Failure now always
    ends in a playable game.
 
+## Free-path prompt fidelity fix (2026-07-31)
+
+Pollinations-path assets previously ignored most of the user's prompt: the AI
+"art director" step (which turns the prompt into per-asset descriptions) only ran
+on Gemini, and on the free path a prompt that loosely matched one of the five
+built-in themes was silently replaced by that theme's fixed asset templates —
+producing on-theme but off-prompt assets. Two changes:
+
+1. **The user's prompt now always drives the asset subjects on the free path.**
+   A matched theme only contributes its color palette and mood; the background,
+   player, enemy, floor, platform and obstacle descriptions are all built from
+   the prompt text itself. "Underground dungeon with skeleton enemies" now asks
+   the image model for dungeons and skeletons, not a canned lookalike theme.
+2. **A free AI art-director step was added ahead of that fallback.** It calls
+   Pollinations' free text model (`openai-fast`) to design all asset descriptions
+   from the prompt, exactly like the Gemini art director. Caveat: as of
+   2026-07-31 Pollinations has put its text API behind a paid credit system
+   (HTTP 402 even for anonymous requests, verified directly), so this call
+   currently fails fast and the prompt-driven fallback in (1) takes over. The
+   code is self-healing — if Pollinations restores the free text tier, the
+   art director starts working with no code change (log line: "[DESIGN] Asset
+   prompts composed via free AI art director").
+
 ## Quick guide for testing
 
 ### How to test

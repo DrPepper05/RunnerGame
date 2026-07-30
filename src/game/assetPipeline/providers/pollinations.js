@@ -90,3 +90,56 @@ export function generateImage({ prompt, width, height, seed, timeoutMs = 45000 }
     }
   });
 }
+
+// Pollinations' free TEXT tier (text.pollinations.ai, model 'openai-fast') — used
+// for the prompt-design step when Gemini is off, so free-path assets are designed
+// from the user's actual prompt instead of canned theme tables. Same-origin base
+// for the same Turnstile/CORS reason as images (see vite.config.js / vercel.json).
+const POLLINATIONS_TEXT_BASE = import.meta.env.VITE_POLLINATIONS_TEXT_BASE || '/api/pollinations-text';
+
+/**
+ * One JSON-mode completion on the free text tier. Returns the parsed object.
+ * NOT routed through the image serial queue: it's a different upstream service,
+ * and the single design call always completes before image generation starts.
+ * Throws on HTTP errors, timeout, or unparseable output — callers fall back to
+ * local templates.
+ */
+export async function generateDesignJson({ prompt, timeoutMs = 20000 }) {
+  const key = getPollinationsKey();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${POLLINATIONS_TEXT_BASE}/${key ? `?token=${key}` : ''}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messages: [{ role: 'user', content: prompt }],
+        model: 'openai-fast',
+        jsonMode: true
+      }),
+      signal: controller.signal
+    });
+    if (!res.ok) {
+      const err = new Error(`Pollinations text responded with HTTP ${res.status}.`);
+      err.status = res.status;
+      throw err;
+    }
+    const raw = (await res.text()).trim()
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/```\s*$/, '');
+    let parsed = JSON.parse(raw);
+    // Some deployments answer in OpenAI chat-completion shape — unwrap it.
+    if (parsed && Array.isArray(parsed.choices)) {
+      const content = parsed.choices[0]?.message?.content;
+      if (typeof content !== 'string') throw new Error('Pollinations text returned an empty completion.');
+      parsed = JSON.parse(content.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, ''));
+    }
+    if (!parsed || typeof parsed !== 'object') throw new Error('Pollinations text returned non-object JSON.');
+    return parsed;
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error(`Pollinations text timed out after ${timeoutMs}ms.`);
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}

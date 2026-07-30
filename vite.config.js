@@ -10,6 +10,11 @@ export default defineConfig({
       // ("Missing Turnstile token"), so the client calls same-origin
       // /api/pollinations/* and the dev server forwards it. Production hosts
       // need an equivalent rewrite (see CLAUDE.md).
+      '/api/pollinations-text': {
+        target: 'https://text.pollinations.ai',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api\/pollinations-text/, '')
+      },
       '/api/pollinations': {
         target: 'https://image.pollinations.ai',
         changeOrigin: true,
@@ -19,6 +24,11 @@ export default defineConfig({
   },
   preview: {
     proxy: {
+      '/api/pollinations-text': {
+        target: 'https://text.pollinations.ai',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api\/pollinations-text/, '')
+      },
       '/api/pollinations': {
         target: 'https://image.pollinations.ai',
         changeOrigin: true,
