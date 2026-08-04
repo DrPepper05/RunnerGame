@@ -1,8 +1,9 @@
 # CLAUDE.md
 
 Context for AI assistants working in this repo. Everything here was verified against the
-code on 2026-07-20 (updated the same day after the asset-pipeline rebuild). If you change
-the pipeline, update this file in the same commit.
+code on 2026-07-20 (updated 2026-08-05 after the animation-quality overhaul: Gemini 3.x
+model tiers, chroma keying, repair/pro-rescue rungs, filmstrip QA, palette lock). If you
+change the pipeline, update this file in the same commit.
 
 ## What this is
 
@@ -25,28 +26,45 @@ user prompt
         │                           402-paywalled — see proxy section); fallback is local
         │                           and PROMPT-FIRST: prompt drives subjects, matched
         │                           theme contributes only palette/mood
-        ├─ per slot: Gemini image (gemini-2.5-flash-image, aspectRatio control, 2×retry)
+        ├─ per slot: Gemini image (TIERED models, spec.gen.model: 3.1-flash-lite for
+        │            scenery, 3.1-flash for player + sheet (sheet at imageSize '2K',
+        │            supersampled down); unavailable 3.x models auto-fall back to
+        │            2.5-flash-image via a cached ladder in providers/geminiImage.js;
+        │            aspectRatio control, 2×retry)
         │            → Pollinations fallback (free/keyless, retries)
-        ├─ postProcessAsset()       postprocess.js — resize → flood-key → edge chain
-        │                           (erode AA fringe → dark outline → alpha-bleed) →
-        │                           darken (mid/near depth grading) → trim/crop
-        ├─ keying self-check        deterministic, all providers: border-band near-white
-        │                           residue or ~zero keying → one looser re-key
+        ├─ postProcessAsset()       postprocess.js — resize (progressive halving for
+        │                           big downscales) → flood-key → edge chain
+        │                           (erode AA fringe → chroma despill → dark outline →
+        │                           alpha-bleed) → darken (mid/near) → trim/crop.
+        │                           Keyed sprite slots prompt for a CHROMA-KEY backdrop
+        │                           on the Gemini path (green, or magenta for greenish
+        │                           subjects — pickChromaColor in promptDesigner; free
+        │                           path stays white); the pipeline re-derives the
+        │                           color from the prompt text (chromaFromPrompt)
+        ├─ keying self-check        deterministic, all providers: border-band residue
+        │                           (near-white AND leftover chroma) or ~zero keying →
+        │                           one looser re-key
         ├─ vision QA (qa.js)        player/enemy: {facingRight, backgroundClean} →
-        │                           mirror client-side / re-key / one regen; never fatal
+        │                           mirror client-side / re-key / one regen; never fatal;
+        │                           reviewSprite itself gates on isGeminiConfigured()
         ├─ player_sheet: STATIC player generated FIRST (full slot pipeline), then
         │                           the sheet — on Gemini as an image-EDIT call with
         │                           the static sprite as inlineData reference
         │                           ("redraw THIS character in 9 poses"; free path
-        │                           asks for a 2×2 4-frame stride instead) → per-cell
+        │                           asks for a 2×2 4-frame stride instead) → content-
+        │                           aware grid cuts (detectGridCuts) → per-cell
         │                           key+re-key → per-frame scoring (geometry +
-        │                           color-histogram identity), ≤2 bad run frames
-        │                           CULLED to a 1×N strip → align (center-x, shared
-        │                           baseline, capped height norm) → union-crop →
-        │                           reassemble; Gemini rung escalates to per-frame
-        │                           generation (≤10 image-edits of the reference)
-        │                           when the grid sheet fails; any terminal failure
-        │                           keeps the static base (already registered)
+        │                           color-histogram identity + aligned-mask IoU
+        │                           continuity/duplicates), ≤2 bad run frames CULLED
+        │                           to a 1×N strip; 3-4 bad frames → REPAIR rung
+        │                           (single-frame reference edits, prev frame as 2nd
+        │                           ref) → numbered-filmstrip vision QA (kind 'strip':
+        │                           sameCharacter/legsAlternate/badFrames per-frame
+        │                           cull) → palette lock vs the static base → align
+        │                           (centroid-x, shared baseline, capped height norm)
+        │                           → union-crop → reassemble; failure ladder: retry →
+        │                           ONE gemini-3-pro-image rescue sheet → per-frame
+        │                           escalation (≤10 image-edits) → static base kept
         └─> preloadedImages: { slot: HTMLImageElement } + assetMeta
               └─> GameManagerScene.init() registers as dyn_* textures
                   (addSpriteSheet when assetMeta.slots.player.frames is present)
@@ -72,13 +90,23 @@ with `meta.dropped` on failure — never fatal; `createBackgroundLayers` filters
   platform, player, enemy, obstacle`): canvas sizes, aspect ratios, post-process flags,
   texture keys, and prompt scaffolds. Do not hardcode slot data elsewhere.
 - **Code owns invariants, the LLM owns flavor.** Scaffolds append the non-negotiable prompt
-  constraints (pure white background for keyed sprites, facing right, tileable floor,
-  framing). The prompt designer only returns subject descriptors + palette.
+  constraints (backdrop clause for keyed sprites, facing right, tileable floor,
+  framing). The prompt designer only returns subject descriptors + palette. Keyed
+  sprite slots (player/enemy/obstacle/projectile/platform + sheet) ask for a
+  **chroma-key backdrop** on the Gemini path (`BG_CLAUSE` in slotSpecs): green by
+  default, magenta when the subject/style text reads greenish (`pickChromaColor` —
+  a green goblin on a green screen keys into nothing), white when both collide and
+  ALWAYS white on the free path (sana's exact-hex compliance is unproven). The
+  pipeline re-derives the color from the final prompt (`chromaFromPrompt`, matches
+  the hex) — prompt text is the single source of truth, no side-channel plumbing.
 - **Post-processing is the dimension guarantee.** No provider honors exact pixels and none
   outputs alpha; `postprocess.js` produces the exact contract the game needs. Keying is
   **border-connected flood fill** seeded from the DOMINANT border color (`removeBorderBackground`)
-  — handles non-white backdrops and keeps white pixels inside sprites; the old global
-  white-threshold keyer survives only as its safety fallback. The dominant-color (not mean)
+  — handles non-white backdrops and keeps white pixels inside sprites. Its pathological-wipe
+  guard fires only on a NEAR-TOTAL wipe (>99.5% removed — a small sprite like the projectile
+  legitimately leaves >95% backdrop, and the old 0.95 threshold rejected perfectly good keys)
+  and falls back to a global key of the DETECTED backdrop color (`removeFlatColor`; the old
+  white-only fallback shipped solid green boxes on chroma screens). The dominant-color (not mean)
   detail matters: content flush against one edge (silhouette layers) would drag a mean to
   gray and key nothing. Gemini generates at 16:9/1:1 and gets cover-cropped (no 2:1 option).
 - **Vision QA is corrective, never fatal.** `qa.js` reviews the final keyed player/enemy
@@ -92,15 +120,24 @@ with `meta.dropped` on failure — never fatal; `createBackgroundLayers` filters
   (which misfires on unusual silhouettes) is overridden for verified sprites. QA is
   gated ONLY on `isGeminiConfigured()` — NOT on `runState.skipGemini`, which tracks the
   image model's quota; the vision model's quota is separate, and QA matters most exactly
-  when images fell back to the free provider.
+  when images fell back to the free provider. The gate lives INSIDE `reviewSprite`
+  (returns null unverified when the free path is forced) so no call site can leak a
+  Gemini call. Sheets get the **numbered-filmstrip review** (kind `'strip'`): surviving
+  frames composited side by side with painted numbers (`composeFilmstrip`), ONE vision
+  call returning `sameCharacter`/`legsAlternate` (whole-strip, fail the attempt) and
+  `badFrames` (per-frame, fed into one more cull via `cullFromKept` — which remaps a
+  run-frame `jumpFrameIndex` (free 2×2 dual-use) instead of appending it as a cell).
 - **Edge chain fixes what keying can't.** Two halo sources survive a perfect key: the
-  ring of anti-aliased pixels blended with the white backdrop ("not white enough" for
+  ring of anti-aliased pixels blended with the backdrop ("not backdrop enough" for
   the flood), and WebGL bilinear filtering sampling the RGB of adjacent TRANSPARENT
-  pixels (which keying leaves white) at render time. `cleanKeyedEdges` runs after every
-  keying pass: `erodeAlphaEdge` (spec `post.edgeErode`, sprites 1px / layers 2px) →
-  `addOutline` (spec `post.outline` — dark ring under player/enemy/obstacle/platform
-  and sheet cells; the pixel-art readability guarantee) → `bleedEdgeColors` (extends
-  sprite RGB into transparent neighbors so the filter has nothing white to sample).
+  pixels (which keying leaves backdrop-colored) at render time. `cleanKeyedEdges` runs
+  after every keying pass: `erodeAlphaEdge` (spec `post.edgeErode`, sprites 1px /
+  layers 2px) → `despillEdges` (chroma runs only: classic green/magenta spill
+  suppression, applied ONLY within 2px of transparency so legitimately green/magenta
+  sprite interiors survive) → `addOutline` (spec `post.outline` — dark ring under
+  player/enemy/obstacle/platform and sheet cells; the pixel-art readability
+  guarantee) → `bleedEdgeColors` (extends sprite RGB into transparent neighbors so
+  the filter has nothing backdrop-colored to sample).
   Do not "simplify" the bleed away — the mask can be perfect and the halo still renders.
 - **Readability is enforced per category, not per prompt.** `buildFinalPrompt` styles
   slots in buckets: gameplay (player/enemy/obstacle) get the designer's `accentPalette`
@@ -109,8 +146,10 @@ with `meta.dropped` on failure — never fatal; `createBackgroundLayers` filters
   silhouette language plus programmatic `post.darken` (0.85/0.72) for atmospheric
   depth. One shared style string was the root cause of everything converging on one hue.
 - **Deterministic keying self-check (`enforceKeyQuality`)** runs for every KEYED slot on
-  every provider, before vision QA and with no API. Cropped sprites: near-white border
-  residue (>6%) or near-zero keying (<5% transparent) → one LOOSER re-key; a >92%
+  every provider, before vision QA and with no API. Cropped sprites: border residue
+  (`borderResidueFraction` counts near-white AND — when the prompt asked for a chroma
+  screen — leftover green/magenta, covering both provider-compliance outcomes) >6%,
+  or near-zero keying (<5% transparent) → one LOOSER re-key; a >92%
   transparent cropped sprite (flood ate the interior) → one TIGHTER re-key
   ({seedTol:26, stepTol:10}). Non-cropped keyed slots are the parallax layers: their
   contract is an empty top band, so `topBandOpaqueFraction` (>10% of the top 45%) →
@@ -136,22 +175,33 @@ with `meta.dropped` on failure — never fatal; `createBackgroundLayers` filters
   banned-word filter is whole-word (`\b`) — the old substring check silently swapped
   innocent prompts ("brASS automaton") for a random ice game.
 - **Sprite-sheet frames are ALIGNED per frame, then union-cropped** (`alignFrames` in
-  postprocess.js): each frame's content bbox is centered horizontally and bottom-anchored
-  to a shared baseline, run-frame heights pulled toward the median (>5% deviation only,
-  clamped ±20%) — this removes the model's per-cell drift, which WAS the main
-  "animation not continuous" complaint; the union crop (alpha≥16, so one stray pixel
-  can't inflate the box) then keeps a common frame box. Never crop per-frame to
-  content — that reintroduces jitter. Sheets are mirrored per-frame (whole-sheet mirror
-  would swap cell order), transparency-gated ≥30%, and each cell gets its own
-  key-quality pass (`keyCellWithQuality`: one tighter/looser re-key on shredded/residue
-  cells — prevents per-frame background flicker). Gating is per-frame, not
-  all-or-nothing: `evaluateAndCullCells` scores every run frame (geometry: empty or
-  <30% cell height; identity: 4×4×4 color-histogram L1 >0.9 vs the run-median) and
-  CULLS up to 2 bad run frames into a 1×N strip (`framesMeta {cols:N, rows:1, ...}`,
-  jump dropped → `jumpFrameIndex` omitted, `playPlayerAnim` falls back to frame 1);
-  ≥3 bad or <4 survivors rejects. Survivors re-checked for staticness
-  (`framesLookStatic`) and height ratio ≤1.35. Sheets walk the normal provider ladder:
-  Gemini is reliable; Pollinations (sana) gets ONE gated attempt with no regeneration.
+  postprocess.js): each frame's content bbox is anchored on its alpha-weighted
+  CENTROID-x (clamped within ±12% of the bbox center — bbox centers wobble when an
+  arm extends; the centroid tracks the torso) and bottom-anchored to a shared
+  baseline, run-frame heights pulled toward the median (>5% deviation only, clamped
+  ±20%) — this removes the model's per-cell drift, which WAS the main "animation not
+  continuous" complaint; the union crop (alpha≥16, so one stray pixel can't inflate
+  the box) then keeps a common frame box. Never crop per-frame to content — that
+  reintroduces jitter. Sheets are mirrored per-frame (whole-sheet mirror would swap
+  cell order), transparency-gated ≥30%, and each cell gets its own key-quality pass
+  (`keyCellWithQuality`: one tighter/looser re-key on shredded/residue cells —
+  prevents per-frame background flicker). Gating is per-frame, not all-or-nothing:
+  `evaluateAndCullCells` scores every run frame (geometry: empty or <30% cell height;
+  identity: 4×4×4 color-histogram L1 >0.9 vs the run-median; continuity: aligned-mask
+  IoU — a frame whose healthy neighbors share <30% silhouette is a pose/identity
+  jump, an adjacent pair >96.5% is a duplicated cell, second one culled) and CULLS up
+  to 2 bad run frames into a 1×N strip (`framesMeta {cols:N, rows:1, ...}`, jump
+  dropped → `jumpFrameIndex` omitted, `playPlayerAnim` falls back to frame 1); ≥3 bad
+  or <4 survivors rejects — but rejection with 1-4 flagged frames first tries the
+  REPAIR rung (`tryRepairFrames`: each bad frame redrawn as its own reference edit,
+  previous healthy frame attached as a second reference composited on white; only on
+  the Gemini 3×3 whose cell indices map 1:1 onto `RUN_CYCLE_POSES`). Survivors
+  re-checked for staticness (`framesLookStatic`) and height ratio ≤1.35, then
+  palette-LOCKED to the static base (`lockPalette`: median-cut 48 colors + the
+  outline color, nearest-match per pixel, self-skipping when mean shift >30 — kills
+  per-frame hue flicker). Sheet ladder: 2 attempts on `GEMINI_SHEET_MODEL` → ONE
+  `gemini-3-pro-image` rescue attempt → per-frame escalation → static base.
+  Pollinations (sana) still gets ONE gated attempt with no regeneration/repair.
 - **`config.dynamicAssetUrls` truthiness** is still the switch that routes every Phaser
   consumer between AI (`dyn_*`) and static-theme textures. It also serves as last-ditch
   raw URLs for paths with no preloading (`#config=` share links, initial preset) — Phaser's
@@ -210,7 +260,7 @@ with `meta.dropped` on failure — never fatal; `createBackgroundLayers` filters
 | `src/game/assetPipeline/promptDesigner.js` | LLM prompt design + local theme tables (`generateAssetDirections`) |
 | `src/game/assetPipeline/postprocess.js` | Pure canvas: resize, flood-key, trim, crop, sheet slice/assemble |
 | `src/game/assetPipeline/qa.js` | Vision QA reviewer (facing/background/grid), never throws |
-| `src/game/assetPipeline/providers/geminiImage.js` | @google/genai image+JSON calls, ProviderError taxonomy |
+| `src/game/assetPipeline/providers/geminiImage.js` | @google/genai image+JSON calls, ProviderError taxonomy, model fallback ladder (unavailable 3.x → 2.5, cached per session), multi-reference image edits, imageSize |
 | `src/game/assetPipeline/providers/pollinations.js` | Free fallback: URL builder + fetch→dataURL |
 | `src/game/geminiService.js` | Local config gen (physics/layout/title) — misnamed, no API |
 | `src/game/gameEditor.js` | AI live editor for the Creator Panel prompt box: `interpretEditPrompt(config, instruction)` → tweak (clamped whitelist patch, no reboot) / restyle (`assetTargets` → `resolveAssetTargets` → partial pipeline + merge-and-remount) / regenerate (full pipeline); mode-switch refusal; local keyword fallback without a key |
@@ -272,7 +322,9 @@ the hard way (all handled in `providers/pollinations.js`):
 `.env` is gitignored and holds live keys — never commit it, never paste its values into
 output. `.env.example` is the tracked template.
 
-- `VITE_GEMINI_API_KEY` — recommended. Enables Gemini asset generation + prompt design.
+- `VITE_GEMINI_API_KEY` — recommended, must be a BILLED key: as of Dec 2025 the Gemini
+  API free tier serves 0 images/min on every image model, so a keyless-tier key can
+  only ride the Pollinations path. Enables Gemini asset generation + prompt design.
   Mirrored to localStorage on startup (`App.jsx`); also settable via the UI key buttons
   (ScreenZero, CreatorPanel). **Client-side by design** — accepted tradeoff for this app.
 - `VITE_POLLINATIONS_API_KEY` — optional auth suffix on Pollinations URLs.
@@ -329,25 +381,39 @@ output. `.env.example` is the tracked template.
   with IDENTITY ("copied nine/four times, only limb poses redrawn") — do NOT add
   "every cell must differ from every other cell" pressure: a run cycle legitimately
   repeats its passing poses (cells 2/6), and that pressure makes models redesign the
-  character per cell (regression observed 2026-07-30). **Gemini escalation rung**
-  (`generatePerFrameSheet`): when the grid sheet fails its gates and Gemini is alive,
+  character per cell (regression observed 2026-07-30). The sheet renders at
+  **imageSize '2K'** on `GEMINI_SHEET_MODEL` and is progressively downscaled to the
+  384px canvas (supersampling — the halving loop in `drawToCanvas`). **Repair rung**
+  (`tryRepairFrames`): 1-4 scorer-flagged frames get individually redrawn (reference
+  edit of the static base + the previous healthy frame composited on white as a
+  second reference) before any full regeneration. **Pro rescue**: after the 2 normal
+  attempts fail, ONE `gemini-3-pro-image` sheet attempt (spec override on the same
+  loop) — cheaper and usually better than escalating. **Gemini escalation rung**
+  (`generatePerFrameSheet`): when all sheet attempts fail and Gemini is alive,
   each pose is drawn as its OWN image-edit of the reference (worker pool 3, hard cap
-  10 calls, 1 shared retry; dead quota/auth aborts and sets `skipGemini`), keyed as
+  10 calls, 1 shared retry; dead quota/auth aborts and sets `skipGemini`) via the
+  shared `generateSingleFrame` helper (also the repair rung's engine), keyed as
   cells, scored/culled the same way (≥4 run frames must survive), assembled as a 1×N
-  strip, one vision call for facing only — `meta.player.perFrame: true`. Sheet
+  strip — `meta.player.perFrame: true`. Sheet
   failure keeps the already-registered static base; sheet success overwrites the
   player image+meta WITHOUT a second doneCount increment. Gates are per-frame
-  (`evaluateAndCullCells` — see the design-rules bullet). Vision guards (Gemini grid
-  sheets): `gridConsistent`, `legsAlternate`. Registered via `addSpriteSheet`,
-  animated as `dyn_player_run` (frameRate 12 @ ≥8 frames, 10 @ 6-7, 8 @ 4-5);
-  `playPlayerAnim`: run → cycle, idle → frame 0, jump → `jumpFrameIndex ?? 1`.
-  **Sheets are keyed PER CELL** (`processSheet`: slice with a 3px inset →
+  (`evaluateAndCullCells` — see the design-rules bullet). Vision guard for every
+  sheet path is the numbered-filmstrip `'strip'` review (`sameCharacter`,
+  `legsAlternate`, per-frame `badFrames`; escalation skips the legsAlternate
+  pressure — its frames are individually choreographed). Registered via
+  `addSpriteSheet`, animated as `dyn_player_run` (frameRate 12 @ ≥8 frames, 10 @
+  6-7, 8 @ 4-5); `playPlayerAnim`: run → cycle, idle → frame 0, jump →
+  `jumpFrameIndex ?? 1`.
+  **Sheets are keyed PER CELL** (`processSheet`: content-aware cuts via
+  `detectGridCuts` — models don't space grids perfectly uniformly, projection
+  profiling finds the true background gutters within ±6% of each uniform boundary,
+  cells re-centered unscaled onto uniform canvases — then a 3px inset →
   `keyCellWithQuality` each cell) — a whole-sheet flood can never reach an interior
   cell's backdrop (3×3 center), and the inset discards model-drawn grid lines. One
-  regeneration for any quality failure (then per-frame escalation on Gemini, then
-  static base) — except on the Pollinations rung, which never regenerates (one
-  serial-queue slot max; the free path always spends 2 serialized calls on the
-  player: static then sheet attempt).
+  regeneration for any quality failure (then pro rescue and per-frame escalation on
+  Gemini, then static base) — except on the Pollinations rung, which never
+  regenerates (one serial-queue slot max; the free path always spends 2 serialized
+  calls on the player: static then sheet attempt).
 - Static dynamic players (sheet gates rejected / free path) get a **procedural run bob**
   (`startPlayerBob`/`stopPlayerBob` in GameManagerScene: ±3° angle tween, 110ms yoyo) so
   the player never looks frozen; idle/jump reset the angle to 0.

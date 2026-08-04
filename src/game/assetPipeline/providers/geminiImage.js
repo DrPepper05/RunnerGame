@@ -6,7 +6,7 @@
  * retrying here and falling back to Pollinations.
  */
 import { GoogleGenAI } from '@google/genai';
-import { GEMINI_IMAGE_MODEL, GEMINI_TEXT_MODEL } from '../slotSpecs';
+import { GEMINI_IMAGE_FALLBACK_MODEL, GEMINI_TEXT_MODEL } from '../slotSpecs';
 
 export class ProviderError extends Error {
   /** @param {'no-key'|'auth'|'quota'|'safety'|'no-image'|'network'|'timeout'} kind */
@@ -71,45 +71,82 @@ function withTimeout(promise, timeoutMs, label) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
+// Models this key/region turned out not to serve (404 / not-supported on first use).
+// Cached per session so a missing 3.x model costs exactly one failed round-trip,
+// after which every request lands directly on the legacy fallback model.
+const unavailableImageModels = new Set();
+
+const isModelUnavailableError = (err) => {
+  const status = err?.status ?? err?.code;
+  const message = err?.message || '';
+  return status === 404 ||
+    /not\s+found|not\s+supported|does not exist|unknown (?:model|name)|is not available/i.test(message);
+};
+
 /**
- * Generate a single image. Returns { dataUrl, provider: 'gemini' }.
- * Pass `referenceImageDataUrl` for image-editing calls: the reference rides along as
- * an inlineData part so the model redraws THAT character instead of imagining a new
- * one (the identity anchor for sprite-sheet generation).
+ * Generate a single image. Returns { dataUrl, provider: 'gemini', model }.
+ * - `model`: which image model to use (spec-driven; defaults to the legacy fallback).
+ *   A model the key can't serve is remembered and transparently replaced by
+ *   GEMINI_IMAGE_FALLBACK_MODEL — new model IDs never hard-break a key without access.
+ * - `imageSize`: '1K'|'2K'|'4K' — forwarded only to 3.x models (2.5 rejects it).
+ * - `referenceImageDataUrls` (or legacy singular `referenceImageDataUrl`): image-editing
+ *   references that ride along as inlineData parts so the model redraws THAT character
+ *   instead of imagining a new one (the identity anchor for sprite-sheet generation).
  */
-export async function generateImage({ prompt, aspectRatio = '1:1', timeoutMs = 45000, referenceImageDataUrl = null }) {
+export async function generateImage({
+  prompt,
+  aspectRatio = '1:1',
+  timeoutMs = 45000,
+  referenceImageDataUrl = null,
+  referenceImageDataUrls = null,
+  model = null,
+  imageSize = null
+}) {
   const ai = getClient();
 
+  const refs = referenceImageDataUrls || (referenceImageDataUrl ? [referenceImageDataUrl] : []);
   let contents = prompt;
-  if (referenceImageDataUrl) {
-    const match = referenceImageDataUrl.match(/^data:([^;]+);base64,(.*)$/s);
-    if (match) {
-      contents = [{
-        parts: [
-          { text: prompt },
-          { inlineData: { mimeType: match[1], data: match[2] } }
-        ]
-      }];
-      timeoutMs = Math.max(timeoutMs, 60000);
-    }
+  const refParts = [];
+  for (const ref of refs) {
+    const match = ref?.match(/^data:([^;]+);base64,(.*)$/s);
+    if (match) refParts.push({ inlineData: { mimeType: match[1], data: match[2] } });
   }
+  if (refParts.length) {
+    contents = [{ parts: [{ text: prompt }, ...refParts] }];
+    timeoutMs = Math.max(timeoutMs, 60000);
+  }
+  // 2K/4K renders are slower end to end — don't let the default budget clip them.
+  if (imageSize && imageSize !== '1K') timeoutMs = Math.max(timeoutMs, 60000);
+
+  const requested = model || GEMINI_IMAGE_FALLBACK_MODEL;
+  let activeModel = unavailableImageModels.has(requested) ? GEMINI_IMAGE_FALLBACK_MODEL : requested;
 
   let response;
-  try {
-    response = await withTimeout(
-      ai.models.generateContent({
-        model: GEMINI_IMAGE_MODEL,
-        contents,
-        config: {
-          responseModalities: ['IMAGE'],
-          imageConfig: { aspectRatio }
-        }
-      }),
-      timeoutMs,
-      'Gemini image generation'
-    );
-  } catch (err) {
-    throw toProviderError(err);
+  for (;;) {
+    const sizeAllowed = imageSize && activeModel.startsWith('gemini-3');
+    try {
+      response = await withTimeout(
+        ai.models.generateContent({
+          model: activeModel,
+          contents,
+          config: {
+            responseModalities: ['IMAGE'],
+            imageConfig: { aspectRatio, ...(sizeAllowed ? { imageSize } : {}) }
+          }
+        }),
+        timeoutMs,
+        'Gemini image generation'
+      );
+      break;
+    } catch (err) {
+      if (activeModel !== GEMINI_IMAGE_FALLBACK_MODEL && isModelUnavailableError(err)) {
+        console.warn(`[GeminiImage] Model "${activeModel}" unavailable for this key — falling back to ${GEMINI_IMAGE_FALLBACK_MODEL}.`);
+        unavailableImageModels.add(activeModel);
+        activeModel = GEMINI_IMAGE_FALLBACK_MODEL;
+        continue;
+      }
+      throw toProviderError(err);
+    }
   }
 
   const candidate = response?.candidates?.[0];
@@ -121,7 +158,7 @@ export async function generateImage({ prompt, aspectRatio = '1:1', timeoutMs = 4
   }
 
   const mimeType = imagePart.inlineData.mimeType || 'image/png';
-  return { dataUrl: `data:${mimeType};base64,${imagePart.inlineData.data}`, provider: 'gemini' };
+  return { dataUrl: `data:${mimeType};base64,${imagePart.inlineData.data}`, provider: 'gemini', model: activeModel };
 }
 
 /**

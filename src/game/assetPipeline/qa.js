@@ -8,7 +8,7 @@
  * Contract: NEVER throws and never fails a slot — any error returns null and the
  * pipeline proceeds unverified (the in-game pixel heuristic keeps working as before).
  */
-import { generateJson } from './providers/geminiImage';
+import { generateJson, isGeminiConfigured } from './providers/geminiImage';
 
 const SPRITE_SCHEMA = {
   type: 'OBJECT',
@@ -32,6 +32,24 @@ const LAYER_SCHEMA = {
   required: ['backgroundClean', 'cutoutShapes']
 };
 
+// Numbered-filmstrip review: the frames are laid out side by side with painted frame
+// numbers, so the model can name WHICH frames break the animation instead of failing
+// the whole strip — per-frame verdicts feed the culling/repair loop.
+const STRIP_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    facingRight: { type: 'BOOLEAN', description: 'Does the character face the RIGHT side of the image in the frames?' },
+    sameCharacter: { type: 'BOOLEAN', description: 'Is every numbered frame clearly the SAME character (same design, colors, outfit)?' },
+    legsAlternate: { type: 'BOOLEAN', description: 'Across the run frames, do some frames show the LEFT leg leading and others the RIGHT leg leading?' },
+    badFrames: {
+      type: 'ARRAY',
+      items: { type: 'INTEGER' },
+      description: 'Frame numbers (1-based) that break the animation: a different-looking character, corrupted/incomplete drawing, wrong pose family, or leftover backdrop. Empty when all frames are fine.'
+    }
+  },
+  required: ['facingRight', 'sameCharacter', 'legsAlternate']
+};
+
 const SHEET_SCHEMA = {
   type: 'OBJECT',
   properties: {
@@ -44,6 +62,24 @@ const SHEET_SCHEMA = {
 };
 
 function buildPrompt(kind, grid) {
+  if (kind === 'strip') {
+    const count = grid?.frameCount || 0;
+    const runCount = grid?.runFrameCount || count;
+    const jumpNote = count > runCount
+      ? ` Frame ${count} is a separate JUMP pose (knees tucked) — different from the run frames by design, only flag it if it shows a different character or corrupted art.`
+      : '';
+    return (
+      `This image is a numbered filmstrip of ${count} animation frames (numbers painted under each ` +
+      `frame) of ONE game character's run cycle, frames 1 to ${runCount} in stride order.${jumpNote} ` +
+      'Answer strictly:\n' +
+      '- facingRight: does the character face the RIGHT side of the image?\n' +
+      '- sameCharacter: is every frame clearly the same character — same face, colors, outfit, held items?\n' +
+      '- legsAlternate: across the run frames, do some frames show the LEFT leg leading and others the RIGHT?\n' +
+      '- badFrames: list the frame NUMBERS that break the animation (different-looking character, ' +
+      'corrupted or incomplete drawing, leftover backdrop patch). Use an empty list when all frames are fine — ' +
+      'normal pose differences between stride phases are NOT bad frames.'
+    );
+  }
   if (kind === 'sheet') {
     const cols = grid?.cols || 2;
     const rows = grid?.rows || 2;
@@ -87,13 +123,23 @@ function buildPrompt(kind, grid) {
  * @returns {{facingRight: boolean, backgroundClean: boolean, gridConsistent?: boolean} | null}
  */
 export async function reviewSprite(dataUrl, { kind = 'sprite', grid = null } = {}) {
+  // Single provider gate: when the free path is forced, NO Gemini call may fire —
+  // a null review just means "proceed unverified", exactly like a failed call.
+  if (!isGeminiConfigured()) return null;
   try {
-    const schema = kind === 'sheet' ? SHEET_SCHEMA : kind === 'layer' ? LAYER_SCHEMA : SPRITE_SCHEMA;
+    const schema = kind === 'sheet' ? SHEET_SCHEMA
+      : kind === 'strip' ? STRIP_SCHEMA
+      : kind === 'layer' ? LAYER_SCHEMA
+      : SPRITE_SCHEMA;
     const result = await generateJson({
       prompt: buildPrompt(kind, grid),
       responseSchema: schema,
       imageDataUrl: dataUrl
     });
+    if (kind === 'strip') {
+      if (typeof result?.facingRight !== 'boolean' || typeof result?.sameCharacter !== 'boolean') return null;
+      return result;
+    }
     if (typeof result?.backgroundClean !== 'boolean') return null;
     if (kind !== 'layer' && typeof result?.facingRight !== 'boolean') return null;
     return result;

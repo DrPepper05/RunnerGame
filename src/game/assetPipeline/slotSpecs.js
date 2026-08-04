@@ -6,16 +6,45 @@
  * dimensions or texture keys anywhere else.
  */
 
-export const GEMINI_IMAGE_MODEL = 'gemini-2.5-flash-image';
+// Image model tiers (verified against the live docs 2026-08-04). The Gemini 3.x
+// image family has far stronger character consistency than legacy 2.5 — the sheet
+// path depends on it. providers/geminiImage.js transparently retries on the
+// fallback model when a key/region lacks 3.x access (404/not-supported), so these
+// IDs are safe to ship without per-key feature detection.
+export const GEMINI_SLOT_MODEL = 'gemini-3.1-flash-lite-image'; // static scenery/props — cheaper than legacy 2.5
+export const GEMINI_SHEET_MODEL = 'gemini-3.1-flash-image';     // player + sheet + per-frame: the consistency workhorse
+export const GEMINI_PRO_SHEET_MODEL = 'gemini-3-pro-image';     // ONE premium rescue attempt when the sheet fails gates
+export const GEMINI_IMAGE_FALLBACK_MODEL = 'gemini-2.5-flash-image';
 // Rolling alias on purpose: fixed text-model IDs get sunset for new projects
 // (gemini-2.5-flash 404s with "no longer available to new users")
 export const GEMINI_TEXT_MODEL = 'gemini-flash-latest';
+
+// Chroma-key backgrounds for keyed sprite slots (Gemini path only — the free path
+// stays on white, sana's compliance with exact-hex asks is unproven). Green/magenta
+// never collide with a sprite palette the way white does (white teeth, eyes,
+// highlights sit inside every sprite), and the ALL-CAPS exact-hex phrasing is the
+// field-tested way to get a flat keyable field out of image models. promptDesigner
+// picks the color per slot so a green subject gets a magenta screen and vice versa.
+export const CHROMA_KEYS = {
+  green: { label: 'chroma key green', hex: '#00FF00', ban: 'green' },
+  magenta: { label: 'chroma key magenta', hex: '#FF00FF', ban: 'magenta or pink' }
+};
+export const BG_CLAUSE = (chroma) => {
+  const c = CHROMA_KEYS[chroma];
+  if (!c) return 'isolated on a plain pure white background';
+  return `isolated on a solid flat ${c.label} background, EXACT hex ${c.hex}, the entire ` +
+    `background one uniform flat color with NO gradients, NO noise, NO texture, NO shadows, ` +
+    `and absolutely no ${c.ban} anywhere on the subject itself`;
+};
 
 /**
  * Slot spec shape:
  *  - textureKey        Phaser texture key GameManagerScene registers the image under
  *  - canvas            final post-processed pixel size handed to the game
  *  - gen.aspectRatio   Gemini imageConfig aspect ratio (no 2:1 available; post 'cover' fixes it)
+ *  - gen.model         Gemini image model for this slot (falls back per geminiImage.js ladder)
+ *  - gen.imageSize     optional Gemini imageConfig size ('1K'|'2K'|'4K', 3.x models only) —
+ *                      the sheet renders at 2K and is downscaled (supersampled clean edges)
  *  - gen.pollinations  width/height query params for the Pollinations fallback URL
  *  - post.fit          'cover' (center-crop to fill) | 'stretch' (fill exactly)
  *  - post.keying       'flood' (border-connected flood fill — handles any backdrop color,
@@ -56,17 +85,17 @@ const SHEET_IDENTITY_CLAUSE = (count) =>
 const SHEET_HELD_ITEM_CLAUSE =
   `Any weapon or held item stays gripped in the same hand in every cell and tilts ` +
   `with that arm as it swings.`;
-const SHEET_FRAMING_CLAUSE =
+const SHEET_FRAMING_CLAUSE = (chroma) =>
   `Character faces right in side profile in every cell, same character size and same ` +
-  `ground line in every cell, each character centered in its own grid cell, isolated ` +
-  `on a plain pure white background in every cell, no scenery, no floor, no shadows, ` +
+  `ground line in every cell, each character centered in its own grid cell, ` +
+  `${BG_CLAUSE(chroma)} in every cell, no scenery, no floor, no shadows, ` +
   `no motion lines, no grid lines, no cell borders, no text`;
 
 export const SLOT_SPECS = {
   background_far: {
     textureKey: 'dyn_bg_far',
     canvas: { width: 1024, height: 512 },
-    gen: { aspectRatio: '16:9', pollinations: { width: 1024, height: 576 } },
+    gen: { aspectRatio: '16:9', model: GEMINI_SLOT_MODEL, pollinations: { width: 1024, height: 576 } },
     post: { fit: 'cover', keying: null, trimBorder: false, crop: false },
     scaffold: (subject, style) =>
       `wide side-scrolling video game background, ${subject}, distant landscape scenery, ` +
@@ -76,7 +105,7 @@ export const SLOT_SPECS = {
   background_mid: {
     textureKey: 'dyn_bg_mid',
     canvas: { width: 1024, height: 512 },
-    gen: { aspectRatio: '16:9', pollinations: { width: 1024, height: 576 } },
+    gen: { aspectRatio: '16:9', model: GEMINI_SLOT_MODEL, pollinations: { width: 1024, height: 576 } },
     post: { fit: 'cover', keying: 'flood+white', trimBorder: false, crop: false, minAlphaFraction: 0.15, edgeErode: 2, darken: 0.85 },
     qa: { clean: true },
     optional: true,
@@ -94,7 +123,7 @@ export const SLOT_SPECS = {
   background_near: {
     textureKey: 'dyn_bg_near',
     canvas: { width: 1024, height: 512 },
-    gen: { aspectRatio: '16:9', pollinations: { width: 1024, height: 576 } },
+    gen: { aspectRatio: '16:9', model: GEMINI_SLOT_MODEL, pollinations: { width: 1024, height: 576 } },
     // edgeErode 1 (not 2): near props are detailed decor, 2px erosion shreds thin
     // details; bleedEdgeColors still covers the halo
     post: { fit: 'cover', keying: 'flood+white', trimBorder: false, crop: false, minAlphaFraction: 0.15, edgeErode: 1, darken: 0.72 },
@@ -114,7 +143,7 @@ export const SLOT_SPECS = {
   floor: {
     textureKey: 'dyn_floor',
     canvas: { width: 128, height: 128 },
-    gen: { aspectRatio: '1:1', pollinations: { width: 128, height: 128 } },
+    gen: { aspectRatio: '1:1', model: GEMINI_SLOT_MODEL, pollinations: { width: 128, height: 128 } },
     post: { fit: 'stretch', keying: null, trimBorder: true, crop: false },
     scaffold: (subject, style) =>
       `seamless horizontally tileable ground texture, ${subject}, side view game terrain block, ` +
@@ -125,7 +154,7 @@ export const SLOT_SPECS = {
   platform: {
     textureKey: 'dyn_platform',
     canvas: { width: 128, height: 64 },
-    gen: { aspectRatio: '1:1', pollinations: { width: 128, height: 64 } },
+    gen: { aspectRatio: '1:1', model: GEMINI_SLOT_MODEL, pollinations: { width: 128, height: 64 } },
     // fillAfterCrop: the game tiles this texture into a fixed 64×32 physics box —
     // cropped-to-content textures of arbitrary size leave the visible art misaligned
     // with the hitbox. Crop to content, then stretch back to exactly fill the canvas,
@@ -133,10 +162,10 @@ export const SLOT_SPECS = {
     // solidify: stretch each column's art to the full frame height so the texture edge
     // IS the collision edge (rounded pill shapes read as floating off their hitbox)
     post: { fit: 'stretch', keying: 'flood', trimBorder: false, crop: true, fillAfterCrop: true, solidify: true, outline: true },
-    scaffold: (subject, style) =>
+    scaffold: (subject, style, { chroma } = {}) =>
       `a single wide flat rectangular floating platform, ${subject}, side view, the ` +
       `platform spans the full width of the frame from the left edge to the right edge, ` +
-      `flat level top surface, isolated on a plain pure white background, no shadow, ` +
+      `flat level top surface, ${BG_CLAUSE(chroma)}, no shadow, ` +
       `no reflection, ${style}`,
     fallbackSubject: (d) => d?.platforms
   },
@@ -145,41 +174,43 @@ export const SLOT_SPECS = {
   projectile: {
     textureKey: 'dyn_projectile',
     canvas: { width: 128, height: 64 },
-    gen: { aspectRatio: '1:1', pollinations: { width: 128, height: 64 } },
+    gen: { aspectRatio: '1:1', model: GEMINI_SLOT_MODEL, pollinations: { width: 128, height: 64 } },
     post: { fit: 'stretch', keying: 'flood', trimBorder: false, crop: true, outline: true },
     optional: true,
-    scaffold: (subject, style) =>
+    scaffold: (subject, style, { chroma } = {}) =>
       `a single small 2d video game projectile sprite, ${subject}, flying to the right, ` +
-      `elongated horizontal shape, side view, centered, isolated on a plain pure white ` +
-      `background, no shadow, no motion trail, no text, ${style}`,
+      `elongated horizontal shape, side view, centered, ${BG_CLAUSE(chroma)}, ` +
+      `no shadow, no motion trail, no text, ${style}`,
     fallbackSubject: (d) => d?.projectile
   },
   player: {
     textureKey: 'dyn_player',
     canvas: { width: 128, height: 128 },
-    gen: { aspectRatio: '1:1', pollinations: { width: 128, height: 128 } },
+    // Sheet-tier model: this sprite is the identity reference every sheet/per-frame
+    // call anchors to — its quality compounds into all nine frames.
+    gen: { aspectRatio: '1:1', model: GEMINI_SHEET_MODEL, pollinations: { width: 128, height: 128 } },
     post: { fit: 'stretch', keying: 'flood', trimBorder: false, crop: true, outline: true },
     qa: { facing: true },
     // Pose language matters most on the free model (sana): without "mid-run stride"
     // it produces stiff standing poses; "no ground, no motion lines" suppresses the
     // baked-in floor streaks it loves to add under runners.
-    scaffold: (subject, style) =>
+    scaffold: (subject, style, { chroma } = {}) =>
       `2d video game character sprite, ${subject}, running to the right in a dynamic ` +
       `mid-run stride, full body in side profile facing right, single character ` +
-      `filling most of the frame, isolated on a plain pure white background, sharp ` +
+      `filling most of the frame, ${BG_CLAUSE(chroma)}, sharp ` +
       `clean outline, no shadow, no ground, no motion lines, no text, ${style}`,
     fallbackSubject: (d) => d?.player
   },
   enemy: {
     textureKey: 'dyn_enemy',
     canvas: { width: 128, height: 128 },
-    gen: { aspectRatio: '1:1', pollinations: { width: 128, height: 128 } },
+    gen: { aspectRatio: '1:1', model: GEMINI_SLOT_MODEL, pollinations: { width: 128, height: 128 } },
     post: { fit: 'stretch', keying: 'flood', trimBorder: false, crop: true, outline: true },
     qa: { facing: true },
-    scaffold: (subject, style) =>
+    scaffold: (subject, style, { chroma } = {}) =>
       `2d video game enemy sprite, ${subject}, prowling to the right, full body in ` +
-      `side profile facing right, single creature filling most of the frame, isolated ` +
-      `on a plain pure white background, sharp clean outline, no shadow, no ground, ` +
+      `side profile facing right, single creature filling most of the frame, ` +
+      `${BG_CLAUSE(chroma)}, sharp clean outline, no shadow, no ground, ` +
       `no motion lines, no text, ${style}`,
     fallbackSubject: (d) => d?.enemy
   },
@@ -193,7 +224,9 @@ export const SLOT_SPECS = {
     textureKey: 'dyn_player',
     outputKey: 'player',
     canvas: { width: 384, height: 384 },
-    gen: { aspectRatio: '1:1', pollinations: { width: 384, height: 384 } },
+    // 2K request downscaled to the 384px working canvas = ~5× supersampling, which
+    // survives keying/erosion with much cleaner edges than a native 1K render.
+    gen: { aspectRatio: '1:1', model: GEMINI_SHEET_MODEL, imageSize: '2K', pollinations: { width: 384, height: 384 } },
     post: { fit: 'stretch', keying: 'flood', trimBorder: false, crop: false, minAlphaFraction: 0.3, outline: true },
     // Cells 0-7 (row-major) = full run cycle with alternating legs; cell 8 = jump pose
     frames: { cols: 3, rows: 3, runFrameCount: 8, jumpFrameIndex: 8 },
@@ -214,7 +247,7 @@ export const SLOT_SPECS = {
     // lead). Do NOT demand every cell differ from every OTHER cell: a run cycle
     // legitimately repeats its passing poses (cells 2/6), and "dramatically
     // different" pressure makes models redesign the character per cell.
-    scaffold: (subject, style) =>
+    scaffold: (subject, style, { chroma } = {}) =>
       `sprite sheet, a 3x3 grid of nine animation frames of the EXACT SAME video game ` +
       `character: ${subject}. ${SHEET_IDENTITY_CLAUSE('nine')} ` +
       `Reading left to right, top to bottom, cells 1 to 8 are the eight phases of one ` +
@@ -222,7 +255,7 @@ export const SLOT_SPECS = {
       RUN_CYCLE_POSES.map((pose, i) => `cell ${i + 1}: ${pose}; `).join('') +
       `cell 9 (bottom-right): ${JUMP_POSE}. ` +
       `${SHEET_HELD_ITEM_CLAUSE} ` +
-      `${SHEET_FRAMING_CLAUSE}, ${style}`,
+      `${SHEET_FRAMING_CLAUSE(chroma)}, ${style}`,
     // Free-path (sana) variant: a 2×2 four-frame stride. Nine small cells are beyond
     // sana — four larger cells pass the gates often enough to actually animate.
     // Poses: contact-R / pass / contact-L / pass = a complete straight loop.
@@ -244,18 +277,18 @@ export const SLOT_SPECS = {
         `cell 3: ${RUN_CYCLE_POSES[4]}; ` +
         `cell 4: ${RUN_CYCLE_POSES[5]}. ` +
         `${SHEET_HELD_ITEM_CLAUSE} ` +
-        `${SHEET_FRAMING_CLAUSE}, ${style}`
+        `${SHEET_FRAMING_CLAUSE(null)}, ${style}` // free path stays on white — see CHROMA_KEYS note
     },
     fallbackSubject: (d) => d?.player
   },
   obstacle: {
     textureKey: 'dyn_obstacle',
     canvas: { width: 128, height: 128 },
-    gen: { aspectRatio: '1:1', pollinations: { width: 128, height: 128 } },
+    gen: { aspectRatio: '1:1', model: GEMINI_SLOT_MODEL, pollinations: { width: 128, height: 128 } },
     post: { fit: 'stretch', keying: 'flood', trimBorder: false, crop: true, outline: true },
-    scaffold: (subject, style) =>
+    scaffold: (subject, style, { chroma } = {}) =>
       `a single hazard object, ${subject}, roughly square proportions, side view, centered, ` +
-      `isolated on a plain pure white background, no shadow, no text, ${style}`,
+      `${BG_CLAUSE(chroma)}, no shadow, no text, ${style}`,
     fallbackSubject: (d) => d?.hazards
   }
 };

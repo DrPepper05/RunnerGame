@@ -21,6 +21,29 @@ export function loadImage(src, { crossOrigin = 'anonymous' } = {}) {
 }
 
 /**
+ * Progressive pre-shrink for large downscales. A single drawImage from e.g. a 2K
+ * render down to a 128px cell resamples through at most a 2×2 tap and aliases badly;
+ * halving repeatedly until within ~1.5× of the target keeps every step inside the
+ * filter kernel — the standard canvas supersampling recipe.
+ */
+function preshrink(src, targetW, targetH) {
+  let w = src.width, h = src.height;
+  while (w / 2 >= targetW * 1.5 && h / 2 >= targetH * 1.5) {
+    const half = document.createElement('canvas');
+    half.width = Math.max(1, Math.round(w / 2));
+    half.height = Math.max(1, Math.round(h / 2));
+    const hctx = half.getContext('2d');
+    hctx.imageSmoothingEnabled = true;
+    hctx.imageSmoothingQuality = 'high';
+    hctx.drawImage(src, 0, 0, half.width, half.height);
+    src = half;
+    w = half.width;
+    h = half.height;
+  }
+  return src;
+}
+
+/**
  * Draw an image onto a fresh canvas at the target size.
  * 'cover' scales to fill and center-crops (used to force ~2:1 backgrounds from 16:9 sources);
  * 'stretch' fills the canvas exactly.
@@ -34,13 +57,14 @@ export function drawToCanvas(img, { width, height, fit = 'stretch' }) {
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
 
+  const src = preshrink(img, width, height);
   if (fit === 'cover') {
-    const scale = Math.max(width / img.width, height / img.height);
-    const drawW = img.width * scale;
-    const drawH = img.height * scale;
-    ctx.drawImage(img, (width - drawW) / 2, (height - drawH) / 2, drawW, drawH);
+    const scale = Math.max(width / src.width, height / src.height);
+    const drawW = src.width * scale;
+    const drawH = src.height * scale;
+    ctx.drawImage(src, (width - drawW) / 2, (height - drawH) / 2, drawW, drawH);
   } else {
-    ctx.drawImage(img, 0, 0, width, height);
+    ctx.drawImage(src, 0, 0, width, height);
   }
   return canvas;
 }
@@ -81,16 +105,25 @@ export function contentBoundsOf(canvas, { alphaMin = 1 } = {}) {
 }
 
 /**
- * Fraction of the canvas's outer band occupied by OPAQUE near-white pixels.
- * A keyed + content-cropped sprite hugs its bounding box, so near-white pixels
- * sitting along the frame edge are leftover backdrop the flood fill failed to
- * reach — a deterministic "keying failed" signal that needs no vision model.
+ * Fraction of the canvas's outer band occupied by OPAQUE backdrop-colored pixels.
+ * A keyed + content-cropped sprite hugs its bounding box, so backdrop-colored pixels
+ * sitting along the frame edge are leftovers the flood fill failed to reach — a
+ * deterministic "keying failed" signal that needs no vision model. Near-white is
+ * ALWAYS checked (the legacy backdrop and the free path); pass `chroma` to also
+ * count leftover green/magenta screen — providers don't always honor the chroma
+ * ask, so the check covers both compliance outcomes.
  */
-export function borderResidueFraction(canvas, { band = 0.12, threshold = 228 } = {}) {
+export function borderResidueFraction(canvas, { band = 0.12, threshold = 228, chroma = null } = {}) {
   const w = canvas.width, h = canvas.height;
   const data = canvas.getContext('2d').getImageData(0, 0, w, h).data;
   const bx = Math.max(1, Math.round(w * band));
   const by = Math.max(1, Math.round(h * band));
+  const isResidue = (r, g, b) => {
+    if (r >= threshold && g >= threshold && b >= threshold) return true;
+    if (chroma === 'green') return g >= 140 && g >= r + 50 && g >= b + 50;
+    if (chroma === 'magenta') return r >= 140 && b >= 140 && r >= g + 50 && b >= g + 50;
+    return false;
+  };
   let ring = 0;
   let residue = 0;
   for (let y = 0; y < h; y++) {
@@ -98,9 +131,7 @@ export function borderResidueFraction(canvas, { band = 0.12, threshold = 228 } =
       if (x >= bx && x < w - bx && y >= by && y < h - by) continue;
       ring++;
       const i = (y * w + x) * 4;
-      if (data[i + 3] > 0 && data[i] >= threshold && data[i + 1] >= threshold && data[i + 2] >= threshold) {
-        residue++;
-      }
+      if (data[i + 3] > 0 && isResidue(data[i], data[i + 1], data[i + 2])) residue++;
     }
   }
   return ring === 0 ? 0 : residue / ring;
@@ -188,7 +219,10 @@ export function removeBorderBackground(canvas, {
   seedTol = 40,
   stepTol = 14,
   globalCap = 120,
-  maxRemovedFraction = 0.95
+  // Near-total wipes only: a SMALL sprite (projectile) legitimately leaves >95%
+  // backdrop, so the old 0.95 guard fired on perfectly good keys. Only a flood that
+  // ate essentially everything (sprite same color as backdrop) is pathological.
+  maxRemovedFraction = 0.995
 } = {}) {
   const ctx = canvas.getContext('2d');
   const w = canvas.width;
@@ -260,9 +294,13 @@ export function removeBorderBackground(canvas, {
   let removedCount = 0;
   for (let i = 0; i < n; i++) if (removed[i]) removedCount++;
   if (removedCount / n > maxRemovedFraction) {
-    // Something pathological (e.g. sprite same color as backdrop) — fall back to the
-    // conservative white keyer rather than erasing the whole image
-    return removeWhiteBackground(canvas);
+    // Something pathological (e.g. sprite same color as backdrop) — fall back to a
+    // conservative global key of the DETECTED backdrop color rather than erasing the
+    // whole image. The fallback MUST match the actual backdrop: the old white-only
+    // fallback shipped solid green boxes for chroma-keyed sprites (it removed nothing).
+    return (br >= 200 && bg >= 200 && bb >= 200)
+      ? removeWhiteBackground(canvas)
+      : removeFlatColor(canvas, { r: br, g: bg, b: bb });
   }
 
   for (let i = 0; i < n; i++) if (removed[i]) data[i * 4 + 3] = 0;
@@ -336,6 +374,31 @@ export function trimUniformBorder(canvas, { tolerance = 12 } = {}) {
   out.height = ch;
   out.getContext('2d').putImageData(ctx.getImageData(left, top, cw, ch), 0, 0);
   return out;
+}
+
+/**
+ * Global distance-threshold key against an arbitrary flat backdrop color — the
+ * chroma-capable counterpart of removeWhiteBackground, used as the flood keyer's
+ * safety fallback when the backdrop isn't near-white (green/magenta screens).
+ * Pixels within `tol` of the color go transparent, with a soft alpha ramp over the
+ * next `soft` units to avoid a hard fringe.
+ */
+export function removeFlatColor(canvas, { r, g, b }, { tol = 48, soft = 40 } = {}) {
+  const ctx = canvas.getContext('2d');
+  const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const data = imgData.data;
+  for (let i = 0; i < data.length; i += 4) {
+    const dr = data[i] - r, dg = data[i + 1] - g, db = data[i + 2] - b;
+    const d = Math.sqrt(dr * dr + dg * dg + db * db);
+    if (d <= tol) {
+      data[i + 3] = 0;
+    } else if (d <= tol + soft) {
+      const alpha = Math.round(255 * ((d - tol) / soft));
+      data[i + 3] = Math.min(data[i + 3], alpha);
+    }
+  }
+  ctx.putImageData(imgData, 0, 0);
+  return canvas;
 }
 
 /**
@@ -483,6 +546,28 @@ export function alignFrames(frames, { runFrameCount = frames.length, alphaMin = 
   const boxes = frames.map((frame) =>
     contentBoundsOf(frame, { alphaMin }) || contentBoundsOf(frame));
 
+  // Alpha-weighted centroid-x per frame: the bbox center jumps when a single arm
+  // extends forward, but the mass centroid tracks the torso — anchoring on it
+  // (clamped near the bbox center) removes most residual horizontal wobble.
+  const centroids = frames.map((frame, i) => {
+    const box = boxes[i];
+    if (!box) return null;
+    const w = frame.width;
+    const data = frame.getContext('2d').getImageData(0, 0, w, frame.height).data;
+    let sum = 0, weight = 0;
+    for (let y = box.minY; y <= box.maxY; y++) {
+      for (let x = box.minX; x <= box.maxX; x++) {
+        const a = data[(y * w + x) * 4 + 3];
+        if (a >= alphaMin) { sum += x * a; weight += a; }
+      }
+    }
+    if (!weight) return null;
+    const cx = sum / weight;
+    const boxCenter = (box.minX + box.maxX) / 2;
+    const slack = Math.max(4, (box.maxX - box.minX + 1) * 0.12);
+    return Math.max(boxCenter - slack, Math.min(boxCenter + slack, cx));
+  });
+
   const runHeights = boxes
     .slice(0, runFrameCount)
     .filter(Boolean)
@@ -513,7 +598,9 @@ export function alignFrames(frames, { runFrameCount = frames.length, alphaMin = 
     const drawW = boxW * scale;
     const drawH = boxH * scale;
     const baseline = cellH - 2;
-    let dx = Math.round(cellW / 2 - drawW / 2);
+    // Place so the (clamped) centroid lands at the cell's horizontal center.
+    const anchorOffset = centroids[i] != null ? (centroids[i] - box.minX) * scale : drawW / 2;
+    let dx = Math.round(cellW / 2 - anchorOffset);
     let dy = Math.round(baseline - drawH);
     dx = Math.max(0, Math.min(dx, Math.floor(cellW - drawW)));
     dy = Math.max(0, Math.min(dy, Math.floor(cellH - drawH)));
@@ -524,6 +611,129 @@ export function alignFrames(frames, { runFrameCount = frames.length, alphaMin = 
     out.getContext('2d').drawImage(frame, box.minX, box.minY, boxW, boxH, dx, dy, drawW, drawH);
     return out;
   });
+}
+
+/**
+ * Intersection-over-union of two frames' alpha masks (same-size, ALIGNED frames).
+ * The deterministic continuity signal: consecutive run frames of one character in
+ * one stride overlap heavily but never perfectly — near-zero IoU means an identity
+ * or pose jump, near-1.0 means a duplicated frame. Both read as broken animation.
+ */
+export function maskIoU(a, b, { alphaMin = 16 } = {}) {
+  const w = Math.min(a.width, b.width), h = Math.min(a.height, b.height);
+  const da = a.getContext('2d').getImageData(0, 0, w, h).data;
+  const db = b.getContext('2d').getImageData(0, 0, w, h).data;
+  let inter = 0, union = 0;
+  for (let i = 3; i < da.length; i += 4) {
+    const ia = da[i] >= alphaMin, ib = db[i] >= alphaMin;
+    if (ia && ib) inter++;
+    if (ia || ib) union++;
+  }
+  return union === 0 ? 0 : inter / union;
+}
+
+/**
+ * Compose keyed cells into a single numbered filmstrip on white, for vision QA.
+ * Numbering the frames is what lets the reviewer return per-frame verdicts
+ * ("frame 4 is a different character") instead of a whole-sheet yes/no.
+ */
+export function composeFilmstrip(cells) {
+  const cellW = Math.max(...cells.map(c => c.width));
+  const cellH = Math.max(...cells.map(c => c.height));
+  const pad = 4;
+  const labelBand = 20;
+  const canvas = document.createElement('canvas');
+  canvas.width = cells.length * (cellW + pad) + pad;
+  canvas.height = cellH + labelBand + pad * 2;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#000000';
+  ctx.font = 'bold 14px monospace';
+  ctx.textAlign = 'center';
+  cells.forEach((cell, i) => {
+    const x = pad + i * (cellW + pad);
+    ctx.drawImage(cell, x + Math.floor((cellW - cell.width) / 2), pad);
+    ctx.fillText(String(i + 1), x + cellW / 2, pad + cellH + 15);
+    ctx.strokeStyle = '#888888';
+    ctx.strokeRect(x - 0.5, pad - 0.5, cellW + 1, cellH + 1);
+  });
+  return canvas;
+}
+
+/**
+ * Quantize every frame's opaque pixels to a shared palette sampled from the static
+ * reference sprite (median-cut). Kills the subtle per-frame hue/shading drift that
+ * plays back as color flicker. Guarded: when the frames' colors genuinely diverge
+ * from the reference (mean per-pixel shift above `maxMeanShift`), the lock would
+ * deface the art — return the originals untouched instead.
+ */
+export function lockPalette(frames, refCanvas, { maxColors = 48, maxMeanShift = 30 } = {}) {
+  const refData = refCanvas.getContext('2d').getImageData(0, 0, refCanvas.width, refCanvas.height).data;
+  const samples = [];
+  for (let i = 0; i < refData.length; i += 8) { // every 2nd pixel
+    if (refData[i + 3] > 64) samples.push([refData[i], refData[i + 1], refData[i + 2]]);
+  }
+  if (samples.length < 32) return frames;
+
+  // Median-cut: split the widest-channel box at its median until maxColors boxes.
+  let boxes = [samples];
+  while (boxes.length < maxColors) {
+    let widest = -1, widestIdx = -1, widestCh = 0;
+    boxes.forEach((box, bi) => {
+      if (box.length < 2) return;
+      for (let ch = 0; ch < 3; ch++) {
+        let min = 255, max = 0;
+        for (const p of box) { if (p[ch] < min) min = p[ch]; if (p[ch] > max) max = p[ch]; }
+        if (max - min > widest) { widest = max - min; widestIdx = bi; widestCh = ch; }
+      }
+    });
+    if (widestIdx === -1 || widest < 8) break;
+    const box = boxes[widestIdx];
+    box.sort((a, b) => a[widestCh] - b[widestCh]);
+    const mid = Math.floor(box.length / 2);
+    boxes.splice(widestIdx, 1, box.slice(0, mid), box.slice(mid));
+  }
+  const palette = boxes.filter(b => b.length).map((box) => {
+    let r = 0, g = 0, b2 = 0;
+    for (const p of box) { r += p[0]; g += p[1]; b2 += p[2]; }
+    return [Math.round(r / box.length), Math.round(g / box.length), Math.round(b2 / box.length)];
+  });
+  palette.push([15, 18, 26]); // the addOutline ring color must survive quantization
+
+  const nearestCache = new Map();
+  const nearest = (r, g, b) => {
+    const key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
+    let hit = nearestCache.get(key);
+    if (hit) return hit;
+    let best = palette[0], bestD = Infinity;
+    for (const p of palette) {
+      const d = (p[0] - r) ** 2 + (p[1] - g) ** 2 + (p[2] - b) ** 2;
+      if (d < bestD) { bestD = d; best = p; }
+    }
+    nearestCache.set(key, best);
+    return best;
+  };
+
+  const quantized = [];
+  let shiftSum = 0, shiftCount = 0;
+  for (const frame of frames) {
+    const out = cloneCanvas(frame);
+    const ctx = out.getContext('2d');
+    const imageData = ctx.getImageData(0, 0, out.width, out.height);
+    const data = imageData.data;
+    for (let i = 0; i < data.length; i += 4) {
+      if (data[i + 3] === 0) continue;
+      const [r, g, b] = nearest(data[i], data[i + 1], data[i + 2]);
+      shiftSum += Math.abs(r - data[i]) + Math.abs(g - data[i + 1]) + Math.abs(b - data[i + 2]);
+      shiftCount++;
+      data[i] = r; data[i + 1] = g; data[i + 2] = b;
+    }
+    ctx.putImageData(imageData, 0, 0);
+    quantized.push(out);
+  }
+  if (shiftCount && shiftSum / shiftCount > maxMeanShift) return frames;
+  return quantized;
 }
 
 /**
@@ -569,21 +779,21 @@ function cloneCanvas(canvas) {
  * plays back as per-frame background flicker. Cells are uncropped, so the outer band
  * of the cell is exactly where leftover backdrop lives.
  */
-export function keyCellWithQuality(cell) {
+export function keyCellWithQuality(cell, { chroma = null } = {}) {
   const pristine = cloneCanvas(cell);
   const keyed = removeBorderBackground(cell);
   const transparent = alphaFraction(keyed);
-  const residue = borderResidueFraction(keyed);
+  const residue = borderResidueFraction(keyed, { chroma });
 
   if (transparent > 0.92) {
     const retried = removeBorderBackground(cloneCanvas(pristine), { seedTol: 26, stepTol: 10 });
-    const after = { transparent: alphaFraction(retried), residue: borderResidueFraction(retried) };
+    const after = { transparent: alphaFraction(retried), residue: borderResidueFraction(retried, { chroma }) };
     return after.transparent <= transparent - 0.1 && after.residue <= 0.06 ? retried : keyed;
   }
 
   if (transparent < 0.05 || residue > 0.06) {
     const retried = removeBorderBackground(cloneCanvas(pristine), { seedTol: 70, stepTol: 24 });
-    const after = { transparent: alphaFraction(retried), residue: borderResidueFraction(retried) };
+    const after = { transparent: alphaFraction(retried), residue: borderResidueFraction(retried, { chroma }) };
     const spriteSurvived = after.transparent < 0.97;
     const improved = after.residue < residue || (transparent < 0.05 && after.transparent >= 0.05);
     return spriteSurvived && improved ? retried : keyed;
@@ -593,21 +803,104 @@ export function keyCellWithQuality(cell) {
 }
 
 /**
- * Draw a raw sheet at spec size, slice it, and flood-key EACH CELL independently.
+ * Locate the real cell boundaries of a drawn sprite-sheet grid. Image models do NOT
+ * space their grids perfectly uniformly — a fixed w/cols cut lands inside a limb a
+ * few percent of the time and clips it out of that frame. Projection profiling finds
+ * the true background gutters: per column/row, count pixels that differ from the
+ * dominant border (backdrop) color, then within a ±6% window around each expected
+ * uniform boundary pick the emptiest line. Bounded by the window, so a noisy profile
+ * can never do worse than a slightly shifted uniform cut.
+ */
+export function detectGridCuts(canvas, { cols, rows }) {
+  const w = canvas.width, h = canvas.height;
+  const data = canvas.getContext('2d').getImageData(0, 0, w, h).data;
+
+  // Dominant border color — same rationale as removeBorderBackground.
+  const bins = new Map();
+  const addPx = (x, y) => {
+    const i = (y * w + x) * 4;
+    const r = data[i], g = data[i + 1], b = data[i + 2];
+    const key = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
+    let bin = bins.get(key);
+    if (!bin) { bin = { count: 0, r: 0, g: 0, b: 0 }; bins.set(key, bin); }
+    bin.count++; bin.r += r; bin.g += g; bin.b += b;
+  };
+  for (let x = 0; x < w; x++) { addPx(x, 0); addPx(x, h - 1); }
+  for (let y = 1; y < h - 1; y++) { addPx(0, y); addPx(w - 1, y); }
+  let dom = null;
+  for (const bin of bins.values()) if (!dom || bin.count > dom.count) dom = bin;
+  const br = dom.r / dom.count, bg = dom.g / dom.count, bb = dom.b / dom.count;
+
+  const isContent = (i) => {
+    const dr = data[i] - br, dg = data[i + 1] - bg, db = data[i + 2] - bb;
+    return dr * dr + dg * dg + db * db > 60 * 60;
+  };
+  const colProfile = new Float32Array(w);
+  const rowProfile = new Float32Array(h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (isContent((y * w + x) * 4)) { colProfile[x] += 1 / h; rowProfile[y] += 1 / w; }
+    }
+  }
+
+  const cutsFor = (profile, size, parts) => {
+    const cuts = [0];
+    for (let k = 1; k < parts; k++) {
+      const expected = Math.round((size * k) / parts);
+      const win = Math.max(3, Math.round(size * 0.06));
+      let best = expected, bestVal = Infinity;
+      for (let p = expected - win; p <= expected + win; p++) {
+        if (p <= cuts[cuts.length - 1] + 8 || p >= size - 8) continue;
+        // Tiny distance penalty: among equally empty gutters prefer the uniform cut.
+        const v = profile[p] + (Math.abs(p - expected) / size) * 0.02;
+        if (v < bestVal) { bestVal = v; best = p; }
+      }
+      cuts.push(best);
+    }
+    cuts.push(size);
+    return cuts;
+  };
+  return { xCuts: cutsFor(colProfile, w, cols), yCuts: cutsFor(rowProfile, h, rows) };
+}
+
+/**
+ * Draw a raw sheet at spec size, slice it at DETECTED cell boundaries, and flood-key
+ * EACH CELL independently.
  *
  * Keying the whole sheet from its outer border fails structurally on grids with
  * interior cells (a 3×3 center cell never touches the sheet border, so its backdrop
  * is unreachable by the flood). Per-cell keying gives every cell its own reachable
  * border; the small inset also discards any grid lines the model drew at cell edges.
+ * Detected cells vary by a few pixels, so each is re-centered (never scaled) onto a
+ * uniform cell canvas — alignFrames re-anchors precisely later.
  * Returns { previewImg (keyed sheet for QA/gating), cells }.
  */
-export async function processSheet(rawSrc, spec, { inset = 3 } = {}) {
+export async function processSheet(rawSrc, spec, { inset = 3, chroma = null } = {}) {
   const img = await loadImage(rawSrc);
   const canvas = drawToCanvas(img, { ...spec.canvas, fit: spec.post.fit });
-  const cells = sliceGrid(canvas, spec.frames)
+  const { cols, rows } = spec.frames;
+  const { xCuts, yCuts } = detectGridCuts(canvas, spec.frames);
+  const cellW = Math.floor(canvas.width / cols);
+  const cellH = Math.floor(canvas.height / rows);
+  const rawCells = [];
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const sx = xCuts[c], sw = xCuts[c + 1] - sx;
+      const sy = yCuts[r], sh = yCuts[r + 1] - sy;
+      const cell = document.createElement('canvas');
+      cell.width = cellW;
+      cell.height = cellH;
+      cell.getContext('2d').drawImage(
+        canvas, sx, sy, sw, sh,
+        Math.floor((cellW - sw) / 2), Math.floor((cellH - sh) / 2), sw, sh
+      );
+      rawCells.push(cell);
+    }
+  }
+  const cells = rawCells
     .map((cell) => insetCanvas(cell, inset))
-    .map((cell) => keyCellWithQuality(cell))
-    .map((cell) => cleanKeyedEdges(cell, { erode: 1, outline: !!spec.post.outline }));
+    .map((cell) => keyCellWithQuality(cell, { chroma }))
+    .map((cell) => cleanKeyedEdges(cell, { erode: 1, outline: !!spec.post.outline, despill: chroma }));
   const preview = assembleSheet(cells, spec.frames);
   const previewImg = await loadImage(preview.canvas.toDataURL('image/png'), { crossOrigin: null });
   return { previewImg, cells };
@@ -784,12 +1077,70 @@ export function darkenCanvas(canvas, factor) {
 }
 
 /**
- * The post-keying edge chain, in the only order that works:
- * erode (kill the white-blend AA ring) → outline (stamp dark ring under the sprite)
- * → bleed (fill transparent RGB so bilinear filtering can't sample white).
+ * Chroma spill suppression along the alpha edge. Anti-aliased edge pixels blend the
+ * sprite with the screen color; after keying they survive as a green/magenta fringe
+ * the erode pass can't fully reach on thin details. Classic despill formulas
+ * (green: cap G at max(R,B); magenta: pull R/B toward G), applied ONLY within
+ * `range` px of transparency so legitimately green/magenta sprite interiors are
+ * never touched.
  */
-export function cleanKeyedEdges(canvas, { erode = 1, outline = false, outlineThickness = 2 } = {}) {
+export function despillEdges(canvas, chroma, { range = 2 } = {}) {
+  if (chroma !== 'green' && chroma !== 'magenta') return canvas;
+  const w = canvas.width, h = canvas.height;
+  const ctx = canvas.getContext('2d');
+  const imageData = ctx.getImageData(0, 0, w, h);
+  const data = imageData.data;
+
+  // Distance-to-transparency rings via iterative dilation of the transparent set.
+  let frontier = new Uint8Array(w * h);
+  const edgeband = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) if (data[i * 4 + 3] === 0) frontier[i] = 1;
+  for (let ring = 0; ring < range; ring++) {
+    const next = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const p = y * w + x;
+        if (frontier[p] || edgeband[p] || data[p * 4 + 3] === 0) continue;
+        let touches = false;
+        for (let dy = -1; dy <= 1 && !touches; dy++) {
+          for (let dx = -1; dx <= 1 && !touches; dx++) {
+            if (!dx && !dy) continue;
+            const nx = x + dx, ny = y + dy;
+            if (nx >= 0 && nx < w && ny >= 0 && ny < h && frontier[ny * w + nx]) touches = true;
+          }
+        }
+        if (touches) { next[p] = 1; edgeband[p] = 1; }
+      }
+    }
+    frontier = next;
+  }
+
+  for (let p = 0; p < w * h; p++) {
+    if (!edgeband[p]) continue;
+    const i = p * 4;
+    const r = data[i], g = data[i + 1], b = data[i + 2];
+    if (chroma === 'green') {
+      if (g > r && g > b) data[i + 1] = Math.max(r, b);
+    } else {
+      if (r > g && b > g) {
+        data[i] = Math.round((r + g) / 2);
+        data[i + 2] = Math.round((b + g) / 2);
+      }
+    }
+  }
+  ctx.putImageData(imageData, 0, 0);
+  return canvas;
+}
+
+/**
+ * The post-keying edge chain, in the only order that works:
+ * erode (kill the backdrop-blend AA ring) → despill (neutralize chroma fringe the
+ * erode couldn't reach) → outline (stamp dark ring under the sprite) → bleed (fill
+ * transparent RGB so bilinear filtering can't sample the backdrop color).
+ */
+export function cleanKeyedEdges(canvas, { erode = 1, outline = false, outlineThickness = 2, despill = null } = {}) {
   if (erode > 0) erodeAlphaEdge(canvas, erode);
+  if (despill) despillEdges(canvas, despill);
   if (outline) addOutline(canvas, { thickness: outlineThickness });
   bleedEdgeColors(canvas);
   return canvas;
@@ -828,6 +1179,8 @@ function applyKeying(canvas, keying, keyOverrides) {
  * spec.post: { fit, keying: 'flood'|'white'|null, trimBorder, crop, minAlphaFraction? }
  * opts.keyOverrides — looser tolerances for QA-driven re-key retries; requires rawSrc,
  * so callers keep the raw source around.
+ * opts.chroma — 'green'|'magenta' when the prompt asked for a chroma-key backdrop;
+ * enables the edge despill pass (the flood keyer itself is backdrop-color agnostic).
  */
 export async function postProcessAsset(rawSrc, spec, opts = {}) {
   const img = await loadImage(rawSrc);
@@ -845,7 +1198,8 @@ export async function postProcessAsset(rawSrc, spec, opts = {}) {
   if (spec.post.keying) {
     cleanKeyedEdges(canvas, {
       erode: spec.post.edgeErode ?? 1,
-      outline: !!spec.post.outline
+      outline: !!spec.post.outline,
+      despill: opts.chroma || null
     });
   }
   if (spec.post.darken) darkenCanvas(canvas, spec.post.darken);

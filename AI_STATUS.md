@@ -123,6 +123,63 @@ addressed:
    static. The free path now asks for a simpler 2×2, 4-frame stride with larger
    cells — choppier than 8 frames, but it actually animates.
 
+## Animation quality overhaul, phase 2 (2026-08-05)
+
+Building on the continuity work above, this round upgrades the models themselves and
+adds a real visual double-check loop. Verified against Google's current API docs.
+
+1. **Newer image models.** The pipeline was still on `gemini-2.5-flash-image`, which
+   Google now labels legacy. Scenery slots moved to `gemini-3.1-flash-lite-image`
+   (slightly CHEAPER than before), while the player sprite and the animation sheet
+   moved to `gemini-3.1-flash-image` — the current generation's consistency
+   workhorse, with dedicated support for character-reference inputs. If a key/region
+   doesn't serve the 3.x models yet, the code detects it once and silently falls
+   back to the old model — nothing breaks. `assetMeta.slots.*.model` now records
+   which model actually produced each asset.
+2. **Sheets render at 2K and are supersampled down.** ~5× oversampling means keying
+   and outlining work on much cleaner edges. Costs ~3 cents more per game.
+3. **Chroma-key backgrounds (green screen).** Sprites are now requested on an exact
+   #00FF00 green screen instead of white (magenta automatically for green-looking
+   subjects, so a slime monster doesn't vanish). White exists inside almost every
+   sprite (eyes, teeth, highlights); green doesn't — keying gets decisively easier,
+   and a classic despill pass removes the last green fringe from the edges. The
+   free path keeps white.
+4. **Repair instead of retry.** When only a few frames of an otherwise-good sheet
+   fail the quality scoring, just those frames are redrawn individually (with the
+   character reference AND the neighboring healthy frame attached) instead of
+   regenerating — or rejecting — the whole sheet.
+5. **Premium rescue attempt.** If the sheet fails twice, ONE attempt on
+   `gemini-3-pro-image` (Google's top image model, marketed specifically for
+   character sheets) runs before the expensive 10-call per-frame escalation.
+6. **Visual double-check with per-frame verdicts.** The surviving frames are
+   composited into a numbered filmstrip and reviewed by the vision model in one
+   call: same character in every frame? do the legs actually alternate? which
+   specific frame numbers are broken? Flagged frames are culled (or the attempt
+   rejected), so what ships is what passed review — previously the review happened
+   before culling and could only say yes/no to the whole sheet.
+7. **Deterministic continuity metrics.** Consecutive frames are compared by
+   silhouette overlap (IoU) after alignment: a frame that shares almost nothing
+   with its neighbors is an identity/pose jump, a near-identical pair is a
+   duplicated frame — both culled without spending any API call.
+8. **Color flicker eliminated.** All frames are locked to the static character's
+   color palette (with a guard that skips the lock if colors legitimately differ),
+   and frames are horizontally anchored on their center of mass instead of the
+   bounding box, removing the residual wobble when an arm extends.
+9. **Sheet cells are cut where the model actually drew them.** Models don't space
+   grid cells perfectly evenly; cutting at fixed thirds occasionally clipped limbs.
+   The slicer now finds the real background gutters.
+
+Cost per full game on the Gemini path: ~$0.45 happy path (was ~$0.40 on the legacy
+model), with a LOWER worst case because repair (1-4 calls) and the pro rescue (1
+call) usually replace the 10-call escalation.
+
+**Fix (same day):** the first live test showed the projectile rendering as a solid
+green box. Cause: a small sprite legitimately leaves >95% backdrop, which tripped
+the flood keyer's "removed too much" safety guard — whose fallback keyer only knew
+how to remove WHITE, so on the new green screen it removed nothing. The guard now
+fires only on a near-total wipe (>99.5%) and its fallback keys the detected
+backdrop color, whatever it is.
+
 ## Quick guide for testing
 
 ### How to test

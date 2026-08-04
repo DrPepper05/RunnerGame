@@ -364,6 +364,35 @@ export async function designAssetPrompts({ userPrompt, gameType, themeKey, asset
  */
 const GAMEPLAY_SLOTS = new Set(['player', 'player_sheet', 'enemy', 'obstacle', 'projectile']);
 
+// Keyed sprite slots ask for a chroma-key background on the Gemini path (see
+// CHROMA_KEYS in slotSpecs): platform is keyed too but isn't a "gameplay accent" slot.
+const KEYED_SPRITE_SLOTS = new Set([...GAMEPLAY_SLOTS, 'platform']);
+
+// Palette-collision guard for the chroma color: a green goblin on a green screen
+// gets flood-keyed into nothing, so green-leaning subjects get the magenta screen
+// and vice versa. Both leaning → fall back to the legacy white backdrop.
+const GREENISH = /\b(green|emerald|lime|jade|moss|mossy|leaf|leafy|foliage|jungle|forest|swamp|grass|grassy|slime|toxic|acid|zombie|goblin|orc|cactus|vine|fern|frog|turtle|dragon)\b/i;
+const MAGENTAISH = /\b(magenta|pink|fuchsia|purple|violet|lavender|neon|candy|sakura|blossom|orchid|plum)\b/i;
+function pickChromaColor(text) {
+  const green = GREENISH.test(text);
+  const magenta = MAGENTAISH.test(text);
+  if (green && magenta) return null; // white
+  if (green) return 'magenta';
+  return 'green';
+}
+
+/**
+ * Recover which chroma background a final prompt asked for — the pipeline derives
+ * its keying/despill configuration from the prompt itself (single source of truth,
+ * no extra plumbing between prompt design and post-processing).
+ */
+export function chromaFromPrompt(prompt) {
+  if (!prompt) return null;
+  if (/#00FF00/i.test(prompt)) return 'green';
+  if (/#FF00FF/i.test(prompt)) return 'magenta';
+  return null;
+}
+
 export function buildFinalPrompt(slotKey, subjects, styleGuide, { free = false } = {}) {
   const spec = SLOT_SPECS[slotKey];
   const subject = subjects[slotKey] ?? (spec.subjectKey ? subjects[spec.subjectKey] : undefined);
@@ -388,5 +417,10 @@ export function buildFinalPrompt(slotKey, subjects, styleGuide, { free = false }
   // Free-path variant scaffold (e.g. player_sheet's 2×2 four-frame ask) — must stay
   // in lockstep with the variant spec runSheetSlot selects.
   const scaffold = (free && spec.freeVariant?.scaffold) || spec.scaffold;
-  return scaffold(subject, style);
+  // Chroma backgrounds are a Gemini-path ask only — sana's exact-hex compliance is
+  // unproven, and the flood keyer handles whichever backdrop actually arrives.
+  const chroma = (!free && KEYED_SPRITE_SLOTS.has(slotKey))
+    ? pickChromaColor(`${subject || ''} ${style}`)
+    : null;
+  return scaffold(subject, style, { chroma });
 }

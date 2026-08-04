@@ -7,12 +7,12 @@
  * required slot rejects; every caller handles it (ScreenZero downgrades to static
  * theme art, App surfaces it in the regen overlay) — no global error event here.
  */
-import { SLOT_SPECS, BASELINE_SLOTS, GENERATED_SLOTS } from './slotSpecs';
-import { postProcessAsset, mirrorImage, drawToCanvas, alphaFraction, borderResidueFraction, topBandOpaqueFraction, contentBoundsOf, processSheet, finalizeSheetFrames, loadImage, keyCellWithQuality, cleanKeyedEdges } from './postprocess';
+import { SLOT_SPECS, BASELINE_SLOTS, GENERATED_SLOTS, GEMINI_PRO_SHEET_MODEL, BG_CLAUSE } from './slotSpecs';
+import { postProcessAsset, mirrorImage, drawToCanvas, alphaFraction, borderResidueFraction, topBandOpaqueFraction, contentBoundsOf, processSheet, finalizeSheetFrames, loadImage, keyCellWithQuality, cleanKeyedEdges, alignFrames, maskIoU, composeFilmstrip, lockPalette } from './postprocess';
 import { reviewSprite } from './qa';
 import * as gemini from './providers/geminiImage';
 import * as pollinations from './providers/pollinations';
-import { designAssetPrompts, localDesign, buildFinalPrompt } from './promptDesigner';
+import { designAssetPrompts, localDesign, buildFinalPrompt, chromaFromPrompt } from './promptDesigner';
 import { parsePromptKeywords } from '../promptUtils';
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -36,7 +36,13 @@ async function generateSlotImage(slot, prompt, seed, onProgress, maxAttemptsPerP
       try {
         // referenceImageDataUrl is Gemini-only (image editing); Pollinations has no
         // image-conditioning API, so the fallback below runs from the prompt alone.
-        const result = await gemini.generateImage({ prompt, aspectRatio: spec.gen.aspectRatio, referenceImageDataUrl });
+        const result = await gemini.generateImage({
+          prompt,
+          aspectRatio: spec.gen.aspectRatio,
+          referenceImageDataUrl,
+          model: spec.gen.model,
+          imageSize: spec.gen.imageSize
+        });
         return { ...result, attempts };
       } catch (err) {
         lastError = err;
@@ -136,13 +142,13 @@ export async function generateAssets({
   // the cropped sprite is full of opaque near-white pixels (leftover backdrop). Both
   // trigger one re-key with looser tolerances; the looser result is kept only when
   // it measurably improves without dissolving the sprite.
-  const enforceKeyQuality = async (slot, spec, raw, img) => {
+  const enforceKeyQuality = async (slot, spec, raw, img, chroma = null) => {
     if (!spec.post.keying) return img;
     const measure = (image) => {
       const canvas = drawToCanvas(image, { width: image.naturalWidth, height: image.naturalHeight, fit: 'stretch' });
       return {
         transparent: alphaFraction(canvas),
-        residue: spec.post.crop ? borderResidueFraction(canvas) : 0,
+        residue: spec.post.crop ? borderResidueFraction(canvas, { chroma }) : 0,
         topBand: spec.post.crop ? 0 : topBandOpaqueFraction(canvas)
       };
     };
@@ -153,7 +159,7 @@ export async function generateAssets({
     if (!spec.post.crop) {
       if (before.topBand <= 0.10) return img;
       report(`[ASSETS] Re-keying ${slot} (backdrop left in the top band)...`);
-      const retried = await postProcessAsset(raw.dataUrl, spec, { keyOverrides: { seedTol: 70, stepTol: 24 } });
+      const retried = await postProcessAsset(raw.dataUrl, spec, { keyOverrides: { seedTol: 70, stepTol: 24 }, chroma });
       const after = measure(retried);
       return after.transparent < 0.97 && after.topBand < before.topBand ? retried : img;
     }
@@ -163,7 +169,7 @@ export async function generateAssets({
     // re-key, kept only when it restores real coverage without leaving residue.
     if (before.transparent > 0.92) {
       report(`[ASSETS] Re-keying ${slot} (keying removed too much)...`);
-      const retried = await postProcessAsset(raw.dataUrl, spec, { keyOverrides: { seedTol: 26, stepTol: 10 } });
+      const retried = await postProcessAsset(raw.dataUrl, spec, { keyOverrides: { seedTol: 26, stepTol: 10 }, chroma });
       const after = measure(retried);
       const restored = after.transparent <= before.transparent - 0.1;
       return restored && after.residue <= 0.06 ? retried : img;
@@ -171,7 +177,7 @@ export async function generateAssets({
 
     if (before.transparent >= 0.05 && before.residue <= 0.06) return img;
     report(`[ASSETS] Re-keying ${slot} (background leftovers detected)...`);
-    const retried = await postProcessAsset(raw.dataUrl, spec, { keyOverrides: { seedTol: 70, stepTol: 24 } });
+    const retried = await postProcessAsset(raw.dataUrl, spec, { keyOverrides: { seedTol: 70, stepTol: 24 }, chroma });
     const after = measure(retried);
     const spriteSurvived = after.transparent < 0.97;
     const improved = after.residue < before.residue || (before.transparent < 0.05 && after.transparent >= 0.05);
@@ -189,6 +195,7 @@ export async function generateAssets({
     // provider (weaker facing/pose adherence) but vision review still works.
     if (!spec.qa || !gemini.isGeminiConfigured()) return { img, outcome };
 
+    const chroma = chromaFromPrompt(prompt);
     // Layers get their own review kind: their failure mode is rectangular vignette
     // "props" (mini paintings) rather than a wrong facing.
     const kind = spec.qa.clean ? 'layer' : 'sprite';
@@ -196,13 +203,13 @@ export async function generateAssets({
     let review = await reviewSprite(img.src, { kind });
     if (failed(review)) {
       report(`[ASSETS] QA: re-keying ${slot} background...`);
-      img = await postProcessAsset(raw.dataUrl, spec, { keyOverrides: { seedTol: 60, stepTol: 20 } });
+      img = await postProcessAsset(raw.dataUrl, spec, { keyOverrides: { seedTol: 60, stepTol: 20 }, chroma });
       review = (await reviewSprite(img.src, { kind })) || review;
       if (failed(review)) {
         report(`[ASSETS] QA: regenerating ${slot}...`);
         try {
           const retryRaw = await generateSlotImage(slot, prompt, seed + 1, report, maxAttemptsPerProvider, runState);
-          const retryImg = await postProcessAsset(retryRaw.dataUrl, spec);
+          const retryImg = await postProcessAsset(retryRaw.dataUrl, spec, { chroma });
           img = retryImg;
           review = (await reviewSprite(img.src, { kind })) || review;
         } catch (err) {
@@ -246,6 +253,21 @@ export async function generateAssets({
     report(`[ASSETS] Generating animated ${spec.outputKey || slot}...`);
     const onAttempt = attemptTicker(slot);
     try {
+      // Which backdrop the sheet prompt asked for — drives per-cell despill/residue.
+      const chroma = chromaFromPrompt(prompt);
+      // Decoded static base: the palette-lock reference and the identity anchor for
+      // repair/escalation calls. Optional — a decode failure only skips the lock.
+      let baseCanvas = null;
+      if (baseSrc) {
+        try {
+          const baseImg = await loadImage(baseSrc);
+          baseCanvas = drawToCanvas(baseImg, {
+            width: baseImg.naturalWidth || baseImg.width,
+            height: baseImg.naturalHeight || baseImg.height,
+            fit: 'stretch'
+          });
+        } catch { /* palette lock is optional */ }
+      }
       // A sheet whose cells kept a painted scene can't be keyed (non-uniform backdrop)
       // and would render the player as an opaque card — gate on transparency
       // deterministically, allow one regeneration, else fall back to static.
@@ -337,10 +359,34 @@ export async function generateAssets({
           });
         }
 
+        // Continuity scoring on ALIGNED copies (scoring unaligned cells would flag
+        // placement drift, which alignment fixes for free, instead of content faults).
+        // Consecutive run frames of one stride overlap substantially — a frame whose
+        // every healthy neighbor shares almost no silhouette is a pose/identity jump;
+        // a near-perfect overlap is a duplicated cell (animates as a stutter).
+        const aligned = alignFrames(cells, { runFrameCount: runCount });
+        const ious = [];
+        for (let i = 1; i < runCount && i < aligned.length; i++) {
+          ious[i] = (bad[i - 1] || bad[i]) ? null : maskIoU(aligned[i - 1], aligned[i]);
+        }
+        for (let i = 0; i < runCount; i++) {
+          if (bad[i]) continue;
+          const neighborIous = [i > 0 ? ious[i] : null, i + 1 < runCount ? ious[i + 1] : null]
+            .filter((v) => v != null);
+          if (neighborIous.length && neighborIous.every((v) => v < 0.30)) bad[i] = true;
+        }
+        for (let i = 1; i < runCount; i++) {
+          if (!bad[i] && ious[i] != null && ious[i] > 0.965) bad[i] = true; // duplicate — keep the first
+        }
+
         const badRunCount = bad.slice(0, runCount).filter(Boolean).length;
         const keptRun = cells.slice(0, runCount).filter((_, i) => !bad[i]);
         if (badRunCount > 2 || keptRun.length < 4) {
-          return { issue: identityIssue ? 'draws a different character per frame' : (geomIssue || 'has inconsistent frames') };
+          return {
+            issue: identityIssue ? 'draws a different character per frame' : (geomIssue || 'has inconsistent frames'),
+            // Which frames failed — lets the repair rung redraw exactly these.
+            badIndices: bad.map((b, i) => (b ? i : -1)).filter((i) => i >= 0)
+          };
         }
         // Survivors must still read as one coherent cycle (same thresholds as the
         // old whole-sheet gates, applied to what actually ships).
@@ -366,6 +412,113 @@ export async function generateAssets({
         return { keptCells, framesMeta, dropped: cells.length - keptCells.length };
       };
 
+      // ---- Shared single-frame machinery (repair rung + per-frame escalation) ----
+      const framePrompt = (poseText, hasPrevFrame = false) =>
+        `Use the character in the attached reference image${hasPrevFrame
+          ? 's (the FIRST image is the character; the SECOND is the previous animation frame — match its size and style)'
+          : ''}. ` +
+        `Redraw THIS EXACT character — identical design, colors, outfit and held items, do not reinvent ` +
+        `anything — in a new pose: ${poseText}. Full body in side profile facing right, same size and ` +
+        `style as the reference, centered, ${BG_CLAUSE(chroma)}, no shadow, no ground, no motion lines, no text.`;
+
+      // Sending a keyed (transparent) frame as a reference is ambiguous to the model —
+      // compose it on white first.
+      const onWhite = (canvas) => {
+        const out = document.createElement('canvas');
+        out.width = canvas.width;
+        out.height = canvas.height;
+        const ctx = out.getContext('2d');
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, out.width, out.height);
+        ctx.drawImage(canvas, 0, 0);
+        return out.toDataURL('image/png');
+      };
+
+      // One reference-anchored image-edit for a single pose, keyed and edge-cleaned to
+      // a cell canvas. Throws like any Gemini call — callers own abort bookkeeping.
+      const generateSingleFrame = async (poseText, { width, height, extraRef = null }) => {
+        const raw = await gemini.generateImage({
+          prompt: framePrompt(poseText, !!extraRef),
+          aspectRatio: '1:1',
+          referenceImageDataUrls: extraRef ? [baseSrc, extraRef] : [baseSrc],
+          model: activeSpec.gen.model
+        });
+        const img = await loadImage(raw.dataUrl);
+        const cell = drawToCanvas(img, { width, height, fit: 'stretch' });
+        return cleanKeyedEdges(keyCellWithQuality(cell, { chroma }), {
+          erode: 1,
+          outline: !!spec.post.outline,
+          despill: chroma
+        });
+      };
+
+      // Targeted repair: when the grid sheet is mostly good but a few frames failed
+      // the scorer, redrawing JUST those frames (reference-anchored, the previous
+      // healthy frame as a second reference for pose continuity) is far cheaper than
+      // a full regeneration or the 10-call escalation. Only meaningful when cell
+      // indices map 1:1 onto the canonical pose table (the Gemini 3×3 spec).
+      const tryRepairFrames = async (cells, verdict) => {
+        const badIndices = verdict.badIndices || [];
+        const runCount = activeSpec.frames.runFrameCount;
+        if (!baseSrc || !gemini.isGeminiConfigured() || runState.skipGemini) return null;
+        if (spec.poses?.run?.length !== runCount) return null;
+        if (badIndices.length < 1 || badIndices.length > 4) return null;
+        report(`[ASSETS] Repairing ${badIndices.length} bad frame(s) individually...`);
+        const repaired = cells.slice();
+        let calls = 0;
+        for (const idx of badIndices) {
+          const poseText = idx < runCount ? spec.poses.run[idx] : spec.poses.jump;
+          if (!poseText) return null;
+          const neighbor = idx > 0 && !badIndices.includes(idx - 1) ? repaired[idx - 1] : null;
+          try {
+            calls++;
+            repaired[idx] = await generateSingleFrame(poseText, {
+              width: cells[idx].width,
+              height: cells[idx].height,
+              extraRef: neighbor ? onWhite(neighbor) : null
+            });
+            report(null);
+          } catch (err) {
+            console.warn(`[AssetPipeline] Frame repair failed (pose ${idx + 1}): ${err.message}`);
+            if (err.kind === 'auth' || err.kind === 'no-key' ||
+                (err.kind === 'quota' && (!err.retryDelayMs || err.retryDelayMs > 10000))) {
+              runState.skipGemini = true;
+            }
+            return null;
+          }
+        }
+        const reVerdict = evaluateAndCullCells(repaired, activeSpec.frames);
+        return reVerdict.issue ? null : { verdict: reVerdict, calls };
+      };
+
+      // Drop vision-flagged frames from an already-culled kept set, rebuilding strip
+      // meta. Returns null when the survivors can't carry a cycle. A jumpFrameIndex
+      // BELOW runFrameCount means a run frame doubles as the jump pose (free 2×2) —
+      // it must be remapped, never appended as an extra cell.
+      const cullFromKept = (keptCells, framesMeta, badSet) => {
+        const runCount = framesMeta.runFrameCount ?? keptCells.length;
+        const keptRun = [];
+        for (let i = 0; i < runCount; i++) if (!badSet.has(i)) keptRun.push(keptCells[i]);
+        if (keptRun.length < 4) return null;
+        const cellsOut = [...keptRun];
+        let jumpMeta = {};
+        const jumpIdx = framesMeta.jumpFrameIndex;
+        if (jumpIdx != null && !badSet.has(jumpIdx)) {
+          if (jumpIdx >= runCount) {
+            cellsOut.push(keptCells[jumpIdx]); // dedicated jump cell rides along last
+            jumpMeta = { jumpFrameIndex: keptRun.length };
+          } else {
+            let newIdx = 0;
+            for (let i = 0; i < jumpIdx; i++) if (!badSet.has(i)) newIdx++;
+            jumpMeta = { jumpFrameIndex: newIdx };
+          }
+        }
+        return {
+          keptCells: cellsOut,
+          framesMeta: { cols: cellsOut.length, rows: 1, runFrameCount: keptRun.length, ...jumpMeta }
+        };
+      };
+
       // Escalation rung: the cheap single-grid sheet failed its gates — draw every
       // pose as its OWN Gemini image-edit of the static reference. Per-frame identity
       // is far stronger than one grid image (each call re-anchors to the reference),
@@ -377,11 +530,6 @@ export async function generateAssets({
         const poses = spec.poses?.jump ? [...runPoses, spec.poses.jump] : [...runPoses];
         if (poses.length < 5) return null;
         report(`[ASSETS] Sheet failed its quality gates — drawing ${poses.length} poses individually via Gemini...`);
-        const framePrompt = (poseText) =>
-          `Use the character in the attached reference image. Redraw THIS EXACT character — identical design, ` +
-          `colors, outfit and held items, do not reinvent anything — in a new pose: ${poseText}. ` +
-          `Full body in side profile facing right, same size and style as the reference, centered, ` +
-          `isolated on a plain pure white background, no shadow, no ground, no motion lines, no text.`;
 
         const results = new Array(poses.length).fill(null);
         let calls = 0;
@@ -397,14 +545,7 @@ export async function generateAssets({
             }
             calls++;
             try {
-              const raw = await gemini.generateImage({
-                prompt: framePrompt(poses[idx]),
-                aspectRatio: '1:1',
-                referenceImageDataUrl: baseSrc
-              });
-              const img = await loadImage(raw.dataUrl);
-              const cell = drawToCanvas(img, { width: 128, height: 128, fit: 'stretch' });
-              results[idx] = cleanKeyedEdges(keyCellWithQuality(cell), { erode: 1, outline: !!spec.post.outline });
+              results[idx] = await generateSingleFrame(poses[idx], { width: 128, height: 128 });
               done++;
               noteSlotProgress(slot, 0.5 + (done / poses.length) * 0.3);
               report(null);
@@ -433,16 +574,19 @@ export async function generateAssets({
           console.warn(`[AssetPipeline] Per-frame sheet rejected: ${verdict.issue}.`);
           return null;
         }
-        // One cheap vision check for facing only — the frames are individually
-        // choreographed, so gridConsistent/legsAlternate whole-sheet judgments
-        // don't apply here.
-        const previewSheet = await finalizeSheetFrames(verdict.keptCells, activeSpec, { framesMeta: verdict.framesMeta });
-        if (!previewSheet) return null;
-        const pfReview = await reviewSprite(previewSheet.img.src, { kind: 'sheet', grid: verdict.framesMeta });
+        let keptCells = verdict.keptCells;
+        if (baseCanvas) keptCells = lockPalette(keptCells, baseCanvas);
+        // Numbered-strip vision check: facing (client-side mirror) + identity. The
+        // frames are individually choreographed, so legsAlternate pressure doesn't
+        // apply — but "different character per frame" is still terminal here.
+        const strip = composeFilmstrip(keptCells);
+        const pfReview = await reviewSprite(strip.toDataURL('image/png'), {
+          kind: 'strip',
+          grid: { frameCount: keptCells.length, runFrameCount: verdict.framesMeta.runFrameCount }
+        });
+        if (pfReview && pfReview.sameCharacter === false) return null;
         const pfMirrored = !!(pfReview && pfReview.facingRight === false);
-        const finalSheet = pfMirrored
-          ? await finalizeSheetFrames(verdict.keptCells, activeSpec, { mirror: true, framesMeta: verdict.framesMeta })
-          : previewSheet;
+        const finalSheet = await finalizeSheetFrames(keptCells, activeSpec, { mirror: pfMirrored, framesMeta: verdict.framesMeta });
         return finalSheet && { sheet: finalSheet, review: pfReview, mirrored: pfMirrored, calls };
       };
 
@@ -450,11 +594,26 @@ export async function generateAssets({
       let review = null;
       let mirrored = false;
       let provider = null;
+      let servedModel = null;
       let attempts = 0;
       let perFrame = false;
       let lastIssue = 'unknown';
-      for (let attempt = 1; attempt <= 2 && !sheet; attempt++) {
-        if (attempt > 1) report(`[ASSETS] Sheet ${lastIssue}, regenerating...`);
+      // Attempt 3 is the premium rescue: ONE gemini-3-pro-image sheet before the
+      // 10-call per-frame escalation — usually better and always cheaper than
+      // escalating. Gemini-only; the free variant never reaches it.
+      const proRescue = !!(gemini.isGeminiConfigured() && activeSpec.gen.model &&
+        activeSpec.gen.model !== GEMINI_PRO_SHEET_MODEL);
+      const maxSheetAttempts = proRescue ? 3 : 2;
+      for (let attempt = 1; attempt <= maxSheetAttempts && !sheet; attempt++) {
+        if (attempt === 3 && (runState.skipGemini || provider === 'pollinations')) break;
+        if (attempt > 1) {
+          report(attempt === 3
+            ? `[ASSETS] Sheet ${lastIssue} — trying the premium image model...`
+            : `[ASSETS] Sheet ${lastIssue}, regenerating...`);
+        }
+        const attemptSpec = attempt === 3
+          ? { ...activeSpec, gen: { ...activeSpec.gen, model: GEMINI_PRO_SHEET_MODEL } }
+          : activeSpec;
         // On the Gemini rung the sheet is an image-editing call anchored to the
         // static base; the prompt preamble tells the model the attachment IS the
         // character. Pollinations ignores the reference (prompt-only model).
@@ -463,32 +622,67 @@ export async function generateAssets({
           ? `Use the character in the attached reference image. Redraw THIS EXACT character — identical design, ` +
             `colors, outfit and held items, do not reinvent anything about it — as the following sprite sheet. ${prompt}`
           : prompt;
-        const raw = await generateSlotImage(slot, sheetPrompt, seed + attempt * 13, report, maxAttemptsPerProvider, runState, onAttempt, useReference ? baseSrc : null, activeSpec);
+        const raw = await generateSlotImage(slot, sheetPrompt, seed + attempt * 13, report, maxAttemptsPerProvider, runState, onAttempt, useReference ? baseSrc : null, attemptSpec);
         noteSlotProgress(slot, 0.8);
         provider = raw.provider;
+        servedModel = raw.model || servedModel;
         attempts += raw.attempts;
         // Cells are keyed INDIVIDUALLY — whole-sheet flood keying can never reach the
         // backdrop of interior cells (e.g. the center of a 3×3)
-        const { previewImg, cells } = await processSheet(raw.dataUrl, activeSpec);
-        if (sheetTransparency(previewImg) < activeSpec.post.minAlphaFraction) {
+        const { previewImg, cells } = await processSheet(raw.dataUrl, attemptSpec, { chroma });
+        if (sheetTransparency(previewImg) < attemptSpec.post.minAlphaFraction) {
           lastIssue = 'kept a painted background';
           if (provider === 'pollinations') break; // one free-path attempt only
           continue;
         }
-        const verdict = evaluateAndCullCells(cells, activeSpec.frames);
+        let verdict = evaluateAndCullCells(cells, attemptSpec.frames);
         if (verdict.issue) {
-          lastIssue = verdict.issue;
+          // Repair rung: a handful of scorer-flagged frames get individually redrawn
+          // before we pay for a whole new sheet.
+          const repaired = await tryRepairFrames(cells, verdict);
+          if (repaired) {
+            attempts += repaired.calls;
+            verdict = repaired.verdict;
+          } else {
+            lastIssue = verdict.issue;
+            if (provider === 'pollinations') break;
+            continue;
+          }
+        }
+        // Vision double-check on a numbered filmstrip of exactly the frames that will
+        // ship — per-frame verdicts (badFrames) feed one final cull, whole-strip
+        // verdicts (different characters / legs never swap) fail the attempt.
+        const stripMeta = verdict.framesMeta;
+        review = await reviewSprite(composeFilmstrip(verdict.keptCells).toDataURL('image/png'), {
+          kind: 'strip',
+          grid: { frameCount: verdict.keptCells.length, runFrameCount: stripMeta.runFrameCount ?? verdict.keptCells.length }
+        });
+        if (review && (review.sameCharacter === false || review.legsAlternate === false)) {
+          lastIssue = review.sameCharacter === false
+            ? 'looks like different characters (vision QA)'
+            : 'legs not alternating (vision QA)';
           if (provider === 'pollinations') break;
           continue;
         }
-        review = await reviewSprite(previewImg.src, { kind: 'sheet', grid: activeSpec.frames });
-        if (review && (review.gridConsistent === false || review.legsAlternate === false)) {
-          lastIssue = review.gridConsistent === false ? 'grid inconsistent' : 'legs not alternating';
-          if (provider === 'pollinations') break;
-          continue;
+        if (review?.badFrames?.length) {
+          const badSet = new Set(review.badFrames.map((n) => n - 1)
+            .filter((n) => n >= 0 && n < verdict.keptCells.length));
+          if (badSet.size) {
+            const culled = cullFromKept(verdict.keptCells, stripMeta, badSet);
+            if (!culled) {
+              lastIssue = 'vision QA flagged too many frames';
+              if (provider === 'pollinations') break;
+              continue;
+            }
+            verdict = { ...verdict, ...culled, dropped: (verdict.dropped || 0) + badSet.size };
+          }
         }
-        mirrored = !!(review && !review.facingRight);
-        sheet = await finalizeSheetFrames(verdict.keptCells, activeSpec, { mirror: mirrored, framesMeta: verdict.framesMeta });
+        // Shared-palette lock against the static reference — kills per-frame color
+        // flicker; its internal guard skips frames whose colors genuinely diverged.
+        let keptCells = verdict.keptCells;
+        if (baseCanvas) keptCells = lockPalette(keptCells, baseCanvas);
+        mirrored = !!(review && review.facingRight === false);
+        sheet = await finalizeSheetFrames(keptCells, activeSpec, { mirror: mirrored, framesMeta: verdict.framesMeta });
         if (!sheet) {
           lastIssue = 'had no visible content';
           if (provider === 'pollinations') break;
@@ -504,6 +698,7 @@ export async function generateAssets({
           review = escalated.review;
           mirrored = escalated.mirrored;
           provider = 'gemini';
+          servedModel = servedModel || activeSpec.gen.model;
           attempts += escalated.calls;
           perFrame = true;
         }
@@ -514,6 +709,7 @@ export async function generateAssets({
       preloadedImages[outKey] = sheet.img;
       meta[outKey] = {
         provider, attempts, promptUsed: prompt,
+        ...(servedModel ? { model: servedModel } : {}),
         qa: review, mirrored, facingVerified: !!review,
         sheet: true, perFrame, frames: sheet.frames
       };
@@ -557,8 +753,11 @@ export async function generateAssets({
       const attemptOnce = async (attemptSeed, attemptPrompt) => {
         const raw = await generateSlotImage(slot, attemptPrompt, attemptSeed, report, maxAttemptsPerProvider, runState, onAttempt);
         noteSlotProgress(slot, 0.8);
-        let img = await postProcessAsset(raw.dataUrl, spec);
-        img = await enforceKeyQuality(slot, spec, raw, img);
+        // The prompt is the single source of truth for which backdrop was asked for —
+        // keying itself is color-agnostic, but residue checks and despill need it.
+        const chroma = chromaFromPrompt(attemptPrompt);
+        let img = await postProcessAsset(raw.dataUrl, spec, { chroma });
+        img = await enforceKeyQuality(slot, spec, raw, img, chroma);
         const { img: finalImg, outcome } = await applyQualityAssurance(slot, spec, raw, img, attemptPrompt);
         return { raw, finalImg, outcome };
       };
@@ -588,7 +787,13 @@ export async function generateAssets({
       if (qualityIssue) throw new Error(qualityIssue);
 
       preloadedImages[slot] = result.finalImg;
-      meta[slot] = { provider: result.raw.provider, attempts: result.raw.attempts, promptUsed: prompt, ...result.outcome };
+      meta[slot] = {
+        provider: result.raw.provider,
+        attempts: result.raw.attempts,
+        promptUsed: prompt,
+        ...(result.raw.model ? { model: result.raw.model } : {}),
+        ...result.outcome
+      };
       delete slotFraction[slot];
       doneCount++;
       report(`[ASSETS] Ready: ${slot} via ${result.raw.provider} (${doneCount}/${slots.length})`);
