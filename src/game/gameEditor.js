@@ -35,6 +35,7 @@ const EDITABLE_FIELDS = {
   actionGravity: { min: 500, max: 2200, label: 'platformer gravity' },
   actionProjectileEnabled: { bool: true, label: 'platformer ranged attack on/off' },
   worldWidth: { min: 2000, max: 12000, int: true, label: 'platformer level length (px)' },
+  coinValue: { min: 0, max: 500, int: true, label: 'points per collected coin' },
   gameName: { str: true, maxLen: 60, label: 'display title' }
 };
 
@@ -49,7 +50,8 @@ const ASSET_TARGET_SLOTS = {
   player: ['player_sheet'],
   enemy: ['enemy'],
   obstacle: ['obstacle'],
-  projectile: ['projectile']
+  projectile: ['projectile'],
+  collectibles: ['collectible']
 };
 
 /** Map restyle target names to a deduped pipeline slot list for this config. */
@@ -57,6 +59,7 @@ export function resolveAssetTargets(targets, config) {
   const isPlatformer = config?.gameType === 'platformer';
   const allSlots = GENERATED_SLOTS.map(s => (s === 'player' ? 'player_sheet' : s));
   if (isPlatformer) allSlots.push('projectile');
+  allSlots.push('collectible');
   const slots = new Set();
   for (const target of targets || []) {
     if (target === 'all') {
@@ -81,7 +84,7 @@ const EDITOR_RESPONSE_SCHEMA = {
     },
     assetTargets: {
       type: 'ARRAY',
-      items: { type: 'STRING', enum: ['background', 'foreground', 'floor', 'platforms', 'player', 'enemy', 'obstacle', 'projectile', 'all'] },
+      items: { type: 'STRING', enum: ['background', 'foreground', 'floor', 'platforms', 'player', 'enemy', 'obstacle', 'projectile', 'collectibles', 'all'] },
       description: 'Only for intent=restyle: which elements get new artwork. Use "all" for a whole-look re-theme.'
     },
     summary: { type: 'STRING', description: 'One short line describing what changed, e.g. "runSpeed 400 → 560, enemies 5 → 10". For restyle/regenerate, say what is being redrawn and why.' },
@@ -99,6 +102,7 @@ const EDITOR_RESPONSE_SCHEMA = {
         actionGravity: { type: 'NUMBER' },
         actionProjectileEnabled: { type: 'BOOLEAN' },
         worldWidth: { type: 'NUMBER' },
+        coinValue: { type: 'NUMBER' },
         gameName: { type: 'STRING' }
       }
     }

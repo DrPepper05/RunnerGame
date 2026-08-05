@@ -3,7 +3,6 @@ import { DEFAULT_CONFIG } from '../gameConfig';
 import { getTheme } from './themes';
 import GameModeManager from './GameModeManager';
 import MultiCameraManager from './MultiCameraManager';
-import { compileFallbackUrls } from './assetPipeline';
 import ParallaxGroundSystem from './ParallaxGroundSystem';
 import SpriteAlignmentManager from './SpriteAlignmentManager';
 
@@ -38,34 +37,18 @@ export default class GameManagerScene extends Phaser.Scene {
       window.dispatchEvent(new CustomEvent('phaser-load-complete'));
     });
 
-    const hasPreloaded = !!this.gameConfig?.preloadedImages;
-    if (hasPreloaded) {
+    // dynamicAssetUrls is a plain boolean flag now (raw fallback URLs were removed
+    // with the Pollinations provider). Configs without preloadedImages — share
+    // links, presets — boot on built-in theme art: create() detects the missing
+    // dyn_* textures below and nulls the flag.
+    if (this.gameConfig?.preloadedImages) {
       console.log('[Phaser Preloader] Dynamic assets already registered via browser preloader. Bypassing loader requests.');
-    } else {
-      // undefined = legacy path with no URLs (share links / initial preset) → compile
-      // raw fallback URLs for the loader. EXPLICIT null = the asset pipeline failed
-      // and the UI chose the static-theme downgrade → do NOT fetch raw Pollinations
-      // URLs (they bypass the serial queue → 429s → error dialogs).
-      if (this.gameConfig && this.gameConfig.dynamicAssetUrls === undefined) {
-        console.warn('[Phaser Preloader] Config missing dynamicAssetUrls. Compiling fallback assets on the fly...');
-        this.gameConfig.dynamicAssetUrls = compileFallbackUrls(this.gameConfig);
-      }
-
-      const urls = this.gameConfig?.dynamicAssetUrls;
-      if (urls) {
-        console.log('[Phaser Preloader] Loading dynamic assets:', urls);
-        if (urls.background_far) this.load.image('dyn_bg_far', urls.background_far);
-        if (urls.floor) this.load.image('dyn_floor', urls.floor);
-        if (urls.platform) this.load.image('dyn_platform', urls.platform);
-        if (urls.player) this.load.image('dyn_player', urls.player);
-        if (urls.enemy) this.load.image('dyn_enemy', urls.enemy);
-        if (urls.obstacle) this.load.image('dyn_obstacle', urls.obstacle);
-      }
     }
 
     this.load.spritesheet('dude', 'assets/dude.png', { frameWidth: 32, frameHeight: 48 });
     this.load.atlas('fox', 'assets/atlas/atlas.png', 'assets/atlas/atlas.json');
     this.load.image('crate', 'assets/crate.png');
+    this.load.svg('coin', 'assets/coin.svg', { width: 32, height: 32 }); // static collectible fallback
     this.load.image('ground', 'assets/ground.png');
     this.load.svg('projectile', 'assets/shuriken.svg', { width: 48, height: 16 }); // Laser bolt
     this.load.svg('shuriken', 'assets/shuriken.svg', { width: 32, height: 32 });
@@ -134,7 +117,8 @@ export default class GameManagerScene extends Phaser.Scene {
         player: 'dyn_player',
         enemy: 'dyn_enemy',
         obstacle: 'dyn_obstacle',
-        projectile: 'dyn_projectile'
+        projectile: 'dyn_projectile',
+        collectible: 'dyn_collectible'
       };
 
       Object.entries(preloaded).forEach(([key, img]) => {
@@ -160,12 +144,10 @@ export default class GameManagerScene extends Phaser.Scene {
   }
 
   create() {
-    // Raw-URL boots (share links / presets, no preloadedImages) can lose every
-    // dyn_* texture to loader errors — e.g. a production host without the
-    // /api/pollinations rewrite, or Pollinations being down. dynamicAssetUrls
-    // truthiness routes EVERY texture pick to dyn_* keys, so a partial or total
-    // load failure renders green missing-texture boxes. Downgrade to built-in
-    // theme art instead (mirrors ScreenZero's toStaticThemeConfig).
+    // Boots without preloadedImages (share links / presets) have no dyn_* textures
+    // at all, and dynamicAssetUrls truthiness routes EVERY texture pick to dyn_*
+    // keys — missing textures render as green boxes. Downgrade to built-in theme
+    // art instead (mirrors ScreenZero's toStaticThemeConfig).
     if (this.gameConfig.dynamicAssetUrls && !this.gameConfig.preloadedImages) {
       const required = ['dyn_bg_far', 'dyn_floor', 'dyn_player', 'dyn_enemy', 'dyn_obstacle',
         ...(this.gameConfig.gameType === 'platformer' ? ['dyn_platform'] : [])];

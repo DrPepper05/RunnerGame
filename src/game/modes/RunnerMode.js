@@ -9,6 +9,7 @@ export default class RunnerMode extends BaseMode {
     this.runSpeed = this.baseSpeed;
     this.obstacles = null;
     this.obstacleTimer = null;
+    this.coins = null;
 
     // Mobile control and keyboard state
     this.mobileControls = [];
@@ -31,6 +32,16 @@ export default class RunnerMode extends BaseMode {
 
     this.scene.physics.add.collider(this.obstacles, this.scene.floor);
     this.scene.physics.add.collider(this.scene.player, this.obstacles, this.scene.hitObstacle, null, this.scene);
+
+    // Coin pickups: spawned in an arc over obstacles (see spawnCoinArc), collected
+    // on overlap for score. Same pattern as PlatformerMode's collectibles.
+    this.coins = this.scene.physics.add.group();
+    this.scene.physics.add.overlap(this.scene.player, this.coins, (player, coin) => {
+      if (!coin || !coin.active) return;
+      coin.destroy();
+      this.scene.score += (this.scene.gameConfig.coinValue ?? 25);
+      window.dispatchEvent(new CustomEvent('update-score', { detail: this.scene.score }));
+    }, null, this);
 
     this.gameInputListener = (e) => {
       if (!e.detail) return;
@@ -83,6 +94,29 @@ export default class RunnerMode extends BaseMode {
     const theme = this.scene.activeTheme || {};
     obstacle.body.setGravityY(this.scene.gameConfig.gravity || (theme.gravity || 1800));
     obstacle.body.setVelocityX(-this.runSpeed);
+
+    this.spawnCoinArc(spawnX);
+  }
+
+  // A 3-coin arc traced over the obstacle so collecting rewards the jump the
+  // obstacle forces anyway. Piggybacks on the obstacle spawn — no second timer,
+  // so pause handling (which reaches into obstacleTimer by name) needs no changes
+  // and physics.pause() freezes coins like everything else.
+  spawnCoinArc(obstacleX) {
+    if (!this.coins || Math.random() > 0.7) return; // ~70% of obstacles carry coins
+    const useDyn = this.scene.gameConfig.dynamicAssetUrls && this.scene.textures.exists('dyn_collectible');
+    const textureKey = useDyn ? 'dyn_collectible' : 'coin';
+    const frame = this.scene.textures.get(textureKey)?.get(0);
+    // Max-dimension normalization: generated art is cropped to content and can be
+    // any aspect; the static coin.svg is square. Target ~28px either way.
+    const coinScale = 28 / Math.max(frame?.width || 28, frame?.height || 28);
+    const floorY = this.scene.LOGICAL_FLOOR_Y;
+    [[-70, -110], [0, -150], [70, -110]].forEach(([dx, dy]) => {
+      const coin = this.coins.create(obstacleX + dx, floorY + dy, textureKey);
+      coin.setScale(coinScale);
+      coin.body.setAllowGravity(false);
+      coin.body.setVelocityX(-this.runSpeed);
+    });
   }
 
   update(time, delta) {
@@ -113,6 +147,15 @@ export default class RunnerMode extends BaseMode {
       this.obstacles.children.iterate((obstacle) => {
         if (obstacle && obstacle.x < -50) {
           obstacle.destroy();
+        }
+      });
+    }
+
+    // Cleanup off-screen (missed) coins
+    if (this.coins && this.coins.children) {
+      this.coins.children.iterate((coin) => {
+        if (coin && coin.x < -50) {
+          coin.destroy();
         }
       });
     }
@@ -157,6 +200,12 @@ export default class RunnerMode extends BaseMode {
       });
     }
 
+    if (this.coins && this.coins.children) {
+      this.coins.children.iterate((coin) => {
+        if (coin && coin.body) coin.body.setVelocityX(-this.runSpeed);
+      });
+    }
+
     if (oldConfig.obstacleDelay !== newConfig.obstacleDelay) {
       if (this.obstacleTimer) this.obstacleTimer.remove();
       this.obstacleTimer = this.scene.time.addEvent({
@@ -180,6 +229,9 @@ export default class RunnerMode extends BaseMode {
     }
     if (this.obstacles && this.obstacles.scene) {
       try { this.obstacles.clear(true, true); } catch (e) {}
+    }
+    if (this.coins && this.coins.scene) {
+      try { this.coins.clear(true, true); } catch { /* scene already torn down */ }
     }
     if (this.gameInputListener) {
       window.removeEventListener('game-input', this.gameInputListener);

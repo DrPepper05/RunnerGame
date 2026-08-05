@@ -13,6 +13,7 @@ export const DEFAULT_CONFIG = {
   floorHeight: 100,
   floorTileScale: 0.15,
   scoreTimerDelay: 100,
+  coinValue: 25, // score awarded per collected coin (both modes)
   
   // Action Quest (Platformer) specific defaults
   actionJumpHeight: 600,

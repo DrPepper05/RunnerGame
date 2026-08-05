@@ -122,7 +122,7 @@ function buildPrompt(kind, grid) {
  * Review a post-processed sprite (PNG data URL).
  * @returns {{facingRight: boolean, backgroundClean: boolean, gridConsistent?: boolean} | null}
  */
-export async function reviewSprite(dataUrl, { kind = 'sprite', grid = null } = {}) {
+export async function reviewSprite(dataUrl, { kind = 'sprite', grid = null, label = null } = {}) {
   // Single provider gate: when the free path is forced, NO Gemini call may fire —
   // a null review just means "proceed unverified", exactly like a failed call.
   if (!isGeminiConfigured()) return null;
@@ -134,7 +134,8 @@ export async function reviewSprite(dataUrl, { kind = 'sprite', grid = null } = {
     const result = await generateJson({
       prompt: buildPrompt(kind, grid),
       responseSchema: schema,
-      imageDataUrl: dataUrl
+      imageDataUrl: dataUrl,
+      label: label || `qa:${kind}` // cost-report attribution
     });
     if (kind === 'strip') {
       if (typeof result?.facingRight !== 'boolean' || typeof result?.sameCharacter !== 'boolean') return null;

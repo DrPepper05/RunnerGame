@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { GAME_PRESETS } from '../gameConfig';
 import { IconShare, IconExport, IconImport, IconReset, IconHome } from './Icons';
+import { downloadCostReport } from '../game/assetPipeline/costReport';
 
 const RunnerControls = ({ liveParams, onSliderChange }) => (
   <>
@@ -441,6 +442,18 @@ const CreatorPanel = ({
 
         {/* 6. Config Actions at bottom */}
         <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+          {/* Downloadable spend report — only AI-generated games carry a cost tally
+              (presets/share links have none, the free path costs $0) */}
+          {liveParams?.assetMeta?.cost?.calls?.length > 0 && (
+            <button
+              className="pm-btn pm-btn-outline"
+              onClick={() => downloadCostReport(liveParams)}
+              style={{ width: '100%', padding: '10px' }}
+              title="Download a text report of this game's AI generation spend: totals, per-call token log, per-asset providers"
+            >
+              💾 Cost Report (≈ ${(liveParams.assetMeta.cost.estUsd ?? 0).toFixed(2)})
+            </button>
+          )}
           <ConfigActions liveParams={liveParams} setLiveParams={setLiveParams} setPresetKey={setPresetKey} onHomeClick={onHomeClick} />
         </div>
       </div>

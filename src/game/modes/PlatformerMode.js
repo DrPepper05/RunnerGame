@@ -100,7 +100,7 @@ export default class PlatformerMode extends BaseMode {
 
     this.scene.physics.add.overlap(this.scene.player, this.collectibles, (player, collectible) => {
       if (!collectible || !collectible.active) return;
-      this.awardScore(25);
+      this.awardScore(this.scene.gameConfig.coinValue ?? 25);
       collectible.destroy();
     });
     
@@ -219,7 +219,12 @@ export default class PlatformerMode extends BaseMode {
     const TILE_W = theme.tileWidth || 64;
     const PLATFORM_H = theme.platformHeight || 32;
     const themePlatformTexture = this.scene.gameConfig.dynamicAssetUrls ? 'dyn_platform' : (this.scene.activeTheme?.platformTexture || 'stone_tile');
-    const collectibleTexture = this.scene.activeTheme?.collectibleTexture || 'crate';
+    // Generated coin art when the optional collectible slot delivered (projectile
+    // pattern: existence-guarded — a dropped slot keeps the static coin).
+    const useDynCollectible = this.scene.gameConfig.dynamicAssetUrls && this.scene.textures.exists('dyn_collectible');
+    const collectibleTexture = useDynCollectible
+      ? 'dyn_collectible'
+      : (this.scene.activeTheme?.collectibleTexture || 'coin');
 
     // Retrieve dimensions of the platform texture frame for correct dynamic repeating tile scale
     const textureObj = this.scene.textures.get(themePlatformTexture);
@@ -259,7 +264,10 @@ export default class PlatformerMode extends BaseMode {
           }
           collectible.setScale(1.5); // stars are 16x16, scale to 24px
         } else {
-          collectible.setScale(0.5);
+          // Max-dimension normalization to ~28px: generated coin art is cropped to
+          // content (arbitrary size/aspect); the static coin.svg is 32px square.
+          const cFrame = this.scene.textures.get(collectibleTexture)?.get(0);
+          collectible.setScale(28 / Math.max(cFrame?.width || 28, cFrame?.height || 28));
         }
         collectible.body.setAllowGravity(false);
       }

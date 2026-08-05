@@ -1,16 +1,3 @@
 {
-  "rewrites": [
-    {
-      "source": "/api/pollinations-text/:path*",
-      "destination": "https://text.pollinations.ai/:path*"
-    },
-    {
-      "source": "/api/pollinations-text",
-      "destination": "https://text.pollinations.ai/"
-    },
-    {
-      "source": "/api/pollinations/:path*",
-      "destination": "https://image.pollinations.ai/:path*"
-    }
-  ]
+  "rewrites": []
 }

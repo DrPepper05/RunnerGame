@@ -2,26 +2,41 @@
  * Asset generation pipeline — the single entry point for every generation path
  * (ScreenZero prompt flow, App.jsx prompt flow, CreatorPanel regeneration).
  *
- * Per slot: Gemini (when configured) with retry → Pollinations fallback with retry
- * → post-process to the exact contract the game expects. Terminal failure of any
- * required slot rejects; every caller handles it (ScreenZero downgrades to static
- * theme art, App surfaces it in the regen overlay) — no global error event here.
+ * Per slot: Gemini with retry → post-process to the exact contract the game
+ * expects. Gemini is the ONLY image provider (Pollinations was removed 2026-08-06
+ * per client direction) — terminal failure of any required slot rejects, and
+ * every caller handles it by downgrading to the built-in static theme asset set
+ * (ScreenZero's toStaticThemeConfig; App surfaces it in the regen overlay).
  */
 import { SLOT_SPECS, BASELINE_SLOTS, GENERATED_SLOTS, GEMINI_PRO_SHEET_MODEL, BG_CLAUSE } from './slotSpecs';
 import { postProcessAsset, mirrorImage, drawToCanvas, alphaFraction, borderResidueFraction, topBandOpaqueFraction, contentBoundsOf, processSheet, finalizeSheetFrames, loadImage, keyCellWithQuality, cleanKeyedEdges, alignFrames, maskIoU, composeFilmstrip, lockPalette } from './postprocess';
 import { reviewSprite } from './qa';
 import * as gemini from './providers/geminiImage';
-import * as pollinations from './providers/pollinations';
-import { designAssetPrompts, localDesign, buildFinalPrompt, chromaFromPrompt } from './promptDesigner';
+import { designAssetPrompts, buildFinalPrompt, chromaFromPrompt } from './promptDesigner';
 import { parsePromptKeywords } from '../promptUtils';
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 /**
- * Generate one slot's raw image, walking the provider ladder.
- * `runState.skipGemini` is shared across a run: once one slot hits a hard Gemini
- * failure (dead quota, bad key), the remaining slots skip straight to the fallback
- * instead of each burning retries and long quota waits.
+ * Cooperative cancellation for a generation run. The UI cancels the token when the
+ * user abandons the run (closes the prompt overlay, starts a new generation, or
+ * unmounts ScreenZero); the pipeline checks it between attempts and bails, and the
+ * caller ignores results from a cancelled run. Cancellation is a REJECTION of the
+ * whole run (never "drop optional slot and continue") flagged with err.cancelled,
+ * so callers can tell it apart from a real failure and skip the static-theme boot.
+ */
+export const createCancelToken = () => ({
+  cancelled: false,
+  cancel() { this.cancelled = true; }
+});
+
+const cancelledError = () => Object.assign(new Error('Generation cancelled'), { cancelled: true });
+
+/**
+ * Generate one slot's raw image on Gemini (the only image provider).
+ * `runState.skipGemini` is shared across a run: once one slot hits a hard failure
+ * (dead quota, bad key), the remaining slots fail fast instead of each burning
+ * retries and long quota waits — the caller downgrades to static theme art.
  * Returns { dataUrl, provider, attempts }.
  */
 async function generateSlotImage(slot, prompt, seed, onProgress, maxAttemptsPerProvider, runState, onAttempt = () => {}, referenceImageDataUrl = null, specOverride = null) {
@@ -29,66 +44,54 @@ async function generateSlotImage(slot, prompt, seed, onProgress, maxAttemptsPerP
   let attempts = 0;
   let lastError = null;
 
-  if (gemini.isGeminiConfigured() && !runState.skipGemini) {
-    for (let attempt = 1; attempt <= maxAttemptsPerProvider; attempt++) {
-      attempts++;
-      onAttempt({ provider: 'gemini', attempt, total: maxAttemptsPerProvider });
-      try {
-        // referenceImageDataUrl is Gemini-only (image editing); Pollinations has no
-        // image-conditioning API, so the fallback below runs from the prompt alone.
-        const result = await gemini.generateImage({
-          prompt,
-          aspectRatio: spec.gen.aspectRatio,
-          referenceImageDataUrl,
-          model: spec.gen.model,
-          imageSize: spec.gen.imageSize
-        });
-        return { ...result, attempts };
-      } catch (err) {
-        lastError = err;
-        console.warn(`[AssetPipeline] Gemini failed for "${slot}" (attempt ${attempt}): ${err.message}`);
-        // Bad key or safety block won't improve on retry — go straight to fallback
-        if (err.kind === 'auth' || err.kind === 'safety' || err.kind === 'no-key') {
-          if (err.kind !== 'safety') runState.skipGemini = true;
-          break;
-        }
-        if (err.kind === 'quota') {
-          // A long/absent retry window means daily or zero quota — dead for this run
-          if (!err.retryDelayMs || err.retryDelayMs > 10000) {
-            runState.skipGemini = true;
-            break;
-          }
-          if (attempt < maxAttemptsPerProvider) await sleep(err.retryDelayMs);
-          continue;
-        }
-        if (attempt < maxAttemptsPerProvider) await sleep(2000 * attempt);
-      }
-    }
-    onProgress(`[ASSETS] Gemini unavailable for ${slot}, switching to free fallback...`, null);
+  if (!gemini.isGeminiConfigured()) {
+    throw new Error(`No Gemini API key configured — cannot generate "${slot}".`);
   }
-
-  // Retries re-enter the serialized Pollinations queue, which already spaces and
-  // penalty-delays requests — no extra backoff sleep needed for 429s here.
-  // When Gemini can't rescue this run (keyless, or quota/key already dead), every
-  // retry costs a serialized free-path slot (~15s gap each) — keep the ladder short
-  // so a full game stays minutes, not tens of minutes.
-  const fallbackAttempts = (gemini.isGeminiConfigured() && !runState.skipGemini)
-    ? maxAttemptsPerProvider + 2
-    : 2;
-  for (let attempt = 1; attempt <= fallbackAttempts; attempt++) {
+  if (runState.skipGemini) {
+    throw new Error(`Gemini is unavailable for this run — skipping "${slot}".`);
+  }
+  const budgetLeft = () => runState.imageCalls < (runState.maxImageCalls ?? Infinity);
+  for (let attempt = 1; attempt <= maxAttemptsPerProvider; attempt++) {
+    if (runState.cancelToken?.cancelled) throw cancelledError();
+    if (!budgetLeft()) {
+      onProgress(`[COST] Gemini call budget reached — "${slot}" will not be generated.`, null);
+      break;
+    }
+    runState.imageCalls++;
     attempts++;
-    onAttempt({ provider: 'pollinations', attempt, total: fallbackAttempts });
+    onAttempt({ provider: 'gemini', attempt, total: maxAttemptsPerProvider });
     try {
-      const result = await pollinations.generateImage({ prompt, ...spec.gen.pollinations, seed });
+      const result = await gemini.generateImage({
+        prompt,
+        aspectRatio: spec.gen.aspectRatio,
+        referenceImageDataUrl,
+        model: spec.gen.model,
+        imageSize: spec.gen.imageSize,
+        label: slot // cost-report attribution
+      });
       return { ...result, attempts };
     } catch (err) {
       lastError = err;
-      console.warn(`[AssetPipeline] Pollinations failed for "${slot}" (attempt ${attempt}): ${err.message}`);
-      if (attempt < fallbackAttempts && err.status !== 429) await sleep(2000);
+      console.warn(`[AssetPipeline] Gemini failed for "${slot}" (attempt ${attempt}): ${err.message}`);
+      // Bad key or safety block won't improve on retry
+      if (err.kind === 'auth' || err.kind === 'safety' || err.kind === 'no-key') {
+        if (err.kind !== 'safety') runState.skipGemini = true;
+        break;
+      }
+      if (err.kind === 'quota') {
+        // A long/absent retry window means daily or zero quota — dead for this run
+        if (!err.retryDelayMs || err.retryDelayMs > 10000) {
+          runState.skipGemini = true;
+          break;
+        }
+        if (attempt < maxAttemptsPerProvider) await sleep(err.retryDelayMs);
+        continue;
+      }
+      if (attempt < maxAttemptsPerProvider) await sleep(2000 * attempt);
     }
   }
 
-  throw new Error(`All providers failed for asset "${slot}". Last error: ${lastError?.message || 'unknown'}`);
+  throw new Error(`Image generation failed for asset "${slot}". Last error: ${lastError?.message || 'call budget exhausted'}`);
 }
 
 /**
@@ -101,20 +104,32 @@ export async function generateAssets({
   seed = Math.floor(Math.random() * 1000000),
   onProgress = () => {},
   concurrency = 3,
-  maxAttemptsPerProvider = 2
+  maxAttemptsPerProvider = 2,
+  cancelToken = null
 }) {
   const preloadedImages = {};
   const meta = {};
-  const runState = { skipGemini: false };
+  // Cost controls (both read AT RUN START, like the provider toggle):
+  // - qualityMode restores the expensive rescue rungs (pro sheet, per-frame
+  //   escalation, QA regenerations, 2K sheet) that are OFF in the cost defaults.
+  // - maxImageCalls is a hard backstop: once a run has spent this many Gemini
+  //   image calls, remaining attempts go straight to the free fallback. Normal
+  //   runs never reach it.
+  const runState = {
+    skipGemini: false,
+    qualityMode: localStorage.getItem('PM_QUALITY_MODE') === '1',
+    imageCalls: 0,
+    maxImageCalls: parseInt(localStorage.getItem('PM_MAX_GEMINI_CALLS'), 10) || 12,
+    cancelToken
+  };
   let doneCount = 0;
   // A required slot that dies rejects the whole run — stop idle workers from
-  // feeding the serial Pollinations queue for minutes after the UI has moved on.
+  // starting more slots after the UI has moved on.
   let fatal = false;
 
-  // Partial credit for in-flight slots so the bar moves between completions. On the
-  // serialized free path the FIRST completed slot can take minutes, and a bar frozen
-  // at exactly 75 reads as a hang. Fractions are capped per slot, and the total is
-  // clamped to 94 — 95 is reserved for the caller's pipeline-complete report.
+  // Partial credit for in-flight slots so the bar moves between completions.
+  // Fractions are capped per slot, and the total is clamped to 94 — 95 is
+  // reserved for the caller's pipeline-complete report.
   const slotFraction = {};
   const noteSlotProgress = (slot, f) => {
     slotFraction[slot] = Math.max(slotFraction[slot] || 0, Math.min(f, 0.85));
@@ -200,18 +215,20 @@ export async function generateAssets({
     // "props" (mini paintings) rather than a wrong facing.
     const kind = spec.qa.clean ? 'layer' : 'sprite';
     const failed = (r) => r && (!r.backgroundClean || r.cutoutShapes === false);
-    let review = await reviewSprite(img.src, { kind });
+    let review = await reviewSprite(img.src, { kind, label: `qa:${slot}` });
     if (failed(review)) {
       report(`[ASSETS] QA: re-keying ${slot} background...`);
       img = await postProcessAsset(raw.dataUrl, spec, { keyOverrides: { seedTol: 60, stepTol: 20 }, chroma });
-      review = (await reviewSprite(img.src, { kind })) || review;
-      if (failed(review)) {
+      review = (await reviewSprite(img.src, { kind, label: `qa:${slot}` })) || review;
+      // The regeneration below is a PAID full ladder walk — quality mode only.
+      // The cost defaults keep the free corrections (re-key above, mirror below).
+      if (failed(review) && runState.qualityMode) {
         report(`[ASSETS] QA: regenerating ${slot}...`);
         try {
           const retryRaw = await generateSlotImage(slot, prompt, seed + 1, report, maxAttemptsPerProvider, runState);
           const retryImg = await postProcessAsset(retryRaw.dataUrl, spec, { chroma });
           img = retryImg;
-          review = (await reviewSprite(img.src, { kind })) || review;
+          review = (await reviewSprite(img.src, { kind, label: `qa:${slot}` })) || review;
         } catch (err) {
           console.warn(`[AssetPipeline] QA regeneration failed for "${slot}", keeping previous:`, err.message);
         }
@@ -227,10 +244,8 @@ export async function generateAssets({
     return { img, outcome };
   };
 
-  // Sprite-sheet slots walk the normal provider ladder (Gemini → Pollinations) and
-  // fall back to their static slot on ANY quality failure. The free provider gets a
-  // single attempt with no regeneration — its sheets pass the gates often enough to
-  // be worth one serial-queue slot, but not two.
+  // Sprite-sheet slots walk the normal Gemini ladder and fall back to their static
+  // slot on ANY quality failure.
   const runSheetSlot = async (slot, spec, prompt) => {
     // Static base FIRST, sheet second. The finished static sprite (keyed, QA'd,
     // facing-corrected) is both (a) the identity reference for the sheet call —
@@ -242,13 +257,11 @@ export async function generateAssets({
     await runSlot(spec.fallbackSlot);
     const baseSrc = preloadedImages[spec.fallbackSlot]?.src || null;
 
-    // Free-path variant (e.g. the 2×2 four-frame stride): selected by the SAME
-    // run-start rule the prompt was built with (buildFinalPrompt {free}), so spec
-    // and prompt always describe the same grid. A mid-run skipGemini flip must NOT
-    // switch variants — the prompt already asked for the other layout.
-    const activeSpec = (!gemini.isGeminiConfigured() && spec.freeVariant)
-      ? { ...spec, ...spec.freeVariant }
-      : spec;
+    let activeSpec = spec;
+    // Quality mode pays for the 2K supersampled sheet; the default is the spec's 1K.
+    if (runState.qualityMode && activeSpec.gen?.imageSize) {
+      activeSpec = { ...activeSpec, gen: { ...activeSpec.gen, imageSize: '2K' } };
+    }
 
     report(`[ASSETS] Generating animated ${spec.outputKey || slot}...`);
     const onAttempt = attemptTicker(slot);
@@ -437,11 +450,14 @@ export async function generateAssets({
       // One reference-anchored image-edit for a single pose, keyed and edge-cleaned to
       // a cell canvas. Throws like any Gemini call — callers own abort bookkeeping.
       const generateSingleFrame = async (poseText, { width, height, extraRef = null }) => {
+        runState.imageCalls++;
         const raw = await gemini.generateImage({
           prompt: framePrompt(poseText, !!extraRef),
           aspectRatio: '1:1',
           referenceImageDataUrls: extraRef ? [baseSrc, extraRef] : [baseSrc],
-          model: activeSpec.gen.model
+          model: activeSpec.gen.model,
+          imageSize: '0.5K', // frames land on 128px cells — 512px is 4× supersampling
+          label: 'player_sheet:frame'
         });
         const img = await loadImage(raw.dataUrl);
         const cell = drawToCanvas(img, { width, height, fit: 'stretch' });
@@ -460,9 +476,14 @@ export async function generateAssets({
       const tryRepairFrames = async (cells, verdict) => {
         const badIndices = verdict.badIndices || [];
         const runCount = activeSpec.frames.runFrameCount;
+        // ONCE per game — this used to fire on every sheet attempt (up to 3×) and
+        // was a main driver of the observed ~$1.20/game bills.
+        if (repairUsed) return null;
         if (!baseSrc || !gemini.isGeminiConfigured() || runState.skipGemini) return null;
         if (spec.poses?.run?.length !== runCount) return null;
-        if (badIndices.length < 1 || badIndices.length > 4) return null;
+        if (badIndices.length < 1 || badIndices.length > 3) return null;
+        if (runState.imageCalls + badIndices.length > runState.maxImageCalls) return null;
+        repairUsed = true;
         report(`[ASSETS] Repairing ${badIndices.length} bad frame(s) individually...`);
         const repaired = cells.slice();
         let calls = 0;
@@ -523,8 +544,8 @@ export async function generateAssets({
       // pose as its OWN Gemini image-edit of the static reference. Per-frame identity
       // is far stronger than one grid image (each call re-anchors to the reference),
       // and the alignment pass in finalizeSheetFrames makes the independent frames
-      // cohere. Hard-capped at 10 calls; Gemini-only (Pollinations has no image
-      // conditioning). Returns null on abort/insufficient frames → static fallback.
+      // cohere. Hard-capped at 10 calls. Returns null on abort/insufficient
+      // frames → static fallback.
       const generatePerFrameSheet = async () => {
         const runPoses = spec.poses?.run || [];
         const poses = spec.poses?.jump ? [...runPoses, spec.poses.jump] : [...runPoses];
@@ -538,7 +559,7 @@ export async function generateAssets({
         let aborted = false;
         const runFrame = async (idx) => {
           for (let frameAttempt = 1; frameAttempt <= 2 && !results[idx] && !aborted; frameAttempt++) {
-            if (calls >= 10) return;
+            if (calls >= 10 || runState.imageCalls >= runState.maxImageCalls) return;
             if (frameAttempt === 2) {
               if (retryBudget <= 0) return;
               retryBudget--;
@@ -582,6 +603,7 @@ export async function generateAssets({
         const strip = composeFilmstrip(keptCells);
         const pfReview = await reviewSprite(strip.toDataURL('image/png'), {
           kind: 'strip',
+          label: 'qa:player_sheet',
           grid: { frameCount: keptCells.length, runFrameCount: verdict.framesMeta.runFrameCount }
         });
         if (pfReview && pfReview.sameCharacter === false) return null;
@@ -597,15 +619,17 @@ export async function generateAssets({
       let servedModel = null;
       let attempts = 0;
       let perFrame = false;
+      let repairUsed = false;
       let lastIssue = 'unknown';
       // Attempt 3 is the premium rescue: ONE gemini-3-pro-image sheet before the
-      // 10-call per-frame escalation — usually better and always cheaper than
-      // escalating. Gemini-only; the free variant never reaches it.
-      const proRescue = !!(gemini.isGeminiConfigured() && activeSpec.gen.model &&
-        activeSpec.gen.model !== GEMINI_PRO_SHEET_MODEL);
+      // 10-call per-frame escalation. QUALITY MODE ONLY — the cost defaults stop
+      // at the static player instead of paying for rescues.
+      const proRescue = !!(runState.qualityMode && gemini.isGeminiConfigured() &&
+        activeSpec.gen.model && activeSpec.gen.model !== GEMINI_PRO_SHEET_MODEL);
       const maxSheetAttempts = proRescue ? 3 : 2;
       for (let attempt = 1; attempt <= maxSheetAttempts && !sheet; attempt++) {
-        if (attempt === 3 && (runState.skipGemini || provider === 'pollinations')) break;
+        if (runState.cancelToken?.cancelled) throw cancelledError();
+        if (attempt === 3 && runState.skipGemini) break;
         if (attempt > 1) {
           report(attempt === 3
             ? `[ASSETS] Sheet ${lastIssue} — trying the premium image model...`
@@ -614,9 +638,8 @@ export async function generateAssets({
         const attemptSpec = attempt === 3
           ? { ...activeSpec, gen: { ...activeSpec.gen, model: GEMINI_PRO_SHEET_MODEL } }
           : activeSpec;
-        // On the Gemini rung the sheet is an image-editing call anchored to the
-        // static base; the prompt preamble tells the model the attachment IS the
-        // character. Pollinations ignores the reference (prompt-only model).
+        // The sheet is an image-editing call anchored to the static base; the
+        // prompt preamble tells the model the attachment IS the character.
         const useReference = baseSrc && gemini.isGeminiConfigured() && !runState.skipGemini;
         const sheetPrompt = useReference
           ? `Use the character in the attached reference image. Redraw THIS EXACT character — identical design, ` +
@@ -632,7 +655,6 @@ export async function generateAssets({
         const { previewImg, cells } = await processSheet(raw.dataUrl, attemptSpec, { chroma });
         if (sheetTransparency(previewImg) < attemptSpec.post.minAlphaFraction) {
           lastIssue = 'kept a painted background';
-          if (provider === 'pollinations') break; // one free-path attempt only
           continue;
         }
         let verdict = evaluateAndCullCells(cells, attemptSpec.frames);
@@ -645,7 +667,6 @@ export async function generateAssets({
             verdict = repaired.verdict;
           } else {
             lastIssue = verdict.issue;
-            if (provider === 'pollinations') break;
             continue;
           }
         }
@@ -655,13 +676,14 @@ export async function generateAssets({
         const stripMeta = verdict.framesMeta;
         review = await reviewSprite(composeFilmstrip(verdict.keptCells).toDataURL('image/png'), {
           kind: 'strip',
+          label: 'qa:player_sheet',
           grid: { frameCount: verdict.keptCells.length, runFrameCount: stripMeta.runFrameCount ?? verdict.keptCells.length }
         });
-        if (review && (review.sameCharacter === false || review.legsAlternate === false)) {
-          lastIssue = review.sameCharacter === false
-            ? 'looks like different characters (vision QA)'
-            : 'legs not alternating (vision QA)';
-          if (provider === 'pollinations') break;
+        // Cost rule: vision verdicts are cull-only except the one terminal case
+        // (wrong character) — a failed attempt here means another PAID generation,
+        // so imperfect-but-coherent strips ship instead of being redone.
+        if (review && review.sameCharacter === false) {
+          lastIssue = 'looks like different characters (vision QA)';
           continue;
         }
         if (review?.badFrames?.length) {
@@ -669,12 +691,11 @@ export async function generateAssets({
             .filter((n) => n >= 0 && n < verdict.keptCells.length));
           if (badSet.size) {
             const culled = cullFromKept(verdict.keptCells, stripMeta, badSet);
-            if (!culled) {
-              lastIssue = 'vision QA flagged too many frames';
-              if (provider === 'pollinations') break;
-              continue;
+            if (culled) {
+              verdict = { ...verdict, ...culled, dropped: (verdict.dropped || 0) + badSet.size };
+            } else {
+              console.warn('[AssetPipeline] Vision flagged more frames than can be culled — shipping the strip as-is.');
             }
-            verdict = { ...verdict, ...culled, dropped: (verdict.dropped || 0) + badSet.size };
           }
         }
         // Shared-palette lock against the static reference — kills per-frame color
@@ -685,13 +706,14 @@ export async function generateAssets({
         sheet = await finalizeSheetFrames(keptCells, activeSpec, { mirror: mirrored, framesMeta: verdict.framesMeta });
         if (!sheet) {
           lastIssue = 'had no visible content';
-          if (provider === 'pollinations') break;
         } else if (verdict.dropped) {
           report(`[ASSETS] Dropped ${verdict.dropped} inconsistent frame(s) from the run cycle`);
         }
       }
 
-      if (!sheet && baseSrc && gemini.isGeminiConfigured() && !runState.skipGemini) {
+      // Per-frame escalation: quality mode only, and only within the call budget.
+      if (!sheet && baseSrc && runState.qualityMode && gemini.isGeminiConfigured() &&
+          !runState.skipGemini && runState.imageCalls < runState.maxImageCalls) {
         const escalated = await generatePerFrameSheet();
         if (escalated) {
           sheet = escalated.sheet;
@@ -718,6 +740,7 @@ export async function generateAssets({
       // landed; the sheet is an upgrade of the same output key, not a new slot.
       report(`[ASSETS] Upgraded: animated ${outKey} via ${provider}${perFrame ? ' (per-frame)' : ''}`);
     } catch (err) {
+      if (err.cancelled) throw err; // cancellation rejects the run, never "keep static"
       // The static base is already generated, keyed and registered — keep it.
       console.warn(`[AssetPipeline] Sprite sheet failed (${err.message}) — keeping the static "${spec.fallbackSlot}" sprite.`);
       report(`[ASSETS] Animated player unavailable, keeping static sprite.`);
@@ -726,6 +749,7 @@ export async function generateAssets({
   };
 
   const runSlot = async (slot) => {
+    if (cancelToken?.cancelled) throw cancelledError();
     const prompt = finalPrompts[slot];
     if (!prompt) throw new Error(`No prompt provided for asset slot "${slot}".`);
     const spec = SLOT_SPECS[slot];
@@ -771,10 +795,7 @@ export async function generateAssets({
 
       let result = await attemptOnce(seed, prompt);
       let qualityIssue = layerIssue(result);
-      // The strict-prompt retry is another full ladder walk — cheap on Gemini, but a
-      // second serialized slot on the free path. Mirror the sheet's one-free-path-
-      // attempt rule: a Pollinations layer that fails the gates is dropped, not redone.
-      if (qualityIssue && spec.optional && result.raw.provider !== 'pollinations') {
+      if (qualityIssue && spec.optional) {
         report(`[ASSETS] Retrying ${slot} (${qualityIssue})...`);
         // Harsher variant: the model painted a full scene — demand cutouts explicitly
         const strictPrompt = prompt +
@@ -798,6 +819,11 @@ export async function generateAssets({
       doneCount++;
       report(`[ASSETS] Ready: ${slot} via ${result.raw.provider} (${doneCount}/${slots.length})`);
     } catch (err) {
+      // A cancelled run rejects outright — never "drop optional and continue".
+      if (err.cancelled) {
+        fatal = true;
+        throw err;
+      }
       if (spec.optional) {
         // Optional layers degrade gracefully — the game filters missing textures
         console.warn(`[AssetPipeline] Dropping optional slot "${slot}": ${err.message}`);
@@ -814,30 +840,36 @@ export async function generateAssets({
     }
   };
 
-  // Simple promise pool: at most `concurrency` slots in flight (image-model RPM is
-  // low on free tier; a full 6-wide burst just converts into 429s)
+  // Simple promise pool: at most `concurrency` slots in flight (a full 6-wide
+  // burst just converts into image-model 429s)
   const queue = [...slots];
   const workers = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
-    while (queue.length > 0 && !fatal) {
+    while (queue.length > 0 && !fatal && !cancelToken?.cancelled) {
       await runSlot(queue.shift());
     }
   });
   await Promise.all(workers);
+  if (cancelToken?.cancelled) throw cancelledError();
 
   return { preloadedImages, meta };
 }
 
 const DESIGN_SOURCE_LABELS = {
   gemini: 'Gemini art director',
-  'free-llm': 'free AI art director',
   local: 'local templates'
 };
 
 /**
  * Full generation for a game config: design prompts (LLM or local), then generate
  * all baseline assets. The ONE call every UI path uses.
+ * Gemini is the only image provider — without a configured key this rejects
+ * immediately, and every caller downgrades to built-in static theme art.
  */
-export async function generateGameAssets({ config, userPrompt = '', onProgress = () => {} }) {
+export async function generateGameAssets({ config, userPrompt = '', onProgress = () => {}, cancelToken = null }) {
+  if (!gemini.isGeminiConfigured()) {
+    throw new Error('No Gemini API key configured — AI asset generation requires a key.');
+  }
+  gemini.resetUsageTally();
   const design = await designAssetPrompts({
     userPrompt,
     gameType: config.gameType,
@@ -846,39 +878,62 @@ export async function generateGameAssets({ config, userPrompt = '', onProgress =
   });
   onProgress(`[DESIGN] Asset prompts composed via ${DESIGN_SOURCE_LABELS[design.source] || design.source}...`, 73);
 
-  // Free-variant scaffolds (e.g. the 2×2 sheet) follow the same run-start rule
-  // runSheetSlot uses to pick its variant spec — prompt and spec must agree.
-  const free = !gemini.isGeminiConfigured();
+  // Slots whose entity the user explicitly named get identity-first styling
+  // (natural colors + accent rim-light) instead of accent-as-dominant.
+  const namedBySlot = {
+    enemy: design.entities?.enemy,
+    obstacle: design.entities?.hazard,
+    collectible: design.entities?.collectible
+  };
   const finalPrompts = {};
-  for (const slot of [...GENERATED_SLOTS, 'player_sheet', 'projectile']) {
-    finalPrompts[slot] = buildFinalPrompt(slot, design.subjects, design.styleGuide, { free });
+  for (const slot of [...GENERATED_SLOTS, 'player_sheet', 'projectile', 'collectible']) {
+    finalPrompts[slot] = buildFinalPrompt(slot, design.subjects, design.styleGuide,
+      { userNamed: !!namedBySlot[slot] });
   }
 
   // The player is always attempted as an animated sprite sheet (stored under the
-  // 'player' key). Gemini produces reliable sheets; the free path gets one gated
-  // attempt and falls back to a static player sprite when the gates reject it.
+  // 'player' key), falling back to the static player sprite when the gates reject.
   // GENERATED_SLOTS order matters: required gameplay slots precede the optional
-  // parallax layers, so the FIFO worker pool finishes the playable core first
-  // (crucial on the serialized free path) — keep it that way.
+  // parallax layers, so the FIFO worker pool finishes the playable core first —
+  // keep it that way.
   const slots = GENERATED_SLOTS.map(s => (s === 'player' ? 'player_sheet' : s));
   // Platformer games shoot — generate their projectile too (optional slot: on failure
   // the game keeps its static SVG bolt). Runners never fire, skip the cost.
   if (config.gameType === 'platformer') slots.push('projectile');
+  // Both modes spawn score pickups (optional slot: on failure the game keeps the
+  // static coin.svg). Last in the FIFO so required slots always come first.
+  slots.push('collectible');
 
-  const { preloadedImages, meta } = await generateAssets({ finalPrompts, slots, onProgress });
+  const { preloadedImages, meta } = await generateAssets({ finalPrompts, slots, onProgress, cancelToken });
 
-  const providers = Object.values(meta).filter(m => !m.dropped).map(m => m.provider);
-  const geminiCount = providers.filter(p => p === 'gemini').length;
+  const generated = Object.values(meta).filter(m => !m.dropped).length;
   onProgress(
-    `[ASSETS] Complete — ${geminiCount}/${providers.length} images via Gemini, ` +
-    `${providers.length - geminiCount} via free engine. Prompt design: ${design.source}.`,
+    `[ASSETS] Complete — ${generated} image(s) generated via Gemini. ` +
+    `Prompt design: ${design.source}.`,
     95
   );
+  const cost = reportRunCost(onProgress);
 
   // assetMeta rides on the game config so provider usage stays inspectable after
   // generation (DevTools: window.__GAME_LIVE_CONFIG.assetMeta)
-  const assetMeta = { designSource: design.source, slots: meta };
+  const assetMeta = { designSource: design.source, slots: meta, ...(cost ? { cost } : {}) };
   return { preloadedImages, meta, promptSet: finalPrompts, design, assetMeta };
+}
+
+// Estimated spend line for the terminal (skipped on all-free runs). The number
+// comes from usageMetadata + a static price table — an estimate, not a bill.
+function reportRunCost(onProgress) {
+  const cost = gemini.getUsageTally();
+  if (!cost || (!cost.imageCalls && !cost.visionCalls)) return null;
+  const failures = (cost.imageFailures || 0) + (cost.visionFailures || 0);
+  onProgress(
+    `[COST] ≈ $${cost.estUsd.toFixed(2)} estimated — ${cost.imageCalls} image call(s), ` +
+    `${cost.visionCalls} vision call(s)` +
+    (cost.thoughtsTokens ? `, ${cost.thoughtsTokens} thinking tokens` : '') +
+    (failures ? `, ${failures} FAILED call(s)` : ''),
+    95
+  );
+  return cost;
 }
 
 /**
@@ -888,6 +943,10 @@ export async function generateGameAssets({ config, userPrompt = '', onProgress =
  * images/meta over the retained ones and remounts the game.
  */
 export async function regenerateAssetSlots({ config, instruction = '', slots, onProgress = () => {} }) {
+  if (!gemini.isGeminiConfigured()) {
+    throw new Error('No Gemini API key configured — asset regeneration requires a key.');
+  }
+  gemini.resetUsageTally();
   // The instruction IS the art direction for a restyle. Reusing the original
   // assetDesignDirections would make the keyless path regenerate the same subjects
   // and silently ignore the request; a theme word in the instruction ("lava world")
@@ -901,48 +960,30 @@ export async function regenerateAssetSlots({ config, instruction = '', slots, on
   });
   onProgress(`[DESIGN] Asset prompts composed via ${DESIGN_SOURCE_LABELS[design.source] || design.source}...`, 73);
 
-  const free = !gemini.isGeminiConfigured();
+  const namedBySlot = {
+    enemy: design.entities?.enemy,
+    obstacle: design.entities?.hazard,
+    collectible: design.entities?.collectible
+  };
   const finalPrompts = {};
   for (const slot of slots) {
-    finalPrompts[slot] = buildFinalPrompt(slot, design.subjects, design.styleGuide, { free });
+    finalPrompts[slot] = buildFinalPrompt(slot, design.subjects, design.styleGuide,
+      { userNamed: !!namedBySlot[slot] });
     // Sheet slots fall back to their static slot on gate failure — that fallback
     // run needs its own prompt present.
     const fallbackSlot = SLOT_SPECS[slot].fallbackSlot;
     if (fallbackSlot && !finalPrompts[fallbackSlot]) {
-      finalPrompts[fallbackSlot] = buildFinalPrompt(fallbackSlot, design.subjects, design.styleGuide, { free });
+      finalPrompts[fallbackSlot] = buildFinalPrompt(fallbackSlot, design.subjects, design.styleGuide);
     }
   }
 
   const { preloadedImages, meta } = await generateAssets({ finalPrompts, slots, onProgress });
 
-  const providers = Object.values(meta).filter(m => !m.dropped).map(m => m.provider);
-  const geminiCount = providers.filter(p => p === 'gemini').length;
+  const updated = Object.values(meta).filter(m => !m.dropped).length;
   onProgress(
-    `[ASSETS] Updated ${providers.length}/${slots.length} slot(s) — ` +
-    `${geminiCount} via Gemini, ${providers.length - geminiCount} via free engine.`,
+    `[ASSETS] Updated ${updated}/${slots.length} slot(s) via Gemini.`,
     95
   );
+  reportRunCost(onProgress);
   return { preloadedImages, meta, design };
-}
-
-/**
- * Raw Pollinations URL map for paths that skip preloading entirely (share-link
- * imports, initial presets). Phaser's loader fetches these directly.
- */
-export function compileFallbackUrls(config) {
-  const design = localDesign({
-    gameType: config.gameType,
-    themeKey: config.themeKey,
-    assetDesignDirections: config.assetDesignDirections
-  });
-  const seed = Math.floor(Math.random() * 1000000);
-  const urls = {};
-  for (const slot of BASELINE_SLOTS) {
-    urls[slot] = pollinations.buildPollinationsUrl({
-      prompt: buildFinalPrompt(slot, design.subjects, design.styleGuide),
-      ...SLOT_SPECS[slot].gen.pollinations,
-      seed
-    });
-  }
-  return urls;
 }

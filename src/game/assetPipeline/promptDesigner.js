@@ -8,7 +8,6 @@
  */
 import { SLOT_SPECS, BASELINE_SLOTS } from './slotSpecs';
 import { isGeminiConfigured, generateJson } from './providers/geminiImage';
-import { generateDesignJson } from './providers/pollinations';
 
 /**
  * Theme subject tables — the local fallback recipe.
@@ -24,6 +23,7 @@ const THEMES = {
     playerRunner: 'winter athlete runner, cold weather gear, athletic build',
     enemy: 'ice golem monster, frozen yeti creature, frost elemental',
     hazards: 'ice spikes, frozen stalactites, sharp icicles',
+    collectibles: 'gold coin with a frosty blue rim',
     projectile: 'jagged glowing ice shard bolt',
     colorPalette: 'cool blues, whites, cyans, pale purples, ice blue (#E6F3FF, #B3D9FF, #4D94FF)',
     atmosphere: 'cold, crystalline, shimmering'
@@ -36,6 +36,7 @@ const THEMES = {
     playerRunner: 'heat runner with protective suit, athletic stance',
     enemy: 'lava golem, fire demon, magma elemental creature',
     hazards: 'lava pit, fire geyser, molten rock spike',
+    collectibles: 'gold coin with a molten ember glow',
     projectile: 'blazing fireball with molten orange core',
     colorPalette: 'reds, oranges, dark grays, yellow highlights (#FF6B35, #FF4500, #DC143C, #8B0000)',
     atmosphere: 'hot, glowing, dangerous'
@@ -48,6 +49,7 @@ const THEMES = {
     playerRunner: 'nature runner, athletic explorer, green outfit',
     enemy: 'forest wolf, giant spider, evil tree creature',
     hazards: 'thorn bush, poison plant, falling branch',
+    collectibles: 'gold coin wreathed in tiny green leaves',
     projectile: 'sharp wooden arrow with glowing green fletching',
     colorPalette: 'greens, browns, earth tones (#228B22, #32CD32, #8FBC8F, #654321)',
     atmosphere: 'natural, organic, mysterious'
@@ -60,6 +62,7 @@ const THEMES = {
     playerRunner: 'parkour runner, urban athlete, street clothes',
     enemy: 'security robot, street thug, drone enemy',
     hazards: 'electrical barrier, steam vent, construction hazard',
+    collectibles: 'holographic gold credit coin',
     projectile: 'neon plasma bolt with electric sparks',
     colorPalette: 'grays, neon colors, blues, purples (#696969, #FF00FF, #00FFFF, #1E90FF)',
     atmosphere: 'urban, modern, neon-lit'
@@ -72,11 +75,50 @@ const THEMES = {
     playerRunner: 'astronaut runner, space suit, jetpack',
     enemy: 'alien creature, space pirate, robot sentinel',
     hazards: 'laser barrier, meteor, energy field',
+    collectibles: 'glowing golden energy coin',
     projectile: 'bright cyan laser beam bolt',
     colorPalette: 'deep purples, blues, pinks, cosmic colors (#000033, #4B0082, #9400D3, #DDA0DD)',
     atmosphere: 'cosmic, futuristic, otherworldly'
   }
 };
+
+/**
+ * Entity extraction — the prompt-fidelity guarantee. When the player NAMES an
+ * enemy, hazard or collectible ("skeleton enemies", "spikes", "coins"), that noun
+ * is binding for the corresponding asset: it becomes the HEAD of the local subject
+ * phrase, a MUST clause in the LLM designer prompt, and a post-validation check on
+ * the designer's answer. Client-reported failures this fixes: "skeleton enemies"
+ * shipped knights, "spikes" shipped generic blue blocks (2026-08-06).
+ * Matching is cosmetic-only — a false positive steers art, never physics.
+ */
+const ENEMY_NOUNS = /\b(skeleton|zombie|ghost|ghoul|goblin|orc|troll|ogre|dragon|demon|imp|vampire|mummy|witch|wizard|knight|ninja|pirate|robot|drone|alien|slime|bat|spider|scorpion|snake|serpent|wolf|bear|shark|crab|rat|golem|yeti|dinosaur|clown|samurai|viking|crocodile|frog)s?\b/i;
+const HAZARD_NOUNS = /\b(spike|saw|sawblade|buzzsaw|blade|spear|icicle|stalagmite|stalactite|thorn|cactus|mine|bomb|trap|geyser|boulder|barrel|anvil|laser)s?\b/i;
+const COLLECTIBLE_NOUNS = /\b(coin|gem|gemstone|diamond|crystal|jewel|ring|orb|apple|banana|cherry|heart|key|token|treasure|star)s?\b/i;
+// Stop-words stripped from a matched "<X> enemies" noun phrase. Generic filler
+// (game, lots, more…) is included so "a game with enemies" yields NO entity
+// rather than a literal "game enemy".
+const PHRASE_STOPWORDS = /\b(the|a|an|some|many|more|lots|few|several|plenty|tons|other|game|games|with|and|of|as|has|have|are|evil|scary|dangerous|deadly|patrolling|attacking)\b/g;
+
+export function extractEntities(promptText) {
+  const text = (promptText || '').toLowerCase();
+  const entities = { enemy: null, hazard: null, collectible: null };
+  // Noun-phrase form first: "(flying) skeleton enemies" — up to two words before
+  // the role word carry the player's actual creature.
+  const phrase = text.match(/(?:^|[\s,])((?:[a-z-]+\s)?[a-z-]+)\s+(?:enemies|enemy|monsters?|creatures?|foes?|villains?|bosses)\b/);
+  if (phrase) {
+    const cleaned = phrase[1].replace(PHRASE_STOPWORDS, ' ').replace(/\s+/g, ' ').trim();
+    if (cleaned) entities.enemy = cleaned;
+  }
+  if (!entities.enemy) {
+    const m = text.match(ENEMY_NOUNS);
+    if (m) entities.enemy = m[1];
+  }
+  const h = text.match(HAZARD_NOUNS);
+  if (h) entities.hazard = h[1];
+  const c = text.match(COLLECTIBLE_NOUNS);
+  if (c) entities.collectible = c[1];
+  return entities;
+}
 
 function extractCustomElements(promptText) {
   const lower = promptText.toLowerCase();
@@ -110,14 +152,26 @@ function customDirectionsFromPrompt(promptText, gameType) {
   const player = gameType === 'platformer'
     ? `the armed hero character of "${subject}"`
     : `the athletic running hero of "${subject}"`;
+  // User-named entities become the HEAD of the subject phrase: image models
+  // weight the head noun, so "a menacing skeleton enemy, styled to match …" wins
+  // where the old phrasing (head noun "enemy creature", the player's word buried
+  // in a quoted scene clause) kept shipping generic guards.
+  const entities = extractEntities(promptText);
   return {
     backgrounds: `distant scenery landscape of "${subject}"`,
     characters: player,
     levelElements: `ground terrain surface matching "${subject}"`,
     platforms: `floating platform block matching "${subject}"`,
     player,
-    enemy: `menacing enemy creature from "${subject}"`,
-    hazards: `dangerous stationary hazard object from "${subject}"`,
+    enemy: entities.enemy
+      ? `a menacing ${entities.enemy} enemy, styled to match "${subject}"`
+      : `menacing enemy creature from "${subject}"`,
+    hazards: entities.hazard
+      ? `a cluster of sharp ${entities.hazard}s, a ${entities.hazard} hazard, styled to match "${subject}"`
+      : `dangerous stationary hazard object from "${subject}"`,
+    collectibles: entities.collectible
+      ? `a single shiny ${entities.collectible} pickup, styled to match "${subject}"`
+      : `a single shiny gold coin pickup matching "${subject}"`,
     projectile: `small glowing energy projectile matching "${subject}"`,
     styleGuide: 'retro game aesthetic, clear pixel definition, vibrant colors',
     colorPalette: `a cohesive palette that fits "${subject}"`
@@ -168,6 +222,7 @@ export function generateAssetDirections(theme, secondaryTheme, promptText, gameT
     player: finalData.player,
     enemy: finalData.enemy,
     hazards: finalData.hazards,
+    collectibles: finalData.collectibles,
     projectile: finalData.projectile,
     styleGuide: 'retro game aesthetic, clear pixel definition, vibrant colors',
     colorPalette: finalData.colorPalette
@@ -181,6 +236,7 @@ const DEFAULT_SUBJECTS = {
   player: 'running character sprite',
   enemy: 'patrolling enemy monster creature',
   obstacle: 'danger barrier block or spike',
+  collectible: 'shiny gold coin pickup',
   projectile: 'glowing energy bolt'
 };
 
@@ -196,18 +252,22 @@ const DESIGNER_RESPONSE_SCHEMA = {
     floor: { type: 'STRING' },
     platform: { type: 'STRING' },
     player: { type: 'STRING' },
-    enemy: { type: 'STRING' },
-    obstacle: { type: 'STRING' },
+    enemy: { type: 'STRING', description: 'The patrolling enemy. If the player request names a specific creature (e.g. skeletons), it must be exactly that creature' },
+    obstacle: { type: 'STRING', description: 'The stationary hazard. If the player request names one (e.g. spikes), depict exactly that' },
+    collectible: { type: 'STRING', description: 'The small score pickup the player collects (default: a coin). If the player request names one (e.g. gems), exactly that' },
     projectile: { type: 'STRING', description: 'The small ranged attack shot the hero fires' }
   },
   // mid/near are optional — buildFinalPrompt falls back to the far subject via subjectKey
-  required: ['styleSummary', 'colorPalette', 'accentPalette', 'background_far', 'floor', 'platform', 'player', 'enemy', 'obstacle', 'projectile']
+  required: ['styleSummary', 'colorPalette', 'accentPalette', 'background_far', 'floor', 'platform', 'player', 'enemy', 'obstacle', 'collectible', 'projectile']
 };
 
-function buildDesignerPrompt(userPrompt, gameType) {
+function buildDesignerPrompt(userPrompt, gameType, entities = {}) {
   const modeDesc = gameType === 'platformer'
     ? 'a 2D side-scrolling action platformer'
     : 'a 2D side-scrolling endless runner';
+  const must = (entity, article = 'a') =>
+    entity ? ` — the player explicitly asked for: ${entity}. It MUST be ${article} ${entity}` : '';
+  const anyNamed = !!(entities.enemy || entities.hazard || entities.collectible);
   return (
     `You are the art director for ${modeDesc} generated from this player request: "${userPrompt}".\n\n` +
     `Design one cohesive visual identity and describe six game assets. Return JSON with:\n` +
@@ -223,10 +283,15 @@ function buildDesignerPrompt(userPrompt, gameType) {
     `- floor: the ground/terrain surface material (max 15 words)\n` +
     `- platform: a floating platform block (max 15 words)\n` +
     `- player: the hero character (max 20 words)\n` +
-    `- enemy: a patrolling enemy creature (max 20 words)\n` +
-    `- obstacle: a stationary hazard object (max 15 words)\n` +
+    `- enemy: a patrolling enemy creature${must(entities.enemy)} (max 20 words)\n` +
+    `- obstacle: a stationary hazard object${must(entities.hazard)} (max 15 words)\n` +
+    `- collectible: the small score pickup the player collects, a coin by default${must(entities.collectible)} (max 12 words)\n` +
     `- projectile: the small ranged shot the hero fires, matching the accentPalette (max 10 words)\n\n` +
     `Rules:\n` +
+    (anyNamed
+      ? `- BINDING: entities the player named in the request are requirements, not ` +
+        `inspiration — never substitute a generic creature or object for them.\n`
+      : '') +
     `- Describe SUBJECTS ONLY. Do not mention backgrounds, isolation, transparency, framing, ` +
     `camera angle, facing direction, or tiling — those are added automatically.\n` +
     `- For player, enemy, obstacle and platform: avoid white or near-white as a dominant color; ` +
@@ -257,7 +322,7 @@ export function localDesign({ gameType, themeKey, userPrompt = '', assetDesignDi
     generateAssetDirections(themeKey, themeKey, userPrompt, gameType || 'runner');
 
   const subjects = {};
-  for (const slot of [...BASELINE_SLOTS, 'projectile']) {
+  for (const slot of [...BASELINE_SLOTS, 'projectile', 'collectible']) {
     subjects[slot] = SLOT_SPECS[slot].fallbackSubject(directions) || DEFAULT_SUBJECTS[slot];
   }
   return {
@@ -267,24 +332,42 @@ export function localDesign({ gameType, themeKey, userPrompt = '', assetDesignDi
       colorPalette: directions.colorPalette || 'standard arcade colors',
       accentPalette: THEME_ACCENTS[themeKey] || DEFAULT_ACCENT
     },
-    subjects
+    subjects,
+    // Which slots the user explicitly named — buildFinalPrompt swaps their accent
+    // treatment from "dominant colors" to rim-light so identity beats palette.
+    entities: extractEntities(userPrompt)
   };
 }
 
 /**
  * Extract and validate the per-slot subjects from a designer LLM response.
  * Returns null when any required slot is missing — callers fall back locally.
+ * User-named entities are ENFORCED: if the designer's subject dropped the noun
+ * the player asked for, it is prepended as the new head (keeps the LLM's
+ * palette/flavor words, restores the binding identity).
  */
-function subjectsFromDesignerResult(result) {
+function subjectsFromDesignerResult(result, entities = {}) {
   if (!result || typeof result !== 'object') return null;
   const subjects = {};
   for (const slot of [...BASELINE_SLOTS, 'projectile']) {
     if (!result[slot] || typeof result[slot] !== 'string') return null;
     subjects[slot] = result[slot];
   }
-  for (const slot of ['background_mid', 'background_near']) {
+  // Collectible is newer than the required set — tolerate designer omissions.
+  for (const slot of ['background_mid', 'background_near', 'collectible']) {
     if (typeof result[slot] === 'string' && result[slot].trim()) subjects[slot] = result[slot];
   }
+  if (!subjects.collectible) subjects.collectible = DEFAULT_SUBJECTS.collectible;
+  const bind = (slot, entity) => {
+    if (!entity || !subjects[slot]) return;
+    const head = entity.split(/\s+/).pop().replace(/s$/, '');
+    if (!subjects[slot].toLowerCase().includes(head)) {
+      subjects[slot] = `a ${entity} — ${subjects[slot]}`;
+    }
+  };
+  bind('enemy', entities.enemy);
+  bind('obstacle', entities.hazard);
+  bind('collectible', entities.collectible);
   return subjects;
 }
 
@@ -296,57 +379,31 @@ function styleGuideFromDesignerResult(result) {
   };
 }
 
-// openai-fast has no schema-constrained output like Gemini, so the free-path
-// designer prompt must spell the contract out explicitly.
-const FREE_DESIGNER_JSON_SUFFIX =
-  '\n\nRespond with ONLY a raw JSON object — no markdown fences, no commentary — ' +
-  'with exactly these string keys: styleSummary, colorPalette, accentPalette, ' +
-  'background_far, background_mid, background_near, floor, platform, player, ' +
-  'enemy, obstacle, projectile.';
-
 /**
  * Design the style guide + per-slot subjects for a generation run.
- * One Gemini text call when a key is available; otherwise one free Pollinations
- * text call (openai-fast) so free-path assets still follow the user's prompt
- * instead of canned theme tables; local tables on any failure or empty prompt.
+ * One Gemini text call when a key is available; local theme tables on any
+ * failure or empty prompt.
  */
 export async function designAssetPrompts({ userPrompt, gameType, themeKey, assetDesignDirections, timeoutMs = 12000 }) {
   const fallback = () => localDesign({ gameType, themeKey, userPrompt, assetDesignDirections });
 
-  if (!userPrompt?.trim()) {
+  if (!userPrompt?.trim() || !isGeminiConfigured()) {
     return fallback();
   }
 
-  if (isGeminiConfigured()) {
-    try {
-      const result = await generateJson({
-        prompt: buildDesignerPrompt(userPrompt, gameType),
-        responseSchema: DESIGNER_RESPONSE_SCHEMA,
-        timeoutMs
-      });
-      const subjects = subjectsFromDesignerResult(result);
-      if (!subjects) return fallback();
-      return { source: 'gemini', styleGuide: styleGuideFromDesignerResult(result), subjects };
-    } catch (err) {
-      console.warn('[PromptDesigner] Gemini design failed, using local templates:', err.message);
-      return fallback();
-    }
-  }
-
-  // Free path: same art-director step on Pollinations' keyless text tier.
+  const entities = extractEntities(userPrompt);
   try {
-    const result = await generateDesignJson({
-      prompt: buildDesignerPrompt(userPrompt, gameType) + FREE_DESIGNER_JSON_SUFFIX,
-      timeoutMs: Math.max(timeoutMs, 20000)
+    const result = await generateJson({
+      prompt: buildDesignerPrompt(userPrompt, gameType, entities),
+      responseSchema: DESIGNER_RESPONSE_SCHEMA,
+      timeoutMs,
+      label: 'design' // cost-report attribution
     });
-    const subjects = subjectsFromDesignerResult(result);
-    if (!subjects) {
-      console.warn('[PromptDesigner] Free designer returned incomplete JSON, using local templates.');
-      return fallback();
-    }
-    return { source: 'free-llm', styleGuide: styleGuideFromDesignerResult(result), subjects };
+    const subjects = subjectsFromDesignerResult(result, entities);
+    if (!subjects) return fallback();
+    return { source: 'gemini', styleGuide: styleGuideFromDesignerResult(result), subjects, entities };
   } catch (err) {
-    console.warn('[PromptDesigner] Free designer failed, using local templates:', err.message);
+    console.warn('[PromptDesigner] Gemini design failed, using local templates:', err.message);
     return fallback();
   }
 }
@@ -364,9 +421,9 @@ export async function designAssetPrompts({ userPrompt, gameType, themeKey, asset
  */
 const GAMEPLAY_SLOTS = new Set(['player', 'player_sheet', 'enemy', 'obstacle', 'projectile']);
 
-// Keyed sprite slots ask for a chroma-key background on the Gemini path (see
-// CHROMA_KEYS in slotSpecs): platform is keyed too but isn't a "gameplay accent" slot.
-const KEYED_SPRITE_SLOTS = new Set([...GAMEPLAY_SLOTS, 'platform']);
+// Keyed sprite slots ask for a chroma-key background (see CHROMA_KEYS in
+// slotSpecs): platform and collectible are keyed too but aren't "gameplay accent" slots.
+const KEYED_SPRITE_SLOTS = new Set([...GAMEPLAY_SLOTS, 'platform', 'collectible']);
 
 // Palette-collision guard for the chroma color: a green goblin on a green screen
 // gets flood-keyed into nothing, so green-leaning subjects get the magenta screen
@@ -393,7 +450,7 @@ export function chromaFromPrompt(prompt) {
   return null;
 }
 
-export function buildFinalPrompt(slotKey, subjects, styleGuide, { free = false } = {}) {
+export function buildFinalPrompt(slotKey, subjects, styleGuide, { userNamed = false } = {}) {
   const spec = SLOT_SPECS[slotKey];
   const subject = subjects[slotKey] ?? (spec.subjectKey ? subjects[spec.subjectKey] : undefined);
   const base = `${styleGuide.styleSummary}, 16-bit pixel art style, flat 2D game asset, sharp pixels, clear outlines`;
@@ -401,8 +458,21 @@ export function buildFinalPrompt(slotKey, subjects, styleGuide, { free = false }
 
   let style;
   if (GAMEPLAY_SLOTS.has(slotKey)) {
-    style = `${base}, dominant colors: ${accent}, vivid and highly saturated, bold dark ` +
+    // Accent-as-dominant is the readability rule for designer-invented sprites —
+    // but when the USER named the entity ("spikes"), identity beats palette: a
+    // lava world's complementary teal accent must not repaint spikes blue. The
+    // named branch keeps saturation/outline/silhouette (contrast survives) and
+    // demotes the accent to rim-light/trim.
+    const colorClause = userNamed
+      ? `its natural iconic colors, accented with ${accent} rim-light and trim details`
+      : `dominant colors: ${accent}`;
+    style = `${base}, ${colorClause}, vivid and highly saturated, bold dark ` +
       `outline, strong silhouette, must stand out instantly against a dark muted environment`;
+  } else if (slotKey === 'collectible') {
+    // Pickups read as rewards: bright metallic gold, never the accent hue (a coin
+    // must look like a coin) — unless the designer's subject says otherwise.
+    style = `${base}, bright iconic colors with a metallic gold default, glowing ` +
+      `highlight, bold dark outline, instantly readable at very small size`;
   } else if (slotKey === 'background_far') {
     style = `${base}, color palette ${styleGuide.colorPalette}, muted desaturated tones, ` +
       `soft atmospheric haze, gentle contrast so foreground gameplay elements stand out`;
@@ -414,13 +484,8 @@ export function buildFinalPrompt(slotKey, subjects, styleGuide, { free = false }
     style = `${base}, color palette ${styleGuide.colorPalette}, medium-dark tones with ` +
       `a clearly defined lighter top edge`;
   }
-  // Free-path variant scaffold (e.g. player_sheet's 2×2 four-frame ask) — must stay
-  // in lockstep with the variant spec runSheetSlot selects.
-  const scaffold = (free && spec.freeVariant?.scaffold) || spec.scaffold;
-  // Chroma backgrounds are a Gemini-path ask only — sana's exact-hex compliance is
-  // unproven, and the flood keyer handles whichever backdrop actually arrives.
-  const chroma = (!free && KEYED_SPRITE_SLOTS.has(slotKey))
+  const chroma = KEYED_SPRITE_SLOTS.has(slotKey)
     ? pickChromaColor(`${subject || ''} ${style}`)
     : null;
-  return scaffold(subject, style, { chroma });
+  return spec.scaffold(subject, style, { chroma });
 }

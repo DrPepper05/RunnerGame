@@ -1,6 +1,6 @@
 import { parsePromptKeywords, generateTitle, generateProceduralLayout } from './promptUtils';
 import { generateAssetDirections } from './assetPipeline/promptDesigner';
-import { compileFallbackUrls } from './assetPipeline/pipeline';
+import { isGeminiConfigured } from './assetPipeline/providers/geminiImage';
 
 /**
  * PlayMint Local Generation Service
@@ -137,8 +137,11 @@ export async function generateGameConfig(promptText, onProgress = () => {}) {
       layoutArray,
       assetDesignDirections
     };
-    // Raw fallback URLs; also the flag every consumer checks for "dynamic asset mode"
-    config.dynamicAssetUrls = compileFallbackUrls({ gameType, themeKey: theme, assetDesignDirections });
+    // Plain boolean flag: truthy routes every Phaser consumer to dyn_* textures
+    // (raw Pollinations fallback URLs are gone — Gemini is the only generator).
+    // Keyless runs get null so the game boots straight onto static theme art;
+    // failure paths also null it via toStaticThemeConfig.
+    config.dynamicAssetUrls = isGeminiConfigured() ? true : null;
 
     onProgress('[SYSTEM] Local generation complete!', 90);
 

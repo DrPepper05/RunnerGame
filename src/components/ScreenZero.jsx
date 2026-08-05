@@ -2,13 +2,13 @@ import React, { useState, useRef, useEffect } from 'react';
 import { GAME_PRESETS } from '../gameConfig';
 import { generateTitle } from '../game/promptUtils';
 import { generateGameConfig } from '../game/geminiService';
-import { generateGameAssets, compileFallbackUrls, isGeminiConfigured } from '../game/assetPipeline';
+import { generateGameAssets, isGeminiConfigured, createCancelToken } from '../game/assetPipeline';
 import { THEMES } from '../game/themes';
 
 const BANNED_WORDS = ['fuck', 'shit', 'bitch', 'cunt', 'ass', 'dick', 'pussy', 'cock', 'nigger', 'faggot'];
 
 const AVAILABLE_MODES = [
-  { key: 'standard', label: 'Runner', desc: 'Fast-paced infinite progression runner. Avoid obstacles, collect crates.' },
+  { key: 'standard', label: 'Runner', desc: 'Fast-paced infinite progression runner. Avoid obstacles, collect coins.' },
   { key: 'action_quest', label: 'Action Quest', desc: 'Classic 2D platformer with melee slashing, projectile combat, and patrolling enemies.' },
 ];
 
@@ -126,7 +126,7 @@ const WORLDS = [
 const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompleteTransition, currentConfig }) => {
   const [prompt, setPrompt] = useState('');
   const [isGenerating, setIsGenerating] = useState(false);
-  const [transitionPhase, setTransitionPhase] = useState('idle'); // idle | expanding | compiling | fading | done
+  const [transitionPhase, setTransitionPhase] = useState('idle'); // idle | compiling | fading | done
   const [selectedMode, setSelectedMode] = useState(null); // null | 'standard' | 'action_quest'
   const [showInfoModal, setShowInfoModal] = useState(false);
   const [terminalLogs, setTerminalLogs] = useState([]);
@@ -136,17 +136,19 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
   const [apiKey, setApiKey] = useState(() => localStorage.getItem('GEMINI_API_KEY') || '');
   const [keyInput, setKeyInput] = useState('');
   const [isEditingKey, setIsEditingKey] = useState(false);
-  // Three-state init: an explicit toggle choice ('1'/'0') wins; untouched (null)
-  // falls back to the baked-in env flag — must mirror isGeminiConfigured() exactly
-  // or the dropdown lies about which provider will actually run.
-  const [forcePollinations, setForcePollinations] = useState(() => {
-    const ls = localStorage.getItem('PM_FORCE_POLLINATIONS');
-    if (ls === '1') return true;
-    if (ls === '0') return false;
-    return import.meta.env.VITE_FORCE_POLLINATIONS === '1';
-  });
   const formRef = useRef(null);
   const [phaserLoaded, setPhaserLoaded] = useState(false);
+  // Cancellation for the in-flight generation run. Every new run cancels the
+  // previous one, and unmounting (✕ Close, successful boot, logo re-open cycle)
+  // cancels whatever is still running — this is what makes the Generate button
+  // work again after abandoning a run instead of requiring a page refresh.
+  const runTokenRef = useRef(null);
+  const beginRun = () => {
+    runTokenRef.current?.cancel();
+    runTokenRef.current = createCancelToken();
+    return runTokenRef.current;
+  };
+  useEffect(() => () => { runTokenRef.current?.cancel(); }, []);
 
   useEffect(() => {
     const handleFileComplete = (e) => {
@@ -172,6 +174,11 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
   // re-runs the effect and its cleanup would cancel the pending "done" timer — leaving
   // this full-screen container mounted invisibly over the game, swallowing every click.
   useEffect(() => {
+    // Overlay mode drives its own phases in processPrompt/startCompilationSequence:
+    // a phaser-load-complete fired by the game running UNDERNEATH (e.g. a restart)
+    // must not push the overlay to 'done' mid-generation — 'done' sets
+    // pointerEvents:none and would silently swallow the Close button.
+    if (isOverlay) return;
     if (phaserLoaded && transitionPhase === 'compiling') {
       setProgress(100);
       setTerminalLogs(prev => [...prev, '[ENGINE] World gate synchronized! Starting game...']);
@@ -239,7 +246,9 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
 
   const handleGenerate = (e) => {
     if (e) e.preventDefault();
-    processPrompt(prompt);
+    // processPrompt handles its own failures; this catch is a backstop so an
+    // unexpected throw can never strand the button in its disabled state.
+    processPrompt(prompt).catch(console.error);
   };
 
   const handleQuickStart = () => {
@@ -252,10 +261,9 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
   };
 
   // Terminal pipeline failure never dead-ends the flow: boot the game on built-in
-  // theme art instead. dynamicAssetUrls MUST be explicit null (not deleted):
-  // GameManagerScene.preload treats undefined as "compile raw Pollinations URLs",
-  // which is exactly the network path that just failed. Custom prompts have
-  // themeKey null — pick 'ice' (the generateRandom precedent, full multi-layer art).
+  // theme art instead (dynamicAssetUrls null routes every texture pick to the
+  // static theme set). Custom prompts have themeKey null — pick 'ice' (the
+  // generateRandom precedent, full multi-layer art).
   const toStaticThemeConfig = (config) => ({
     ...config,
     themeKey: THEMES[config.themeKey] ? config.themeKey : 'ice',
@@ -274,18 +282,34 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
 
   const startCompilationSequence = async (newConfig, promptText) => {
     if (isOverlay) {
+      // Overlay runs show the same compiler terminal as the first-run flow
+      // ('compiling' is the phase the progress UI actually renders — the old
+      // 'expanding' phase rendered nothing, which read as "Generate does nothing").
+      const token = beginRun();
       setIsGenerating(true);
-      setTransitionPhase('expanding');
+      setTransitionPhase('compiling');
+      setPhaserLoaded(false);
+      setTerminalLogs([
+        `[PROMPT] Input -> ${promptText ? `"${String(promptText).substring(0, 32)}"` : 'Quick Start Preset'}`,
+        `[ASSETS] Starting asset generation via ${isGeminiConfigured() ? 'Gemini AI' : 'built-in theme artwork (no API key)'}...`
+      ]);
+      setProgress(10);
       try {
-        const { preloadedImages, assetMeta } = await generateGameAssets({ config: newConfig });
-        setTimeout(() => {
-          setTransitionPhase('done');
-          onGenerate('custom', { ...newConfig, preloadedImages, assetMeta });
-        }, 700);
+        const { preloadedImages, assetMeta } = await generateGameAssets({
+          config: newConfig,
+          onProgress: assetProgressHandler,
+          cancelToken: token
+        });
+        if (token.cancelled) return; // stale run — the user moved on
+        setTransitionPhase('done');
+        onGenerate('custom', { ...newConfig, preloadedImages, assetMeta });
       } catch (err) {
+        if (token.cancelled || err.cancelled) return; // cancelled ≠ failed — no static boot
         console.error('[Compilation Error] Overlay generation failed, using static theme:', err);
         setTransitionPhase('done');
         onGenerate('custom', toStaticThemeConfig(newConfig));
+      } finally {
+        setIsGenerating(false); // the latch can never stick again
       }
       return;
     }
@@ -293,10 +317,9 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
     setIsGenerating(true);
     setTransitionPhase('compiling');
     setPhaserLoaded(false);
-    // NOTE: no onStartTransition(newConfig) here — booting Phaser before assets exist
-    // makes it fetch the raw Pollinations fallback URLs (bypassing the serial queue →
-    // 429s → "RUNTIME ERROR" dialog) for textures the preloaded boot replaces anyway.
-    // The single boot happens below with preloadedImages, same as the prompt path.
+    // NOTE: no onStartTransition(newConfig) here — booting Phaser before assets
+    // exist would render missing-texture boxes for textures the preloaded boot
+    // replaces anyway. The single boot happens below with preloadedImages.
 
     const displayPrompt = promptText ? `"${promptText.substring(0, 32)}"` : "Quick Start Preset";
     const themeName = (newConfig.themeKey || 'default').toUpperCase();
@@ -317,14 +340,15 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
       `[THEME]  Mapping assets -> [${themeName} THEME, ${modeName}]`,
       `[PHYSIC] Gravity: ${gravity}m/s² · ${speed} · Diff: ${difficulty}/10`,
       "[ENGINE] Synchronizing WebGL canvas & establishing world gate...",
-      `[ASSETS] Starting asset generation via ${isGeminiConfigured() ? 'Gemini AI' : 'free image engine'}...`
+      `[ASSETS] Starting asset generation via ${isGeminiConfigured() ? 'Gemini AI' : 'built-in theme artwork (no API key)'}...`
     ]);
     setProgress(75);
 
     try {
       const { preloadedImages, assetMeta } = await generateGameAssets({
         config: newConfig,
-        onProgress: assetProgressHandler
+        onProgress: assetProgressHandler,
+        cancelToken: beginRun() // defensive symmetry with the overlay paths
       });
 
       setTerminalLogs(prev => [...prev, '[ENGINE] Booting game scene and registering WebGL textures...']);
@@ -333,7 +357,7 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
       // Stay in the 'compiling' phase: the static boot fires phaser-load-complete,
       // which drives the normal 100% → fade sequence.
       console.error('[Compilation Error] Preset asset generation failed, using static theme:', err);
-      setTerminalLogs(prev => [...prev, '[ASSETS] AI generation unavailable — launching with built-in theme artwork instead.']);
+      setTerminalLogs(prev => [...prev, '[ASSETS] AI generation unavailable — launching with built-in theme artwork. Add a Gemini API key (top right) for AI assets.']);
       onStartTransition(toStaticThemeConfig(newConfig));
     }
   };
@@ -354,19 +378,48 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
     }
 
     if (isOverlay) {
+      // Same restructure as the overlay Quick Start branch: visible 'compiling'
+      // terminal, config generation INSIDE the try, stale-run guards, and a
+      // finally that releases the isGenerating latch no matter what.
+      const token = beginRun();
       setIsGenerating(true);
-      setTransitionPhase('expanding');
-      const result = await generateGameConfig(text);
+      setTransitionPhase('compiling');
+      setPhaserLoaded(false);
+      setTerminalLogs([
+        `[PROMPT] Input -> "${text.substring(0, 32)}"`,
+        `[ASSETS] Starting asset generation via ${isGeminiConfigured() ? 'Gemini AI' : 'built-in theme artwork (no API key)'}...`
+      ]);
+      setProgress(5);
+      let overlayConfig = null;
       try {
-        const { preloadedImages, assetMeta } = await generateGameAssets({ config: result.config, userPrompt: text });
-        setTimeout(() => {
-          setTransitionPhase('done');
-          onGenerate('custom', { ...result.config, preloadedImages, assetMeta });
-        }, 700);
-      } catch (err) {
-        console.error('[Compilation Error] Overlay generation failed, using static theme:', err);
+        const result = await generateGameConfig(text, (logText, progressVal) => {
+          setTerminalLogs(prev => [...prev, logText]);
+          setProgress(p => Math.max(p, Math.min(progressVal, 70)));
+        });
+        overlayConfig = result.config;
+        setProgress(75);
+        const { preloadedImages, assetMeta } = await generateGameAssets({
+          config: result.config,
+          userPrompt: text,
+          onProgress: assetProgressHandler,
+          cancelToken: token
+        });
+        if (token.cancelled) return; // stale run — the user moved on
         setTransitionPhase('done');
-        onGenerate('custom', toStaticThemeConfig(result.config));
+        onGenerate('custom', { ...result.config, preloadedImages, assetMeta });
+      } catch (err) {
+        if (token.cancelled || err.cancelled) return; // cancelled ≠ failed — no static boot
+        console.error('[Compilation Error] Overlay generation failed, using static theme:', err);
+        if (overlayConfig) {
+          setTransitionPhase('done');
+          onGenerate('custom', toStaticThemeConfig(overlayConfig));
+        } else {
+          // Config generation itself failed (local, near-infallible) — plain reset
+          setTransitionPhase('idle');
+          setProgress(0);
+        }
+      } finally {
+        setIsGenerating(false);
       }
       return;
     }
@@ -388,13 +441,14 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
       });
       generatedConfig = result.config;
 
-      setTerminalLogs(prev => [...prev, `[ENGINE] Starting asset generation via ${isGeminiConfigured() ? 'Gemini AI' : 'free image engine'}...`]);
+      setTerminalLogs(prev => [...prev, `[ENGINE] Starting asset generation via ${isGeminiConfigured() ? 'Gemini AI' : 'built-in theme artwork (no API key)'}...`]);
       setProgress(75);
 
       const { preloadedImages, assetMeta } = await generateGameAssets({
         config: result.config,
         userPrompt: text,
-        onProgress: assetProgressHandler
+        onProgress: assetProgressHandler,
+        cancelToken: beginRun() // defensive symmetry with the overlay paths
       });
 
       setTerminalLogs(prev => [...prev, '[ENGINE] Booting game scene and registering WebGL textures...']);
@@ -404,7 +458,7 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
       if (generatedConfig) {
         // Asset generation died — launch on built-in theme art instead of dead-ending.
         // Stay in 'compiling': the static boot fires phaser-load-complete → 100% → fade.
-        setTerminalLogs(prev => [...prev, '[ASSETS] AI generation unavailable — launching with built-in theme artwork instead.']);
+        setTerminalLogs(prev => [...prev, '[ASSETS] AI generation unavailable — launching with built-in theme artwork. Add a Gemini API key (top right) for AI assets.']);
         onStartTransition(toStaticThemeConfig(generatedConfig));
       } else {
         // Config generation itself failed (local, near-infallible) — plain reset
@@ -426,7 +480,9 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
     config.themeKey = theme;
     
     config.gameName = generateTitle("", mode, theme);
-    config.dynamicAssetUrls = compileFallbackUrls(config);
+    // Boolean flag only — true routes to AI (dyn_*) textures once generation
+    // succeeds; keyless goes straight to built-in theme art.
+    config.dynamicAssetUrls = isGeminiConfigured() ? true : null;
 
     startCompilationSequence(config, "Random Preset");
   };
@@ -539,43 +595,9 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
         animation: 'float 18s infinite alternate-reverse', zIndex: 2
       }} />
 
-      {/* Top right: Provider toggle + API key control */}
+      {/* Top right: API key control */}
       <div style={{ position: 'absolute', top: '16px', right: '16px', zIndex: 100, display: 'flex', gap: '12px', alignItems: 'center' }}>
-        {/* Provider Toggle */}
-        <div style={{
-          display: 'flex', gap: '6px', alignItems: 'center',
-          background: 'rgba(10, 15, 24, 0.85)',
-          border: '1px solid rgba(255,255,255,0.15)',
-          borderRadius: '8px', padding: '6px 8px',
-          backdropFilter: 'blur(8px)'
-        }}>
-          <label htmlFor="pm-provider-toggle" style={{ color: '#fff', fontSize: '12px', fontWeight: 600, whiteSpace: 'nowrap' }}>
-            Provider:
-          </label>
-          <select
-            id="pm-provider-toggle"
-            value={forcePollinations ? 'pollinations' : 'gemini'}
-            onChange={(e) => {
-              const isPoll = e.target.value === 'pollinations';
-              setForcePollinations(isPoll);
-              localStorage.setItem('PM_FORCE_POLLINATIONS', isPoll ? '1' : '0');
-              showToast(isPoll ? 'Using Pollinations (free, slower)' : 'Using Gemini (if key available)');
-            }}
-            style={{
-              padding: '4px 6px', fontSize: '12px',
-              background: 'rgba(0,0,0,0.4)', border: '1px solid rgba(255,255,255,0.12)',
-              borderRadius: '4px', color: '#fff', outline: 'none', cursor: 'pointer'
-            }}
-          >
-            <option value="gemini">Gemini</option>
-            <option value="pollinations">Pollinations</option>
-          </select>
-        </div>
-
-        {/* API Key Control */}
-        {!forcePollinations && (
-          <>
-            {HAS_ENV_GEMINI_KEY ? (
+        {HAS_ENV_GEMINI_KEY ? (
               <button
                 onClick={() => showToast('Using Gemini key from environment (.env)')}
                 title="Gemini key active (from .env)"
@@ -599,7 +621,7 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
                   localStorage.setItem('GEMINI_API_KEY', trimmed);
                   setApiKey(trimmed);
                   setIsEditingKey(false);
-                  showToast(trimmed ? 'Gemini key saved — assets will use Gemini AI.' : 'No key — using free image engine.');
+                  showToast(trimmed ? 'Gemini key saved — assets will use Gemini AI.' : 'No key — games will use built-in theme artwork.');
                 }}
                 style={{
                   display: 'flex', gap: '6px', alignItems: 'center',
@@ -637,8 +659,6 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
                 </button>
               </form>
             )}
-          </>
-        )}
       </div>
 
       {/* Close button for overlay */}

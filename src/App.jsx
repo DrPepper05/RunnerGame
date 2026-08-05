@@ -6,7 +6,7 @@ import CreatorPanel from './components/CreatorPanel';
 import ScreenZero from './components/ScreenZero';
 import { GAME_PRESETS } from './gameConfig';
 import { generateGameConfig } from './game/geminiService';
-import { generateGameAssets, regenerateAssetSlots, compileFallbackUrls } from './game/assetPipeline';
+import { generateGameAssets, regenerateAssetSlots } from './game/assetPipeline';
 import { generateTitle } from './game/promptUtils';
 import { interpretEditPrompt, resolveAssetTargets } from './game/gameEditor';
 import GameOverOverlay from './components/GameOverOverlay';
@@ -23,9 +23,9 @@ const getInitialState = () => {
         const importedConfig = JSON.parse(decodedConfigString);
         if (typeof importedConfig === 'object' && importedConfig !== null && Object.keys(importedConfig).length > 0) {
           if (!importedConfig.gameName) importedConfig.gameName = 'PlayMint Core';
-          if (!importedConfig.dynamicAssetUrls) {
-            importedConfig.dynamicAssetUrls = compileFallbackUrls(importedConfig);
-          }
+          // Share links carry config only (no images survive serialization) — boot
+          // on built-in theme art until an asset-caching story exists.
+          importedConfig.dynamicAssetUrls = null;
           return { presetKey: 'custom', liveParams: importedConfig, isImported: true };
         }
       } catch (error) {
@@ -34,8 +34,8 @@ const getInitialState = () => {
     }
   }
 
-  const initialPreset = { ...GAME_PRESETS['standard'], gameName: 'PlayMint Core' };
-  initialPreset.dynamicAssetUrls = compileFallbackUrls(initialPreset);
+  // Presets boot on built-in theme art (no AI generation without a prompt).
+  const initialPreset = { ...GAME_PRESETS['standard'], gameName: 'PlayMint Core', dynamicAssetUrls: null };
 
   return { presetKey: 'standard', liveParams: initialPreset, isImported: false };
 };
@@ -78,10 +78,6 @@ function App() {
     const geminiEnv = import.meta.env.VITE_GEMINI_API_KEY;
     if (geminiEnv) {
       localStorage.setItem('GEMINI_API_KEY', geminiEnv);
-    }
-    const polliEnv = import.meta.env.VITE_POLLINATIONS_API_KEY;
-    if (polliEnv) {
-      localStorage.setItem('POLLINATIONS_API_KEY', polliEnv);
     }
   }, []);
 
@@ -236,14 +232,13 @@ function App() {
   const applyPreset = (key) => {
     const mode = key === 'action_quest' ? 'action_quest' : 'standard';
     const theme = 'ice';
-    const resolvedMode = key === 'action_quest' ? 'platformer' : 'runner';
 
     setPresetKey(key);
     setLiveParams({
       ...GAME_PRESETS[key],
       themeKey: theme,
       gameName: generateTitle("", mode, theme),
-      dynamicAssetUrls: compileFallbackUrls({ ...GAME_PRESETS[key], themeKey: theme, gameType: resolvedMode })
+      dynamicAssetUrls: null // presets use built-in theme art
     });
   };
 
