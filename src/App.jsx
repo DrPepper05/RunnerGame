@@ -6,7 +6,9 @@ import CreatorPanel from './components/CreatorPanel';
 import ScreenZero from './components/ScreenZero';
 import { GAME_PRESETS } from './gameConfig';
 import { generateGameConfig } from './game/geminiService';
-import { generateGameAssets, regenerateAssetSlots } from './game/assetPipeline';
+import { regenerateAssetSlots } from './game/assetPipeline';
+import { generateOrRestoreAssets, updateGameArt, makePromptKey, getGameById } from './game/assetCache';
+import { encodeShareConfig, decodeShareConfig } from './game/shareLink';
 import { generateTitle } from './game/promptUtils';
 import { interpretEditPrompt, resolveAssetTargets } from './game/gameEditor';
 import GameOverOverlay from './components/GameOverOverlay';
@@ -18,15 +20,19 @@ const getInitialState = () => {
     const hash = window.location.hash;
     if (hash && hash.startsWith('#config=')) {
       try {
-        const encodedConfig = hash.replace('#config=', '');
-        const decodedConfigString = atob(encodedConfig);
-        const importedConfig = JSON.parse(decodedConfigString);
+        const importedConfig = decodeShareConfig(hash.replace('#config=', ''));
         if (typeof importedConfig === 'object' && importedConfig !== null && Object.keys(importedConfig).length > 0) {
           if (!importedConfig.gameName) importedConfig.gameName = 'PlayMint Core';
-          // Share links carry config only (no images survive serialization) — boot
-          // on built-in theme art until an asset-caching story exists.
+          // Links carry config only — boot on built-in theme art first. If the
+          // link's gameId is in this browser's asset cache, an App effect
+          // upgrades the boot to the cached AI art right after (one remount).
           importedConfig.dynamicAssetUrls = null;
-          return { presetKey: 'custom', liveParams: importedConfig, isImported: true };
+          return {
+            presetKey: 'custom',
+            liveParams: importedConfig,
+            isImported: true,
+            pendingRestoreId: importedConfig.gameId || null
+          };
         }
       } catch (error) {
         console.error('Failed to parse config from URL:', error);
@@ -72,6 +78,41 @@ function App() {
       window.removeEventListener('playmint-error', handlePlaymintError);
     };
   }, []);
+
+  // Share-link / F5 art restore: when the imported link names a game cached in
+  // THIS browser, upgrade the static boot to the cached AI art (one remount).
+  // A miss changes nothing — the static boot IS the fallback.
+  useEffect(() => {
+    const id = initialConfig.pendingRestoreId;
+    if (!id) return;
+    let stale = false;
+    getGameById(id).then((cached) => {
+      if (!cached || stale) return;
+      setLiveParams(prev => ({
+        ...prev, // the link's config wins (it may carry post-generation tweaks)
+        dynamicAssetUrls: true,
+        gameId: id,
+        preloadedImages: cached.preloadedImages,
+        assetMeta: cached.assetMeta
+      }));
+      setGameKey(k => k + 1);
+    });
+    return () => { stale = true; };
+  }, [initialConfig]);
+
+  // While a generated game is running, keep the share payload in the URL so F5
+  // restores the exact game (art via the local cache) and any copied URL is a
+  // working share link. Keyed on gameKey/hasStarted — NOT liveParams — so
+  // slider drags don't churn the address bar.
+  useEffect(() => {
+    if (!hasStarted) return;
+    try {
+      // Config-only hashes (no gameId) are valid too — they restore the same
+      // static-art game on F5, and never leave a STALE previous game in the URL.
+      window.history.replaceState(null, '', '#config=' + encodeShareConfig(liveParams));
+    } catch { /* URL/history quirks must never break the game */ }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gameKey, hasStarted]);
 
   // Persist environment variables to localStorage on startup to prevent cached/stale build variables
   useEffect(() => {
@@ -280,6 +321,10 @@ function App() {
     setIsMenuOpen(false);
     setIsGameOver(false);
     setGameOverData(null);
+    // Leaving the game: drop the share hash so a reload lands on ScreenZero.
+    try {
+      window.history.replaceState(null, '', window.location.pathname + window.location.search);
+    } catch { /* non-fatal */ }
   };
 
   const handlePromptGenerate = async (promptText) => {
@@ -341,27 +386,34 @@ function App() {
           const keptOld = Object.entries(newMeta)
             .filter(([slot, m]) => m.dropped && liveParams.preloadedImages[slot])
             .map(([slot]) => slot);
+          const mergedImages = { ...liveParams.preloadedImages };
+          const mergedMeta = { ...(liveParams.assetMeta?.slots || {}) };
+          for (const [slot, m] of Object.entries(newMeta)) {
+            if (m.dropped) {
+              // New version failed the quality gates — keep the old art if we had it
+              if (mergedImages[slot]) continue;
+              mergedMeta[slot] = m;
+              continue;
+            }
+            mergedImages[slot] = newImages[slot];
+            mergedMeta[slot] = m;
+          }
+          const mergedParams = {
+            ...liveParams,
+            ...edit.changes,
+            preloadedImages: mergedImages,
+            assetMeta: { ...(liveParams.assetMeta || {}), slots: mergedMeta }
+          };
           setGameKey(k => k + 1);
           setPresetKey('custom');
-          setLiveParams(prev => {
-            const mergedImages = { ...prev.preloadedImages };
-            const mergedMeta = { ...(prev.assetMeta?.slots || {}) };
-            for (const [slot, m] of Object.entries(newMeta)) {
-              if (m.dropped) {
-                // New version failed the quality gates — keep the old art if we had it
-                if (mergedImages[slot]) continue;
-                mergedMeta[slot] = m;
-                continue;
-              }
-              mergedImages[slot] = newImages[slot];
-              mergedMeta[slot] = m;
-            }
-            return {
-              ...prev,
-              ...edit.changes,
-              preloadedImages: mergedImages,
-              assetMeta: { ...(prev.assetMeta || {}), slots: mergedMeta }
-            };
+          setLiveParams(mergedParams);
+          // Persist the restyled art under the game's existing cache entry so a
+          // later cache hit / share-link restore shows the restyled art.
+          // Fire-and-forget: a cache failure must never affect the running game.
+          updateGameArt(liveParams.gameId, {
+            config: mergedParams,
+            preloadedImages: mergedImages,
+            assetMeta: mergedParams.assetMeta
           });
           const summary = keptOld.length
             ? `${edit.summary} — kept the previous ${keptOld.join(', ')} (new version failed quality checks)`
@@ -389,9 +441,10 @@ function App() {
       });
       const updatedConfig = result.config;
 
-      const { preloadedImages, assetMeta } = await generateGameAssets({
+      const gen = await generateOrRestoreAssets({
         config: updatedConfig,
         userPrompt: raw,
+        promptKey: makePromptKey(raw, updatedConfig.gameType),
         onProgress: (logText, progressVal) => {
           console.log(`[App.jsx Asset Progress] ${progressVal}% - ${logText}`);
           pushProgress(logText, progressVal);
@@ -403,7 +456,7 @@ function App() {
       // Apply — force fresh Phaser instance
       setGameKey(k => k + 1);
       setPresetKey('custom');
-      setLiveParams({ ...updatedConfig, preloadedImages, assetMeta });
+      setLiveParams({ ...gen.config, preloadedImages: gen.preloadedImages, assetMeta: gen.assetMeta });
     } catch (err) {
       console.error('[App.jsx] Prompt generation failed:', err);
       window.dispatchEvent(new CustomEvent('playmint-error', { detail: { message: err.message } }));

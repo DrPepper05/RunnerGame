@@ -135,7 +135,10 @@ export async function generateGameConfig(promptText, onProgress = () => {}) {
       actionEnemyCount,
       actionProjectileEnabled,
       layoutArray,
-      assetDesignDirections
+      assetDesignDirections,
+      // The originating prompt rides the config from here on: the asset cache
+      // keys on it, and share links carry it (it was previously transient).
+      sourcePrompt: promptText || ''
     };
     // Plain boolean flag: truthy routes every Phaser consumer to dyn_* textures
     // (raw Pollinations fallback URLs are gone — Gemini is the only generator).

@@ -2,7 +2,8 @@ import React, { useState, useRef, useEffect } from 'react';
 import { GAME_PRESETS } from '../gameConfig';
 import { generateTitle } from '../game/promptUtils';
 import { generateGameConfig } from '../game/geminiService';
-import { generateGameAssets, isGeminiConfigured, createCancelToken } from '../game/assetPipeline';
+import { isGeminiConfigured, createCancelToken } from '../game/assetPipeline';
+import { generateOrRestoreAssets, makePromptKey, makePresetKey } from '../game/assetCache';
 import { THEMES } from '../game/themes';
 
 const BANNED_WORDS = ['fuck', 'shit', 'bitch', 'cunt', 'ass', 'dick', 'pussy', 'cock', 'nigger', 'faggot'];
@@ -134,6 +135,9 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
   const [toastMessage, setToastMessage] = useState('');
   const [currentWorldIndex, setCurrentWorldIndex] = useState(0);
   const [apiKey, setApiKey] = useState(() => localStorage.getItem('GEMINI_API_KEY') || '');
+  // One-shot cache bypass: the next generation skips the local asset cache and
+  // pays for a fresh Gemini run. Captured + reset at run start (applies once).
+  const [forceFresh, setForceFresh] = useState(false);
   const [keyInput, setKeyInput] = useState('');
   const [isEditingKey, setIsEditingKey] = useState(false);
   const formRef = useRef(null);
@@ -280,7 +284,16 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
     if (progressVal != null) setProgress(p => Math.max(p, progressVal));
   };
 
-  const startCompilationSequence = async (newConfig, promptText) => {
+  // Preset cache hits reuse ART only: the freshly rolled preset config (new
+  // difficulty every run) keeps its values; the cached run contributes the game
+  // id and the dyn_* routing flag. Fresh runs boot the wrapper's stamped config.
+  const presetBootConfig = (freshConfig, result) => result.fromCache
+    ? { ...freshConfig, gameId: result.config.gameId, sourcePrompt: result.config.sourcePrompt, dynamicAssetUrls: true }
+    : result.config;
+
+  const startCompilationSequence = async (newConfig, promptText, cacheKey = null) => {
+    const fresh = forceFresh;
+    if (fresh) setForceFresh(false); // one-shot: applies to this run only
     if (isOverlay) {
       // Overlay runs show the same compiler terminal as the first-run flow
       // ('compiling' is the phase the progress UI actually renders — the old
@@ -295,14 +308,16 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
       ]);
       setProgress(10);
       try {
-        const { preloadedImages, assetMeta } = await generateGameAssets({
+        const gen = await generateOrRestoreAssets({
           config: newConfig,
+          promptKey: cacheKey,
           onProgress: assetProgressHandler,
-          cancelToken: token
+          cancelToken: token,
+          forceFresh: fresh
         });
         if (token.cancelled) return; // stale run — the user moved on
         setTransitionPhase('done');
-        onGenerate('custom', { ...newConfig, preloadedImages, assetMeta });
+        onGenerate('custom', { ...presetBootConfig(newConfig, gen), preloadedImages: gen.preloadedImages, assetMeta: gen.assetMeta });
       } catch (err) {
         if (token.cancelled || err.cancelled) return; // cancelled ≠ failed — no static boot
         console.error('[Compilation Error] Overlay generation failed, using static theme:', err);
@@ -345,14 +360,16 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
     setProgress(75);
 
     try {
-      const { preloadedImages, assetMeta } = await generateGameAssets({
+      const gen = await generateOrRestoreAssets({
         config: newConfig,
+        promptKey: cacheKey,
         onProgress: assetProgressHandler,
-        cancelToken: beginRun() // defensive symmetry with the overlay paths
+        cancelToken: beginRun(), // defensive symmetry with the overlay paths
+        forceFresh: fresh
       });
 
       setTerminalLogs(prev => [...prev, '[ENGINE] Booting game scene and registering WebGL textures...']);
-      onStartTransition({ ...newConfig, preloadedImages, assetMeta });
+      onStartTransition({ ...presetBootConfig(newConfig, gen), preloadedImages: gen.preloadedImages, assetMeta: gen.assetMeta });
     } catch (err) {
       // Stay in the 'compiling' phase: the static boot fires phaser-load-complete,
       // which drives the normal 100% → fade sequence.
@@ -377,6 +394,9 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
       return;
     }
 
+    const fresh = forceFresh;
+    if (fresh) setForceFresh(false); // one-shot: applies to this run only
+
     if (isOverlay) {
       // Same restructure as the overlay Quick Start branch: visible 'compiling'
       // terminal, config generation INSIDE the try, stale-run guards, and a
@@ -398,15 +418,17 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
         });
         overlayConfig = result.config;
         setProgress(75);
-        const { preloadedImages, assetMeta } = await generateGameAssets({
+        const gen = await generateOrRestoreAssets({
           config: result.config,
           userPrompt: text,
+          promptKey: makePromptKey(text, result.config.gameType),
           onProgress: assetProgressHandler,
-          cancelToken: token
+          cancelToken: token,
+          forceFresh: fresh
         });
         if (token.cancelled) return; // stale run — the user moved on
         setTransitionPhase('done');
-        onGenerate('custom', { ...result.config, preloadedImages, assetMeta });
+        onGenerate('custom', { ...gen.config, preloadedImages: gen.preloadedImages, assetMeta: gen.assetMeta });
       } catch (err) {
         if (token.cancelled || err.cancelled) return; // cancelled ≠ failed — no static boot
         console.error('[Compilation Error] Overlay generation failed, using static theme:', err);
@@ -444,15 +466,17 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
       setTerminalLogs(prev => [...prev, `[ENGINE] Starting asset generation via ${isGeminiConfigured() ? 'Gemini AI' : 'built-in theme artwork (no API key)'}...`]);
       setProgress(75);
 
-      const { preloadedImages, assetMeta } = await generateGameAssets({
+      const gen = await generateOrRestoreAssets({
         config: result.config,
         userPrompt: text,
+        promptKey: makePromptKey(text, result.config.gameType),
         onProgress: assetProgressHandler,
-        cancelToken: beginRun() // defensive symmetry with the overlay paths
+        cancelToken: beginRun(), // defensive symmetry with the overlay paths
+        forceFresh: fresh
       });
 
       setTerminalLogs(prev => [...prev, '[ENGINE] Booting game scene and registering WebGL textures...']);
-      onStartTransition({ ...result.config, preloadedImages, assetMeta });
+      onStartTransition({ ...gen.config, preloadedImages: gen.preloadedImages, assetMeta: gen.assetMeta });
     } catch (err) {
       console.error('[Compilation Error] Game generation or preloading failed:', err);
       if (generatedConfig) {
@@ -484,7 +508,7 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
     // succeeds; keyless goes straight to built-in theme art.
     config.dynamicAssetUrls = isGeminiConfigured() ? true : null;
 
-    startCompilationSequence(config, "Random Preset");
+    startCompilationSequence(config, "Random Preset", makePresetKey(mode));
   };
 
   const applyDifficulty = (config, mode) => {
@@ -809,6 +833,24 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
                     Quick Start
                   </button>
                 </form>
+
+                {/* One-shot cache bypass — only meaningful when a key can pay for a run */}
+                {apiKey && (
+                  <label style={{
+                    display: 'flex', alignItems: 'center', gap: '6px', marginTop: '8px',
+                    fontSize: '12px', color: 'rgba(255,255,255,0.75)',
+                    cursor: 'pointer', userSelect: 'none'
+                  }}>
+                    <input
+                      type="checkbox"
+                      checked={forceFresh}
+                      onChange={(e) => setForceFresh(e.target.checked)}
+                      disabled={isGenerating}
+                      style={{ accentColor: '#a259ff' }}
+                    />
+                    Force new AI art (paid) — skip the local cache on the next generation
+                  </label>
+                )}
 
                 {/* Game Mode Bubbles Selector */}
                 <div className="pm-screenzero-modes">

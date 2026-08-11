@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { GAME_PRESETS } from '../gameConfig';
 import { IconShare, IconExport, IconImport, IconReset, IconHome } from './Icons';
 import { downloadCostReport } from '../game/assetPipeline/costReport';
+import { encodeShareConfig } from '../game/shareLink';
 
 const RunnerControls = ({ liveParams, onSliderChange }) => (
   <>
@@ -156,7 +157,9 @@ const ShareGameButton = ({ liveParams }) => {
   const [status, setStatus] = useState('idle');
   const handleShare = () => {
     try {
-      const configString = btoa(JSON.stringify(liveParams));
+      // Slim v2 payload (strips images/assetMeta bulk, keeps gameId for the
+      // asset cache) — see src/game/shareLink.js.
+      const configString = encodeShareConfig(liveParams);
       const shareUrl = `${window.location.origin}${window.location.pathname}${window.location.search}#config=${configString}`;
       navigator.clipboard.writeText(shareUrl);
       setStatus('copied');
