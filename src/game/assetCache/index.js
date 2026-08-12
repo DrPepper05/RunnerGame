@@ -14,6 +14,7 @@
 import { generateGameAssets } from '../assetPipeline';
 import { loadImage } from '../assetPipeline/postprocess.js';
 import * as backend from './idbBackend.js';
+import * as server from './serverBackend.js';
 
 const SCHEMA_VERSION = 1;
 
@@ -76,7 +77,7 @@ const persistRun = async ({ id, promptKey, sourcePrompt, createdAt, config, prel
       images[slot] = await (await fetch(img.src)).blob();
     }
     const { preloadedImages: _pi, assetMeta: _am, ...cleanConfig } = config || {};
-    await backend.putGame({
+    const entry = {
       id,
       schemaVersion: SCHEMA_VERSION,
       promptKey: promptKey || null,
@@ -86,7 +87,11 @@ const persistRun = async ({ id, promptKey, sourcePrompt, createdAt, config, prel
       config: cleanConfig,
       assetMeta: assetMeta || null,
       images
-    });
+    };
+    await backend.putGame(entry);
+    // Write-through to the server cache (Vercel Blob) so the game's URL works
+    // cross-device. Fire-and-forget; disabled/failed server = local-only, silently.
+    server.putGame(entry);
   } catch (err) {
     console.warn('[AssetCache] persist skipped:', err?.message || err);
   }
@@ -152,19 +157,44 @@ export async function updateGameArt(gameId, { config, preloadedImages, assetMeta
 }
 
 // Share-link / F5 restore path: id → rehydrated game, or null (miss/corrupt).
+// Local first; on a local miss the server cache (Vercel Blob) is tried, and a
+// server hit is written back into IndexedDB so the next open on this device is
+// instant and free.
 export async function getGameById(id) {
-  const entry = await backend.getGame(id);
+  let entry = await backend.getGame(id);
+  let fromServer = false;
+  if (!entry) {
+    entry = await server.getGame(id);
+    fromServer = !!entry;
+  }
   if (!entry || entry.schemaVersion !== SCHEMA_VERSION) return null;
   try {
     const preloadedImages = await rehydrateEntry(entry);
-    backend.touch(entry.id);
+    if (fromServer) backend.putGame(entry);
+    else backend.touch(entry.id);
     return {
       config: { ...entry.config, gameId: entry.id, dynamicAssetUrls: true },
       preloadedImages,
       assetMeta: restoredMeta(entry)
     };
   } catch {
-    backend.deleteGame(id);
+    if (!fromServer) backend.deleteGame(id); // corrupt LOCAL entry only
     return null;
+  }
+}
+
+// Share-button backfill: make sure this game's art exists on the server cache —
+// covers games generated before the server backend existed and background
+// uploads that failed. Cheap when already uploaded (one HEAD request).
+export async function ensureUploaded(gameId) {
+  if (!gameId) return false;
+  try {
+    if (!(await server.isAvailable())) return false;
+    if (await server.hasGame(gameId)) return true;
+    const entry = await backend.getGame(gameId);
+    if (!entry) return false;
+    return !!(await server.putGame(entry));
+  } catch {
+    return false;
   }
 }

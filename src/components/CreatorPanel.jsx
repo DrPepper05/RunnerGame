@@ -3,6 +3,7 @@ import { GAME_PRESETS } from '../gameConfig';
 import { IconShare, IconExport, IconImport, IconReset, IconHome } from './Icons';
 import { downloadCostReport } from '../game/assetPipeline/costReport';
 import { encodeShareConfig } from '../game/shareLink';
+import { ensureUploaded } from '../game/assetCache';
 
 const RunnerControls = ({ liveParams, onSliderChange }) => (
   <>
@@ -157,6 +158,10 @@ const ShareGameButton = ({ liveParams }) => {
   const [status, setStatus] = useState('idle');
   const handleShare = () => {
     try {
+      // Backfill the server cache so this link carries real art cross-device
+      // (covers pre-server games and failed background uploads). Non-blocking —
+      // the copy happens regardless.
+      ensureUploaded(liveParams.gameId);
       // Slim v2 payload (strips images/assetMeta bulk, keeps gameId for the
       // asset cache) — see src/game/shareLink.js.
       const configString = encodeShareConfig(liveParams);

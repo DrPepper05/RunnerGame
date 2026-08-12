@@ -255,10 +255,26 @@ const DESIGNER_RESPONSE_SCHEMA = {
     enemy: { type: 'STRING', description: 'The patrolling enemy. If the player request names a specific creature (e.g. skeletons), it must be exactly that creature' },
     obstacle: { type: 'STRING', description: 'The stationary hazard. If the player request names one (e.g. spikes), depict exactly that' },
     collectible: { type: 'STRING', description: 'The small score pickup the player collects (default: a coin). If the player request names one (e.g. gems), exactly that' },
-    projectile: { type: 'STRING', description: 'The small ranged attack shot the hero fires' }
+    projectile: { type: 'STRING', description: 'The small ranged attack shot the hero fires' },
+    entityNouns: {
+      type: 'OBJECT',
+      description: 'Canonical identity of each asset: ONE lowercase singular noun (max two words) naming what it depicts, e.g. "skeleton", "lava golem", "ruby"',
+      properties: {
+        player: { type: 'STRING' },
+        enemy: { type: 'STRING' },
+        obstacle: { type: 'STRING' },
+        collectible: { type: 'STRING' },
+        projectile: { type: 'STRING' }
+      }
+    },
+    tags: {
+      type: 'ARRAY',
+      items: { type: 'STRING' },
+      description: '5-10 lowercase search tags for the whole set: art style, mood, era, environment (e.g. "pixel art", "gothic", "volcanic")'
+    }
   },
   // mid/near are optional — buildFinalPrompt falls back to the far subject via subjectKey
-  required: ['styleSummary', 'colorPalette', 'accentPalette', 'background_far', 'floor', 'platform', 'player', 'enemy', 'obstacle', 'collectible', 'projectile']
+  required: ['styleSummary', 'colorPalette', 'accentPalette', 'background_far', 'floor', 'platform', 'player', 'enemy', 'obstacle', 'collectible', 'projectile', 'entityNouns', 'tags']
 };
 
 function buildDesignerPrompt(userPrompt, gameType, entities = {}) {
@@ -286,7 +302,11 @@ function buildDesignerPrompt(userPrompt, gameType, entities = {}) {
     `- enemy: a patrolling enemy creature${must(entities.enemy)} (max 20 words)\n` +
     `- obstacle: a stationary hazard object${must(entities.hazard)} (max 15 words)\n` +
     `- collectible: the small score pickup the player collects, a coin by default${must(entities.collectible)} (max 12 words)\n` +
-    `- projectile: the small ranged shot the hero fires, matching the accentPalette (max 10 words)\n\n` +
+    `- projectile: the small ranged shot the hero fires, matching the accentPalette (max 10 words)\n` +
+    `- entityNouns: for player/enemy/obstacle/collectible/projectile, the ONE lowercase ` +
+    `singular noun (max two words) naming what each depicts — used for cataloguing, ` +
+    `not shown to players\n` +
+    `- tags: 5-10 lowercase search tags for the whole set (art style, mood, era, environment)\n\n` +
     `Rules:\n` +
     (anyNamed
       ? `- BINDING: entities the player named in the request are requirements, not ` +
@@ -325,6 +345,7 @@ export function localDesign({ gameType, themeKey, userPrompt = '', assetDesignDi
   for (const slot of [...BASELINE_SLOTS, 'projectile', 'collectible']) {
     subjects[slot] = SLOT_SPECS[slot].fallbackSubject(directions) || DEFAULT_SUBJECTS[slot];
   }
+  const entities = extractEntities(userPrompt);
   return {
     source: 'local',
     styleGuide: {
@@ -335,7 +356,8 @@ export function localDesign({ gameType, themeKey, userPrompt = '', assetDesignDi
     subjects,
     // Which slots the user explicitly named — buildFinalPrompt swaps their accent
     // treatment from "dominant colors" to rim-light so identity beats palette.
-    entities: extractEntities(userPrompt)
+    entities,
+    taxonomy: localTaxonomy({ gameType, themeKey, entities })
   };
 }
 
@@ -371,6 +393,57 @@ function subjectsFromDesignerResult(result, entities = {}) {
   return subjects;
 }
 
+/**
+ * Canonical per-asset identity nouns + free search tags (cache/search metadata,
+ * added 2026-08-11). The LLM tags comprehensively — words no keyword table knows —
+ * but matching-grade fields stay normalized here and USER-NAMED entities always
+ * win over the LLM's noun (binding beats description). Free tags are for
+ * search/analytics only, never for automatic reuse decisions.
+ */
+const normNoun = (value) => {
+  if (typeof value !== 'string') return null;
+  const cleaned = value.toLowerCase().replace(/[^a-z\s-]/g, ' ').trim()
+    .split(/\s+/).filter(Boolean).slice(-2).join(' ');
+  if (!cleaned) return null;
+  // Light singularization: "skeletons" → "skeleton"; leave "boss"/"glass" alone.
+  return cleaned.length > 3 && cleaned.endsWith('s') && !cleaned.endsWith('ss')
+    ? cleaned.slice(0, -1)
+    : cleaned;
+};
+
+function taxonomyFromDesignerResult(result, entities = {}) {
+  const llm = result?.entityNouns || {};
+  const ents = {};
+  const put = (slot, userNoun, llmNoun) => {
+    const v = normNoun(userNoun) || normNoun(llmNoun);
+    if (v) ents[slot] = v;
+  };
+  put('player', null, llm.player);
+  put('enemy', entities.enemy, llm.enemy);
+  put('obstacle', entities.hazard, llm.obstacle);
+  put('collectible', entities.collectible, llm.collectible);
+  put('projectile', null, llm.projectile);
+  const tags = Array.isArray(result?.tags)
+    ? [...new Set(result.tags
+        .filter(t => typeof t === 'string')
+        .map(t => t.toLowerCase().trim())
+        .filter(Boolean))].slice(0, 12)
+    : [];
+  return { entities: ents, tags };
+}
+
+// Keyless / design-failure fallback: tag what is confidently known — the mode,
+// the matched theme, and any user-named entities. Minimal but never empty-handed.
+function localTaxonomy({ gameType, themeKey, entities = {} }) {
+  const ents = {};
+  if (entities.enemy) ents.enemy = normNoun(entities.enemy);
+  if (entities.hazard) ents.obstacle = normNoun(entities.hazard);
+  if (entities.collectible) ents.collectible = normNoun(entities.collectible);
+  const tags = [gameType === 'platformer' ? 'platformer' : 'runner'];
+  if (themeKey) tags.push(themeKey);
+  return { entities: ents, tags };
+}
+
 function styleGuideFromDesignerResult(result) {
   return {
     styleSummary: result.styleSummary || 'retro game aesthetic',
@@ -401,7 +474,13 @@ export async function designAssetPrompts({ userPrompt, gameType, themeKey, asset
     });
     const subjects = subjectsFromDesignerResult(result, entities);
     if (!subjects) return fallback();
-    return { source: 'gemini', styleGuide: styleGuideFromDesignerResult(result), subjects, entities };
+    return {
+      source: 'gemini',
+      styleGuide: styleGuideFromDesignerResult(result),
+      subjects,
+      entities,
+      taxonomy: taxonomyFromDesignerResult(result, entities)
+    };
   } catch (err) {
     console.warn('[PromptDesigner] Gemini design failed, using local templates:', err.message);
     return fallback();

@@ -859,6 +859,17 @@ const DESIGN_SOURCE_LABELS = {
   local: 'local templates'
 };
 
+// Stamp each generated slot's meta with its canonical entity noun (design.taxonomy:
+// LLM-tagged when the designer ran, user-named/local otherwise). Cache and search
+// metadata only — never read by gameplay code. The sheet's output lands under the
+// 'player' key, so taxonomy slot names line up with meta keys as-is.
+function attachEntityTags(meta, design) {
+  const ents = design.taxonomy?.entities || {};
+  for (const [slot, noun] of Object.entries(ents)) {
+    if (meta[slot] && !meta[slot].dropped) meta[slot].entity = noun;
+  }
+}
+
 /**
  * Full generation for a game config: design prompts (LLM or local), then generate
  * all baseline assets. The ONE call every UI path uses.
@@ -916,7 +927,13 @@ export async function generateGameAssets({ config, userPrompt = '', onProgress =
 
   // assetMeta rides on the game config so provider usage stays inspectable after
   // generation (DevTools: window.__GAME_LIVE_CONFIG.assetMeta)
-  const assetMeta = { designSource: design.source, slots: meta, ...(cost ? { cost } : {}) };
+  attachEntityTags(meta, design);
+  const assetMeta = {
+    designSource: design.source,
+    slots: meta,
+    ...(design.taxonomy?.tags?.length ? { tags: design.taxonomy.tags } : {}),
+    ...(cost ? { cost } : {})
+  };
   return { preloadedImages, meta, promptSet: finalPrompts, design, assetMeta };
 }
 
@@ -985,5 +1002,6 @@ export async function regenerateAssetSlots({ config, instruction = '', slots, on
     95
   );
   reportRunCost(onProgress);
+  attachEntityTags(meta, design);
   return { preloadedImages, meta, design };
 }
