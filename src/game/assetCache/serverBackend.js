@@ -12,7 +12,6 @@
 
 import { upload } from '@vercel/blob/client';
 
-const BASE = (import.meta.env.VITE_BLOB_BASE_URL || '').replace(/\/+$/, '');
 const UPLOAD_ENDPOINT = '/api/games/upload';
 
 let warned = false;
@@ -22,24 +21,53 @@ const warnOnce = (err) => {
   console.warn('[AssetCache/server] degraded to local-only:', err?.message || err);
 };
 
-export const isAvailable = async () => !!BASE;
+// The store's public base URL is self-configuring: the upload endpoint derives
+// it from the server-side token (GET), so no client env var is required on the
+// deployed site. Resolution order: VITE_BLOB_BASE_URL override (local dev,
+// where /api doesn't exist) → localStorage cache → one GET per session.
+const ENV_BASE = (import.meta.env.VITE_BLOB_BASE_URL || '').replace(/\/+$/, '');
+let basePromise = null;
+const resolveBase = () => {
+  if (ENV_BASE) return Promise.resolve(ENV_BASE);
+  if (!basePromise) {
+    basePromise = (async () => {
+      try {
+        const cached = localStorage.getItem('PM_BLOB_BASE');
+        if (cached) return cached;
+        const res = await fetch(UPLOAD_ENDPOINT);
+        if (!res.ok) return '';
+        const { baseUrl } = await res.json();
+        if (baseUrl) {
+          try { localStorage.setItem('PM_BLOB_BASE', baseUrl); } catch { /* quota — refetch next session */ }
+        }
+        return baseUrl || '';
+      } catch {
+        return ''; // no endpoint (plain vite dev) or offline — local-only
+      }
+    })();
+  }
+  return basePromise;
+};
 
-const metaUrl = (id) => `${BASE}/games/${id}/meta.json`;
-const slotUrl = (id, slot) => `${BASE}/games/${id}/${slot}.png`;
+export const isAvailable = async () => !!(await resolveBase());
+
+const metaUrl = (base, id) => `${base}/games/${id}/meta.json`;
+const slotUrl = (base, id, slot) => `${base}/games/${id}/${slot}.png`;
 
 // Remote entry → the same shape idbBackend stores, so rehydrateEntry and the
 // local write-back consume it unchanged.
 export const getGame = async (id) => {
-  if (!BASE || !id) return null;
+  const base = id ? await resolveBase() : '';
+  if (!base) return null;
   try {
-    const metaRes = await fetch(metaUrl(id), { cache: 'no-cache' });
+    const metaRes = await fetch(metaUrl(base, id), { cache: 'no-cache' });
     if (!metaRes.ok) return null;
     const meta = await metaRes.json();
     const slots = Array.isArray(meta.slots) ? meta.slots : [];
     if (!slots.length) return null;
     const images = {};
     await Promise.all(slots.map(async (slot) => {
-      const res = await fetch(slotUrl(id, slot));
+      const res = await fetch(slotUrl(base, id, slot));
       if (!res.ok) throw new Error(`missing slot ${slot}`);
       images[slot] = await res.blob();
     }));
@@ -62,9 +90,10 @@ export const getGame = async (id) => {
 
 // Cheap existence probe for ensureUploaded (no image downloads).
 export const hasGame = async (id) => {
-  if (!BASE || !id) return false;
+  const base = id ? await resolveBase() : '';
+  if (!base) return false;
   try {
-    const res = await fetch(metaUrl(id), { method: 'HEAD', cache: 'no-cache' });
+    const res = await fetch(metaUrl(base, id), { method: 'HEAD', cache: 'no-cache' });
     return res.ok;
   } catch {
     return false;
@@ -72,7 +101,8 @@ export const hasGame = async (id) => {
 };
 
 export const putGame = async (entry) => {
-  if (!BASE || !entry?.id || !entry.config) return null;
+  if (!entry?.id || !entry.config) return null;
+  if (!(await resolveBase())) return null; // no store reachable — stay local-only
   try {
     const slots = Object.keys(entry.images || {});
     if (!slots.length) return null;
