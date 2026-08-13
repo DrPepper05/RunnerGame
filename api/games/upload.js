@@ -35,7 +35,7 @@ export default async function handler(req, res) {
       res.status(404).json({ error: 'Blob store not configured' });
       return;
     }
-    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.setHeader('Cache-Control', 'public, max-age=300');
     res.status(200).json({ baseUrl });
     return;
   }

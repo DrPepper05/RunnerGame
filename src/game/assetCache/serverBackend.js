@@ -23,28 +23,18 @@ const warnOnce = (err) => {
 
 // The store's public base URL is self-configuring: the upload endpoint derives
 // it from the server-side token (GET), so no client env var is required on the
-// deployed site. Resolution order: VITE_BLOB_BASE_URL override (local dev,
-// where /api doesn't exist) → localStorage cache → one GET per session.
+// deployed site. Memoized per session only — the GET is HTTP-cached (1h) and a
+// persistent cache would go stale the moment the store is swapped.
+// VITE_BLOB_BASE_URL survives as a local-dev override (plain vite has no /api).
 const ENV_BASE = (import.meta.env.VITE_BLOB_BASE_URL || '').replace(/\/+$/, '');
 let basePromise = null;
 const resolveBase = () => {
   if (ENV_BASE) return Promise.resolve(ENV_BASE);
   if (!basePromise) {
-    basePromise = (async () => {
-      try {
-        const cached = localStorage.getItem('PM_BLOB_BASE');
-        if (cached) return cached;
-        const res = await fetch(UPLOAD_ENDPOINT);
-        if (!res.ok) return '';
-        const { baseUrl } = await res.json();
-        if (baseUrl) {
-          try { localStorage.setItem('PM_BLOB_BASE', baseUrl); } catch { /* quota — refetch next session */ }
-        }
-        return baseUrl || '';
-      } catch {
-        return ''; // no endpoint (plain vite dev) or offline — local-only
-      }
-    })();
+    basePromise = fetch(UPLOAD_ENDPOINT)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => data?.baseUrl || '')
+      .catch(() => ''); // no endpoint (plain vite dev) or offline — local-only
   }
   return basePromise;
 };
