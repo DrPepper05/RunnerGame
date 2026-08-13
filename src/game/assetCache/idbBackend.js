@@ -137,6 +137,15 @@ export const putGame = async (entry) => {
   return id;
 };
 
+// All entries WITHOUT their image blobs (candidate list for the reuse matcher),
+// most-recently-used first. `imageSlots` keeps the slot names so the ladder knows
+// what a base set contains. Failure resolves to [] — reads as "no candidates".
+export const listGames = () =>
+  withStore('readonly', (store) => req(store.getAll()))
+    .then((all) => (all || [])
+      .map(({ images, ...rest }) => ({ ...rest, imageSlots: Object.keys(images || {}) }))
+      .sort((a, b) => (b.lastAccess || 0) - (a.lastAccess || 0)));
+
 export const touch = (id) => {
   if (!id) return Promise.resolve(false);
   return withStore('readwrite', async (store) => {

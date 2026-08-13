@@ -928,6 +928,9 @@ export async function generateGameAssets({ config, userPrompt = '', onProgress =
   // assetMeta rides on the game config so provider usage stays inspectable after
   // generation (DevTools: window.__GAME_LIVE_CONFIG.assetMeta)
   attachEntityTags(meta, design);
+  if (design.taxonomy?.tags?.length) {
+    onProgress(`[DESIGN] Tags: ${design.taxonomy.tags.join(', ')}`, null);
+  }
   const assetMeta = {
     designSource: design.source,
     slots: meta,
@@ -959,7 +962,7 @@ function reportRunCost(onProgress) {
  * designer so the new art follows the request; the caller merges the returned
  * images/meta over the retained ones and remounts the game.
  */
-export async function regenerateAssetSlots({ config, instruction = '', slots, onProgress = () => {} }) {
+export async function regenerateAssetSlots({ config, instruction = '', slots, onProgress = () => {}, cancelToken = null }) {
   if (!gemini.isGeminiConfigured()) {
     throw new Error('No Gemini API key configured — asset regeneration requires a key.');
   }
@@ -994,7 +997,7 @@ export async function regenerateAssetSlots({ config, instruction = '', slots, on
     }
   }
 
-  const { preloadedImages, meta } = await generateAssets({ finalPrompts, slots, onProgress });
+  const { preloadedImages, meta } = await generateAssets({ finalPrompts, slots, onProgress, cancelToken });
 
   const updated = Object.values(meta).filter(m => !m.dropped).length;
   onProgress(
@@ -1003,5 +1006,8 @@ export async function regenerateAssetSlots({ config, instruction = '', slots, on
   );
   reportRunCost(onProgress);
   attachEntityTags(meta, design);
+  if (design.taxonomy?.tags?.length) {
+    onProgress(`[DESIGN] Tags: ${design.taxonomy.tags.join(', ')}`, null);
+  }
   return { preloadedImages, meta, design };
 }

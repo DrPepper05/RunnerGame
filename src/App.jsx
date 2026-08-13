@@ -459,7 +459,10 @@ function App() {
       setLiveParams({ ...gen.config, preloadedImages: gen.preloadedImages, assetMeta: gen.assetMeta });
     } catch (err) {
       console.error('[App.jsx] Prompt generation failed:', err);
-      window.dispatchEvent(new CustomEvent('playmint-error', { detail: { message: err.message } }));
+      const message = err.cacheOnlyMiss
+        ? 'Cache only is ON and nothing cached matches this prompt. Turn the toggle off on the generator screen (top right) to create new art.'
+        : err.message;
+      window.dispatchEvent(new CustomEvent('playmint-error', { detail: { message } }));
       throw err;
     } finally {
       setRegenState(null);

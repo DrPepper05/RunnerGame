@@ -135,9 +135,22 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
   const [toastMessage, setToastMessage] = useState('');
   const [currentWorldIndex, setCurrentWorldIndex] = useState(0);
   const [apiKey, setApiKey] = useState(() => localStorage.getItem('GEMINI_API_KEY') || '');
-  // One-shot cache bypass: the next generation skips the local asset cache and
-  // pays for a fresh Gemini run. Captured + reset at run start (applies once).
-  const [forceFresh, setForceFresh] = useState(false);
+  // "Cache only" (persisted): hard no-image-spend mode — the cache ladder reuses
+  // matched art or boots built-in theme art, never generating images. The asset
+  // cache reads PM_FORCE_CACHE itself at run start; this state only drives the UI.
+  const [cacheOnly, setCacheOnly] = useState(() => {
+    try { return localStorage.getItem('PM_FORCE_CACHE') === '1'; } catch { return false; }
+  });
+  const toggleCacheOnly = () => {
+    setCacheOnly((prev) => {
+      const next = !prev;
+      try {
+        if (next) localStorage.setItem('PM_FORCE_CACHE', '1');
+        else localStorage.removeItem('PM_FORCE_CACHE');
+      } catch { /* private mode — session-only toggle */ }
+      return next;
+    });
+  };
   const [keyInput, setKeyInput] = useState('');
   const [isEditingKey, setIsEditingKey] = useState(false);
   const formRef = useRef(null);
@@ -292,8 +305,6 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
     : result.config;
 
   const startCompilationSequence = async (newConfig, promptText, cacheKey = null) => {
-    const fresh = forceFresh;
-    if (fresh) setForceFresh(false); // one-shot: applies to this run only
     if (isOverlay) {
       // Overlay runs show the same compiler terminal as the first-run flow
       // ('compiling' is the phase the progress UI actually renders — the old
@@ -312,8 +323,7 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
           config: newConfig,
           promptKey: cacheKey,
           onProgress: assetProgressHandler,
-          cancelToken: token,
-          forceFresh: fresh
+          cancelToken: token
         });
         if (token.cancelled) return; // stale run — the user moved on
         setTransitionPhase('done');
@@ -364,8 +374,7 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
         config: newConfig,
         promptKey: cacheKey,
         onProgress: assetProgressHandler,
-        cancelToken: beginRun(), // defensive symmetry with the overlay paths
-        forceFresh: fresh
+        cancelToken: beginRun() // defensive symmetry with the overlay paths
       });
 
       setTerminalLogs(prev => [...prev, '[ENGINE] Booting game scene and registering WebGL textures...']);
@@ -374,7 +383,9 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
       // Stay in the 'compiling' phase: the static boot fires phaser-load-complete,
       // which drives the normal 100% → fade sequence.
       console.error('[Compilation Error] Preset asset generation failed, using static theme:', err);
-      setTerminalLogs(prev => [...prev, '[ASSETS] AI generation unavailable — launching with built-in theme artwork. Add a Gemini API key (top right) for AI assets.']);
+      if (!err.cacheOnlyMiss) { // cache-only miss already explained itself via onProgress
+        setTerminalLogs(prev => [...prev, '[ASSETS] AI generation unavailable — launching with built-in theme artwork. Add a Gemini API key (top right) for AI assets.']);
+      }
       onStartTransition(toStaticThemeConfig(newConfig));
     }
   };
@@ -393,9 +404,6 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
       generateRandom();
       return;
     }
-
-    const fresh = forceFresh;
-    if (fresh) setForceFresh(false); // one-shot: applies to this run only
 
     if (isOverlay) {
       // Same restructure as the overlay Quick Start branch: visible 'compiling'
@@ -423,8 +431,7 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
           userPrompt: text,
           promptKey: makePromptKey(text, result.config.gameType),
           onProgress: assetProgressHandler,
-          cancelToken: token,
-          forceFresh: fresh
+          cancelToken: token
         });
         if (token.cancelled) return; // stale run — the user moved on
         setTransitionPhase('done');
@@ -471,8 +478,7 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
         userPrompt: text,
         promptKey: makePromptKey(text, result.config.gameType),
         onProgress: assetProgressHandler,
-        cancelToken: beginRun(), // defensive symmetry with the overlay paths
-        forceFresh: fresh
+        cancelToken: beginRun() // defensive symmetry with the overlay paths
       });
 
       setTerminalLogs(prev => [...prev, '[ENGINE] Booting game scene and registering WebGL textures...']);
@@ -482,7 +488,9 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
       if (generatedConfig) {
         // Asset generation died — launch on built-in theme art instead of dead-ending.
         // Stay in 'compiling': the static boot fires phaser-load-complete → 100% → fade.
-        setTerminalLogs(prev => [...prev, '[ASSETS] AI generation unavailable — launching with built-in theme artwork. Add a Gemini API key (top right) for AI assets.']);
+        if (!err.cacheOnlyMiss) { // cache-only miss already explained itself via onProgress
+          setTerminalLogs(prev => [...prev, '[ASSETS] AI generation unavailable — launching with built-in theme artwork. Add a Gemini API key (top right) for AI assets.']);
+        }
         onStartTransition(toStaticThemeConfig(generatedConfig));
       } else {
         // Config generation itself failed (local, near-infallible) — plain reset
@@ -619,8 +627,24 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
         animation: 'float 18s infinite alternate-reverse', zIndex: 2
       }} />
 
-      {/* Top right: API key control */}
+      {/* Top right: cache-only toggle + API key control */}
       <div style={{ position: 'absolute', top: '16px', right: '16px', zIndex: 100, display: 'flex', gap: '12px', alignItems: 'center' }}>
+        <button
+          onClick={toggleCacheOnly}
+          disabled={isGenerating}
+          title={'Cache only: reuse cached art (free) instead of generating. No cached match = built-in theme art. Never spends on image generation.'}
+          style={{
+            height: '32px', padding: '0 10px', borderRadius: '8px',
+            fontSize: '12px', fontWeight: 700, cursor: 'pointer',
+            display: 'flex', alignItems: 'center', gap: '5px',
+            backdropFilter: 'blur(8px)',
+            ...(cacheOnly
+              ? { background: 'rgba(0, 229, 153, 0.15)', border: '1px solid var(--pm-accent-teal)', color: 'var(--pm-accent-teal)' }
+              : { background: 'rgba(255,255,255,0.08)', border: '1px solid rgba(255,255,255,0.15)', color: 'rgba(255,255,255,0.6)' })
+          }}
+        >
+          💾 Cache only{cacheOnly ? ' ✓' : ''}
+        </button>
         {HAS_ENV_GEMINI_KEY ? (
               <button
                 onClick={() => showToast('Using Gemini key from environment (.env)')}
@@ -834,23 +858,9 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
                   </button>
                 </form>
 
-                {/* One-shot cache bypass — only meaningful when a key can pay for a run */}
-                {apiKey && (
-                  <label style={{
-                    display: 'flex', alignItems: 'center', gap: '6px', marginTop: '8px',
-                    fontSize: '12px', color: 'rgba(255,255,255,0.75)',
-                    cursor: 'pointer', userSelect: 'none'
-                  }}>
-                    <input
-                      type="checkbox"
-                      checked={forceFresh}
-                      onChange={(e) => setForceFresh(e.target.checked)}
-                      disabled={isGenerating}
-                      style={{ accentColor: '#a259ff' }}
-                    />
-                    Force new AI art (paid) — skip the local cache on the next generation
-                  </label>
-                )}
+                {/* Fresh-art escape hatch lives in the Creator Panel now: ask it
+                    to "redraw everything" on a running game. The cache toggle
+                    moved to the top-right next to the API key controls. */}
 
                 {/* Game Mode Bubbles Selector */}
                 <div className="pm-screenzero-modes">

@@ -11,16 +11,27 @@
 // because the pipeline (which throws without a key) is never reached on a hit.
 // Every cache failure degrades to a miss; nothing here may break generation.
 
-import { generateGameAssets } from '../assetPipeline';
+import { generateGameAssets, regenerateAssetSlots, isGeminiConfigured } from '../assetPipeline';
 import { loadImage } from '../assetPipeline/postprocess.js';
 import * as backend from './idbBackend.js';
 import * as server from './serverBackend.js';
+import { matchCachedGame, localMatch } from './matcher.js';
 
 const SCHEMA_VERSION = 1;
 
 const readQualityMode = () => {
   try {
     return localStorage.getItem('PM_QUALITY_MODE') === '1';
+  } catch {
+    return false;
+  }
+};
+
+// "Cache only" toggle (ScreenZero top-right, persisted): hard no-image-spend
+// mode — matched cache art or built-in theme art, never a fresh image run.
+const readCacheOnly = () => {
+  try {
+    return localStorage.getItem('PM_FORCE_CACHE') === '1';
   } catch {
     return false;
   }
@@ -99,21 +110,121 @@ const persistRun = async ({ id, promptKey, sourcePrompt, createdAt, config, prel
 
 const restoredMeta = (entry) => ({ ...(entry.assetMeta || {}), restoredFromCache: true });
 
+// Tier 2 of the ladder: no exact hit — ask the matcher whether any cached set
+// fits the new prompt (LLM with a key, deterministic theme match without), then
+// reuse it whole or redraw only the clashing slots. Returns a full result object
+// or null (fall through the ladder). Never generates a full set.
+async function tryMatchedReuse({ config, userPrompt, promptKey, onProgress, cancelToken, cacheOnly }) {
+  let candidates = [];
+  try {
+    candidates = ((await backend.listGames()) || []).filter((e) => e.schemaVersion === SCHEMA_VERSION);
+  } catch {
+    return null;
+  }
+  if (!candidates.length) return null;
+
+  let verdict = null;
+  if (isGeminiConfigured()) {
+    try {
+      verdict = await matchCachedGame({ userPrompt, candidates });
+    } catch {
+      verdict = null; // matcher failure → deterministic fallback below
+    }
+  }
+  if (!verdict) verdict = localMatch({ userPrompt, candidates });
+  if (cancelToken?.cancelled) throw cancelledError();
+  if (!verdict?.matchId) return null;
+
+  // Cache-only never spends: reuse the whole set as-is even when the matcher
+  // suggested redraws. >3 clashing slots = mostly a different world — a full
+  // fresh generation gives better coherence than stitching.
+  const slots = cacheOnly ? [] : (verdict.replaceSlots || []);
+  if (slots.length > 3) return null;
+
+  const entry = await backend.getGame(verdict.matchId);
+  if (!entry || entry.schemaVersion !== SCHEMA_VERSION) return null; // evicted since listing
+  let baseImages;
+  try {
+    baseImages = await rehydrateEntry(entry, cancelToken);
+  } catch (err) {
+    if (err?.cancelled) throw err;
+    backend.deleteGame(entry.id);
+    return null;
+  }
+  backend.touch(entry.id);
+  const label = entry.config?.gameName || entry.sourcePrompt || entry.id.slice(0, 8);
+  const reason = verdict.reason ? ` (${verdict.reason})` : '';
+
+  if (!slots.length) {
+    // Whole-set reuse: the NEW prompt's config drives mode/physics; only art +
+    // frames/facing meta come from the entry. gameId stays the entry's — the App
+    // restore effect spreads the URL's config over cached art, so share/F5 work
+    // without persisting a duplicate entry.
+    onProgress?.(`[CACHE] Matched cached game "${label}"${reason} — reusing ${Object.keys(baseImages).length} image(s), $0 art spend`, 90);
+    if (cacheOnly && verdict.replaceSlots?.length) {
+      onProgress?.(`[CACHE] Cache only is ON — reused as-is (skipped redrawing: ${verdict.replaceSlots.join(', ')})`, null);
+    }
+    return {
+      config: { ...config, gameId: entry.id, sourcePrompt: userPrompt, dynamicAssetUrls: true },
+      preloadedImages: baseImages,
+      assetMeta: restoredMeta(entry),
+      fromCache: true
+    };
+  }
+
+  // Partial reuse: redraw only the clashing slots (~$0.04/slot vs ~$0.40/game).
+  onProgress?.(`[CACHE] Matched cached game "${label}"${reason} — reusing base art, redrawing: ${slots.join(', ')}`, 78);
+  const regenSlots = [...new Set(slots.map((s) => (s === 'player' ? 'player_sheet' : s)))];
+  let regen = null;
+  try {
+    regen = await regenerateAssetSlots({ config, instruction: userPrompt, slots: regenSlots, onProgress, cancelToken });
+  } catch (err) {
+    if (err?.cancelled) throw err;
+    onProgress?.('[CACHE] Redraw failed — reusing the cached art as-is.', null);
+  }
+  const mergedImages = { ...baseImages };
+  const mergedSlots = { ...(entry.assetMeta?.slots || {}) };
+  for (const [slot, m] of Object.entries(regen?.meta || {})) {
+    if (m.dropped) {
+      if (mergedImages[slot]) continue; // failed redraw — keep the base art
+      mergedSlots[slot] = m;
+      continue;
+    }
+    mergedImages[slot] = regen.preloadedImages[slot];
+    mergedSlots[slot] = m;
+  }
+  if (cancelToken?.cancelled) throw cancelledError();
+  // New pixels exist → persist a NEW entry under this prompt's key so the next
+  // identical prompt exact-hits. Base cost tally is stale for the merged set —
+  // strip it (the partial run's [COST] line already reported the real spend).
+  const { cost: _cost, ...metaBase } = entry.assetMeta || {};
+  const assetMeta = { ...metaBase, slots: mergedSlots, restoredFromCache: true };
+  const gameId = newGameId();
+  const stamped = { ...config, gameId, sourcePrompt: userPrompt, dynamicAssetUrls: true };
+  persistRun({ id: gameId, promptKey, sourcePrompt: userPrompt, config: stamped, preloadedImages: mergedImages, assetMeta });
+  return { config: stamped, preloadedImages: mergedImages, assetMeta, fromCache: true };
+}
+
 /**
  * The single wrapper every generation call site uses.
+ * Ladder: exact prompt match → matched reuse (LLM/local, whole or partial) →
+ * cache-only static fallback OR full generation.
  * Returns { config, preloadedImages, assetMeta, fromCache } — call sites must
  * spread the RETURNED config (it carries gameId/sourcePrompt, and on cache hits
  * dynamicAssetUrls is forced true so keyless restores route to dyn_* textures).
  */
-export async function generateOrRestoreAssets({ config, userPrompt = '', promptKey = null, onProgress, cancelToken, forceFresh = false }) {
-  if (!forceFresh && promptKey) {
+export async function generateOrRestoreAssets({ config, userPrompt = '', promptKey = null, onProgress, cancelToken }) {
+  const cacheOnly = readCacheOnly();
+
+  // Tier 1 — exact prompt match: instant whole-set restore.
+  if (promptKey) {
     const entry = await backend.findByPromptKey(promptKey);
     if (entry && entry.schemaVersion === SCHEMA_VERSION) {
       try {
         const preloadedImages = await rehydrateEntry(entry, cancelToken);
         backend.touch(entry.id);
         onProgress?.('[CACHE] Exact match found — restored artwork from local cache ($0 this run)', 90);
-        onProgress?.('[CACHE] Want a fresh look? Enable "Force new AI art" and generate again.', null);
+        onProgress?.('[CACHE] Want a fresh look? Open the Creator Panel in-game and ask it to redraw everything.', null);
         return {
           config: { ...entry.config, gameId: entry.id, sourcePrompt: entry.sourcePrompt || '', dynamicAssetUrls: true },
           preloadedImages,
@@ -127,6 +238,18 @@ export async function generateOrRestoreAssets({ config, userPrompt = '', promptK
     } else if (entry) {
       backend.deleteGame(entry.id); // schema mismatch — drop
     }
+  }
+
+  // Tier 2 — matched reuse (prompt runs only; presets keep their exact key).
+  if (String(userPrompt || '').trim()) {
+    const reused = await tryMatchedReuse({ config, userPrompt, promptKey, onProgress, cancelToken, cacheOnly });
+    if (reused) return reused;
+  }
+
+  // Tier 3 — cache-only miss: explain and hand the caller its static fallback.
+  if (cacheOnly) {
+    onProgress?.('[CACHE] Cache only is ON — no cached game matches this prompt. Launching built-in theme art (no image spend). Turn the toggle off (top right) to generate fresh AI art.', null);
+    throw Object.assign(new Error('cache-only: no cached match'), { cacheOnlyMiss: true });
   }
 
   const { preloadedImages, assetMeta } = await generateGameAssets({ config, userPrompt, onProgress, cancelToken });
