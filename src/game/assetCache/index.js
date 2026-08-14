@@ -12,6 +12,7 @@
 // Every cache failure degrades to a miss; nothing here may break generation.
 
 import { generateGameAssets, regenerateAssetSlots, isGeminiConfigured } from '../assetPipeline';
+import { resetUsageTally, getUsageTally } from '../assetPipeline/providers/geminiImage.js';
 import { loadImage } from '../assetPipeline/postprocess.js';
 import * as backend from './idbBackend.js';
 import * as server from './serverBackend.js';
@@ -90,6 +91,10 @@ const persistRun = async ({ id, promptKey, sourcePrompt, createdAt, config, prel
       images[slot] = await (await fetch(img.src)).blob();
     }
     const { preloadedImages: _pi, assetMeta: _am, ...cleanConfig } = config || {};
+    // `run` is run-scoped truth (tier/timing of ONE boot) — never persisted, or a
+    // later restore would replay a stale outcome. `cost` IS persisted: it becomes
+    // the entry's originalCost on restores.
+    const { run: _runScoped, ...persistedMeta } = assetMeta || {};
     const entry = {
       id,
       schemaVersion: SCHEMA_VERSION,
@@ -98,7 +103,7 @@ const persistRun = async ({ id, promptKey, sourcePrompt, createdAt, config, prel
       createdAt: createdAt || Date.now(),
       lastAccess: Date.now(),
       config: cleanConfig,
-      assetMeta: assetMeta || null,
+      assetMeta: assetMeta ? persistedMeta : null,
       images
     };
     await backend.putGame(entry);
@@ -111,13 +116,88 @@ const persistRun = async ({ id, promptKey, sourcePrompt, createdAt, config, prel
   }
 };
 
-const restoredMeta = (entry) => ({ ...(entry.assetMeta || {}), restoredFromCache: true });
+// ── Run-truth telemetry (2026-08-14, for the client's cost/hit-rate reporting) ──
+// assetMeta.cost is ALWAYS the CURRENT run's spend (an exact hit really is $0);
+// the persisted generation cost survives as assetMeta.originalCost. Every slot
+// carries source: 'cache'|'generated', and assetMeta.run summarizes the outcome
+// (tier, matched game, redrawn slots, wall time). `run` is run-scoped and is
+// stripped before persisting.
+
+const zeroCost = () => ({
+  estUsd: 0, imageCalls: 0, visionCalls: 0, imageFailures: 0, visionFailures: 0,
+  promptTokens: 0, outputTokens: 0, thoughtsTokens: 0, calls: []
+});
+
+const round4 = (n) => Math.round((n || 0) * 10000) / 10000;
+
+const mergeCosts = (...parts) => {
+  const sum = zeroCost();
+  for (const c of parts) {
+    if (!c) continue;
+    sum.estUsd += c.estUsd || 0;
+    sum.imageCalls += c.imageCalls || 0;
+    sum.visionCalls += c.visionCalls || 0;
+    sum.imageFailures += c.imageFailures || 0;
+    sum.visionFailures += c.visionFailures || 0;
+    sum.promptTokens += c.promptTokens || 0;
+    sum.outputTokens += c.outputTokens || 0;
+    sum.thoughtsTokens += c.thoughtsTokens || 0;
+    sum.calls.push(...(c.calls || []));
+  }
+  sum.estUsd = round4(sum.estUsd);
+  return sum;
+};
+
+const runInfo = (tier, t0, extra = {}) => ({
+  tier,
+  elapsedMs: Math.round(performance.now() - t0),
+  ...extra
+});
+
+// Per-browser outcome counters (PM_SPEND_TOTAL conventions) — the measured cache
+// hit rate + per-tier averages that feed the cost report's pricing projection.
+const STATS_KEY = 'PM_CACHE_STATS';
+const readStats = () => {
+  try {
+    const s = JSON.parse(localStorage.getItem(STATS_KEY));
+    return s && typeof s === 'object' ? s : null;
+  } catch {
+    return null;
+  }
+};
+const bumpStats = (field, usd = 0, matcherUsd = 0) => {
+  try {
+    const s = readStats() || {
+      exact: 0, reuse: 0, reusePartial: 0, fresh: 0, staticMiss: 0,
+      freshUsd: 0, partialUsd: 0, matcherUsd: 0, since: new Date().toISOString()
+    };
+    s[field] = (s[field] || 0) + 1;
+    if (field === 'fresh') s.freshUsd = round4((s.freshUsd || 0) + usd);
+    if (field === 'reusePartial') s.partialUsd = round4((s.partialUsd || 0) + usd);
+    s.matcherUsd = round4((s.matcherUsd || 0) + matcherUsd);
+    localStorage.setItem(STATS_KEY, JSON.stringify(s));
+  } catch { /* stats are best-effort */ }
+};
+export const getCacheStats = () => readStats();
+export const resetCacheStats = () => {
+  try { localStorage.removeItem(STATS_KEY); } catch { /* ignore */ }
+};
+
+const restoredMeta = (entry) => {
+  const { cost: originalCost, run: _run, ...rest } = entry.assetMeta || {};
+  const slots = {};
+  for (const [slot, m] of Object.entries(rest.slots || {})) slots[slot] = { ...m, source: 'cache' };
+  for (const slot of Object.keys(entry.images || {})) {
+    if (!slots[slot]) slots[slot] = { source: 'cache' };
+  }
+  return { ...rest, slots, ...(originalCost ? { originalCost } : {}), restoredFromCache: true };
+};
 
 // Tier 2 of the ladder: no exact hit — ask the matcher whether any cached set
 // fits the new prompt (LLM with a key, deterministic theme match without), then
 // reuse it whole or redraw only the clashing slots. Returns a full result object
 // or null (fall through the ladder). Never generates a full set.
-async function tryMatchedReuse({ config, userPrompt, promptKey, onProgress, cancelToken, cacheOnly }) {
+async function tryMatchedReuse({ config, userPrompt, promptKey, onProgress, cancelToken, cacheOnly, t0, box }) {
   // Candidates = this browser's cache ∪ the shared server population (cards are
   // entry-shaped, so the matcher consumes both interchangeably; local wins dedup).
   let candidates = [];
@@ -133,12 +213,18 @@ async function tryMatchedReuse({ config, userPrompt, promptKey, onProgress, canc
   if (!candidates.length) return null;
 
   let verdict = null;
+  let matcherCost = null;
   if (isGeminiConfigured()) {
+    // Snapshot the matcher call's cost NOW — the pipeline's own resetUsageTally
+    // (full gen or partial redraw) would otherwise wipe it from run attribution.
+    resetUsageTally();
     try {
       verdict = await matchCachedGame({ userPrompt, candidates });
     } catch {
       verdict = null; // matcher failure → deterministic fallback below
     }
+    matcherCost = getUsageTally();
+    if (box) box.matcherCost = matcherCost; // no-match → the fresh run still owns this spend
   }
   if (!verdict) verdict = localMatch({ userPrompt, candidates });
   if (cancelToken?.cancelled) throw cancelledError();
@@ -190,10 +276,24 @@ async function tryMatchedReuse({ config, userPrompt, promptKey, onProgress, canc
     if (cacheOnly && verdict.replaceSlots?.length) {
       onProgress?.(`[CACHE] Cache only is ON — reused as-is (skipped redrawing: ${verdict.replaceSlots.join(', ')})`, null);
     }
+    const cost = mergeCosts(matcherCost);
+    const assetMeta = {
+      ...restoredMeta(entry),
+      cost,
+      run: runInfo('reuse', t0, {
+        matchedGameId: entry.id,
+        matchedLabel: label,
+        reason: verdict.reason || '',
+        reusedSlots: Object.keys(baseImages),
+        generatedSlots: [],
+        estUsd: cost.estUsd
+      })
+    };
+    bumpStats('reuse', 0, matcherCost?.estUsd || 0);
     return {
       config: { ...config, gameId: entry.id, sourcePrompt: userPrompt, dynamicAssetUrls: true },
       preloadedImages: baseImages,
-      assetMeta: restoredMeta(entry),
+      assetMeta,
       fromCache: true
     };
   }
@@ -212,22 +312,38 @@ async function tryMatchedReuse({ config, userPrompt, promptKey, onProgress, canc
     onProgress?.('[CACHE] Redraw failed — reusing the cached art as-is.', null);
   }
   const mergedImages = { ...baseImages };
-  const mergedSlots = { ...(entry.assetMeta?.slots || {}) };
+  const baseMeta = restoredMeta(entry); // slots marked 'cache', cost → originalCost
+  const mergedSlots = { ...baseMeta.slots };
+  const generatedSlots = [];
   for (const [slot, m] of Object.entries(regen?.meta || {})) {
     if (m.dropped) {
       if (mergedImages[slot]) continue; // failed redraw — keep the base art
-      mergedSlots[slot] = m;
+      mergedSlots[slot] = { ...m, source: 'generated' };
       continue;
     }
     mergedImages[slot] = regen.preloadedImages[slot];
-    mergedSlots[slot] = m;
+    mergedSlots[slot] = { ...m, source: 'generated' };
+    generatedSlots.push(slot);
   }
   if (cancelToken?.cancelled) throw cancelledError();
+  // This run's true spend = the matcher call + the redraw run.
+  const cost = mergeCosts(matcherCost, regen?.cost);
+  const assetMeta = {
+    ...baseMeta,
+    slots: mergedSlots,
+    cost,
+    run: runInfo('reuse-partial', t0, {
+      matchedGameId: entry.id,
+      matchedLabel: label,
+      reason: verdict.reason || '',
+      reusedSlots: Object.keys(mergedImages).filter((s) => !generatedSlots.includes(s)),
+      generatedSlots,
+      estUsd: cost.estUsd
+    })
+  };
+  bumpStats('reusePartial', cost.estUsd, matcherCost?.estUsd || 0);
   // New pixels exist → persist a NEW entry under this prompt's key so the next
-  // identical prompt exact-hits. Base cost tally is stale for the merged set —
-  // strip it (the partial run's [COST] line already reported the real spend).
-  const { cost: _cost, ...metaBase } = entry.assetMeta || {};
-  const assetMeta = { ...metaBase, slots: mergedSlots, restoredFromCache: true };
+  // identical prompt exact-hits (persistRun strips the run-scoped block).
   const gameId = newGameId();
   const stamped = { ...config, gameId, sourcePrompt: userPrompt, dynamicAssetUrls: true };
   persistRun({ id: gameId, promptKey, sourcePrompt: userPrompt, config: stamped, preloadedImages: mergedImages, assetMeta });
@@ -243,9 +359,10 @@ async function tryMatchedReuse({ config, userPrompt, promptKey, onProgress, canc
  * dynamicAssetUrls is forced true so keyless restores route to dyn_* textures).
  */
 export async function generateOrRestoreAssets({ config, userPrompt = '', promptKey = null, onProgress, cancelToken }) {
+  const t0 = performance.now();
   const cacheOnly = readCacheOnly();
 
-  // Tier 1 — exact prompt match: instant whole-set restore.
+  // Tier 1 — exact prompt match: instant whole-set restore, exactly $0.
   if (promptKey) {
     const entry = await backend.findByPromptKey(promptKey);
     if (entry && entry.schemaVersion === SCHEMA_VERSION) {
@@ -254,10 +371,21 @@ export async function generateOrRestoreAssets({ config, userPrompt = '', promptK
         backend.touch(entry.id);
         onProgress?.('[CACHE] Exact match found — restored artwork from local cache ($0 this run)', 90);
         onProgress?.('[CACHE] Want a fresh look? Open the Creator Panel in-game and ask it to redraw everything.', null);
+        const assetMeta = {
+          ...restoredMeta(entry),
+          cost: zeroCost(),
+          run: runInfo('exact', t0, {
+            matchedGameId: entry.id,
+            reusedSlots: Object.keys(preloadedImages),
+            generatedSlots: [],
+            estUsd: 0
+          })
+        };
+        bumpStats('exact');
         return {
           config: { ...entry.config, gameId: entry.id, sourcePrompt: entry.sourcePrompt || '', dynamicAssetUrls: true },
           preloadedImages,
-          assetMeta: restoredMeta(entry),
+          assetMeta,
           fromCache: true
         };
       } catch (err) {
@@ -270,18 +398,22 @@ export async function generateOrRestoreAssets({ config, userPrompt = '', promptK
   }
 
   // Tier 2 — matched reuse (prompt runs only; presets keep their exact key).
+  // `box` carries the matcher call's cost out of a no-match so the fresh run
+  // below still owns that spend in its report.
+  const box = {};
   if (String(userPrompt || '').trim()) {
-    const reused = await tryMatchedReuse({ config, userPrompt, promptKey, onProgress, cancelToken, cacheOnly });
+    const reused = await tryMatchedReuse({ config, userPrompt, promptKey, onProgress, cancelToken, cacheOnly, t0, box });
     if (reused) return reused;
   }
 
   // Tier 3 — cache-only miss: explain and hand the caller its static fallback.
   if (cacheOnly) {
+    bumpStats('staticMiss');
     onProgress?.('[CACHE] Cache only is ON — no cached game matches this prompt. Launching built-in theme art (no image spend). Turn the toggle off (top right) to generate fresh AI art.', null);
     throw Object.assign(new Error('cache-only: no cached match'), { cacheOnlyMiss: true });
   }
 
-  return generateAndCache({ config, userPrompt, promptKey, onProgress, cancelToken });
+  return generateAndCache({ config, userPrompt, promptKey, onProgress, cancelToken, t0, extraCost: box.matcherCost });
 }
 
 /**
@@ -289,8 +421,22 @@ export async function generateOrRestoreAssets({ config, userPrompt = '', promptK
  * engine). skipSlots skips whole slots ('player' = playerless population sets);
  * awaitPersist makes the local put AND Blob upload complete before returning.
  */
-export async function generateAndCache({ config, userPrompt = '', promptKey = null, onProgress, cancelToken, skipSlots = [], awaitPersist = false }) {
+export async function generateAndCache({ config, userPrompt = '', promptKey = null, onProgress, cancelToken, skipSlots = [], awaitPersist = false, t0 = null, extraCost = null, trackStats = true }) {
+  const started = t0 ?? performance.now();
   const { preloadedImages, assetMeta } = await generateGameAssets({ config, userPrompt, onProgress, cancelToken, skipSlots });
+  // Run-truth telemetry: every generated slot is provenance-marked, the run cost
+  // includes any pre-generation matcher spend, and the run block records timing.
+  for (const m of Object.values(assetMeta.slots || {})) {
+    if (m && !m.dropped) m.source = 'generated';
+  }
+  const cost = mergeCosts(extraCost, assetMeta.cost);
+  assetMeta.cost = cost;
+  assetMeta.run = runInfo('fresh', started, {
+    reusedSlots: [],
+    generatedSlots: Object.keys(preloadedImages),
+    estUsd: cost.estUsd
+  });
+  if (trackStats) bumpStats('fresh', cost.estUsd, extraCost?.estUsd || 0);
   const gameId = newGameId();
   const stampedConfig = { ...config, gameId, sourcePrompt: config?.sourcePrompt ?? userPrompt ?? '' };
   const persist = persistRun(
@@ -326,6 +472,7 @@ export async function updateGameArt(gameId, { config, preloadedImages, assetMeta
 // server hit is written back into IndexedDB so the next open on this device is
 // instant and free.
 export async function getGameById(id) {
+  const t0 = performance.now();
   let entry = await backend.getGame(id);
   let fromServer = false;
   if (!entry) {
@@ -340,7 +487,16 @@ export async function getGameById(id) {
     return {
       config: { ...entry.config, gameId: entry.id, dynamicAssetUrls: true },
       preloadedImages,
-      assetMeta: restoredMeta(entry)
+      assetMeta: {
+        ...restoredMeta(entry),
+        cost: zeroCost(),
+        run: runInfo('restored', t0, {
+          matchedGameId: entry.id,
+          reusedSlots: Object.keys(preloadedImages),
+          generatedSlots: [],
+          estUsd: 0
+        })
+      }
     };
   } catch {
     if (!fromServer) backend.deleteGame(id); // corrupt LOCAL entry only

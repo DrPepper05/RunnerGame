@@ -1008,10 +1008,10 @@ export async function regenerateAssetSlots({ config, instruction = '', slots, on
     `[ASSETS] Updated ${updated}/${slots.length} slot(s) via Gemini.`,
     95
   );
-  reportRunCost(onProgress);
+  const cost = reportRunCost(onProgress);
   attachEntityTags(meta, design);
   if (design.taxonomy?.tags?.length) {
     onProgress(`[DESIGN] Tags: ${design.taxonomy.tags.join(', ')}`, null);
   }
-  return { preloadedImages, meta, design };
+  return { preloadedImages, meta, design, cost };
 }

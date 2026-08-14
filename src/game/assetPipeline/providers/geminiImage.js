@@ -178,6 +178,7 @@ function recordUsage(kind, model, usage, extra = {}) {
     promptTokens: prompt,
     outputTokens: out,
     thoughtsTokens: thoughts,
+    ...(extra.elapsedMs != null ? { elapsedMs: extra.elapsedMs } : {}),
     estUsd: Math.round(estUsd * 10000) / 10000
   });
 }
@@ -215,6 +216,7 @@ export async function generateImage({
   label = null
 }) {
   const ai = getClient();
+  const t0 = performance.now(); // wall time per call (incl. retries + decode probe)
 
   const refs = referenceImageDataUrls || (referenceImageDataUrl ? [referenceImageDataUrl] : []);
   let contents = prompt;
@@ -305,7 +307,8 @@ export async function generateImage({
   recordUsage('image', activeModel, response?.usageMetadata, {
     label,
     requestedSize: imageSize || null,
-    served
+    served,
+    elapsedMs: Math.round(performance.now() - t0)
   });
   return { dataUrl, provider: 'gemini', model: activeModel, width: served?.w, height: served?.h };
 }
@@ -317,6 +320,7 @@ export async function generateImage({
  */
 export async function generateJson({ prompt, responseSchema, imageDataUrl = null, timeoutMs = 12000, label = null }) {
   const ai = getClient();
+  const t0 = performance.now();
 
   let contents = prompt;
   if (imageDataUrl) {
@@ -372,7 +376,7 @@ export async function generateJson({ prompt, responseSchema, imageDataUrl = null
       throw toProviderError(err);
     }
   }
-  recordUsage('vision', GEMINI_TEXT_MODEL, response?.usageMetadata, { label });
+  recordUsage('vision', GEMINI_TEXT_MODEL, response?.usageMetadata, { label, elapsedMs: Math.round(performance.now() - t0) });
 
   try {
     return JSON.parse(response.text);

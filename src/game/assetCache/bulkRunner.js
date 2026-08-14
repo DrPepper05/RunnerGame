@@ -165,6 +165,7 @@ export async function runBulkPopulation(list = null, opts = {}) {
         promptKey,
         skipSlots,
         awaitPersist: true, // Blob upload must land before the LRU can evict
+        trackStats: false, // population runs must not pollute the user hit-rate stats
         onProgress: (text) => { if (text) console.log(`   ${text}`); }
       });
       const estUsd = result.assetMeta?.cost?.estUsd || 0;

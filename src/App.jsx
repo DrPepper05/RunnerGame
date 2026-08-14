@@ -380,7 +380,8 @@ function App() {
           logs: [`[EDITOR] ${edit.summary || `Redrawing ${edit.assetTargets.join(', ')}`} (${slots.length} slot${slots.length > 1 ? 's' : ''})...`]
         });
         try {
-          const { preloadedImages: newImages, meta: newMeta } = await regenerateAssetSlots({
+          const restyleT0 = performance.now();
+          const { preloadedImages: newImages, meta: newMeta, cost: restyleCost } = await regenerateAssetSlots({
             config: liveParams,
             instruction: raw,
             slots,
@@ -392,6 +393,7 @@ function App() {
             .map(([slot]) => slot);
           const mergedImages = { ...liveParams.preloadedImages };
           const mergedMeta = { ...(liveParams.assetMeta?.slots || {}) };
+          const redrawnSlots = [];
           for (const [slot, m] of Object.entries(newMeta)) {
             if (m.dropped) {
               // New version failed the quality gates — keep the old art if we had it
@@ -400,13 +402,26 @@ function App() {
               continue;
             }
             mergedImages[slot] = newImages[slot];
-            mergedMeta[slot] = m;
+            mergedMeta[slot] = { ...m, source: 'generated' };
+            redrawnSlots.push(slot);
           }
           const mergedParams = {
             ...liveParams,
             ...edit.changes,
             preloadedImages: mergedImages,
-            assetMeta: { ...(liveParams.assetMeta || {}), slots: mergedMeta }
+            assetMeta: {
+              ...(liveParams.assetMeta || {}),
+              slots: mergedMeta,
+              // The report shows THIS restyle's spend, not the pre-restyle run's.
+              cost: restyleCost || { estUsd: 0, imageCalls: 0, visionCalls: 0, calls: [] },
+              run: {
+                tier: 'restyle',
+                elapsedMs: Math.round(performance.now() - restyleT0),
+                generatedSlots: redrawnSlots,
+                reusedSlots: Object.keys(mergedImages).filter(s => !redrawnSlots.includes(s)),
+                estUsd: restyleCost?.estUsd || 0
+              }
+            }
           };
           setGameKey(k => k + 1);
           setPresetKey('custom');

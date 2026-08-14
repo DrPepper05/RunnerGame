@@ -450,16 +450,17 @@ const CreatorPanel = ({
 
         {/* 6. Config Actions at bottom */}
         <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-          {/* Downloadable spend report — only AI-generated games carry a cost tally
-              (presets/share links have none, the free path costs $0) */}
-          {liveParams?.assetMeta?.cost?.calls?.length > 0 && (
+          {/* Downloadable spend report — every AI/cache game carries run telemetry
+              now, INCLUDING $0 cache hits (the label shows the CURRENT run's cost;
+              the report separates run cost from the art's original cost). */}
+          {!!liveParams?.assetMeta && (
             <button
               className="pm-btn pm-btn-outline"
               onClick={() => downloadCostReport(liveParams)}
               style={{ width: '100%', padding: '10px' }}
-              title="Download a text report of this game's AI generation spend: totals, per-call token log, per-asset providers"
+              title="Download a text report of this run: outcome (cache vs generated), per-call/per-asset cost + timing, cache hit rate and pricing projection"
             >
-              💾 Cost Report (≈ ${(liveParams.assetMeta.cost.estUsd ?? 0).toFixed(2)})
+              💾 Cost Report (≈ ${(liveParams.assetMeta.cost?.estUsd ?? 0).toFixed(2)} this run)
             </button>
           )}
           <ConfigActions liveParams={liveParams} setLiveParams={setLiveParams} setPresetKey={setPresetKey} onHomeClick={onHomeClick} />
