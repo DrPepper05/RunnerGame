@@ -121,6 +121,19 @@ export const putGame = async (entry) => {
   }
 };
 
+// Matcher candidate cards for the WHOLE shared population (entry-shaped, no
+// images) via /api/games/list. [] on any failure — reads as "no candidates".
+export const listGames = async () => {
+  try {
+    const res = await fetch('/api/games/list');
+    if (!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data?.games) ? data.games : [];
+  } catch {
+    return [];
+  }
+};
+
 export const findByPromptKey = async () => null; // local-only in v1
 export const touch = async () => false; // no server-side LRU in v1
 export const deleteGame = async () => false; // cleanup is a dashboard concern in v1

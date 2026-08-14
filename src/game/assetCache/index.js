@@ -78,9 +78,11 @@ const newGameId = () =>
     ? crypto.randomUUID()
     : `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
 
-// Fire-and-forget entry write. preloadedImages (HTMLImageElements) and assetMeta
-// are stripped from the persisted config — they are not structured-clonable.
-const persistRun = async ({ id, promptKey, sourcePrompt, createdAt, config, preloadedImages, assetMeta }) => {
+// Entry write (fire-and-forget from the normal generation path). preloadedImages
+// (HTMLImageElements) and assetMeta are stripped from the persisted config — they
+// are not structured-clonable. The bulk runner passes awaitServer so the Blob
+// upload completes BEFORE the local LRU (12 entries) can evict the entry.
+const persistRun = async ({ id, promptKey, sourcePrompt, createdAt, config, preloadedImages, assetMeta }, { awaitServer = false } = {}) => {
   try {
     const images = {};
     for (const [slot, img] of Object.entries(preloadedImages || {})) {
@@ -101,8 +103,9 @@ const persistRun = async ({ id, promptKey, sourcePrompt, createdAt, config, prel
     };
     await backend.putGame(entry);
     // Write-through to the server cache (Vercel Blob) so the game's URL works
-    // cross-device. Fire-and-forget; disabled/failed server = local-only, silently.
-    server.putGame(entry);
+    // cross-device. Fire-and-forget normally; awaited for bulk population.
+    const upload = server.putGame(entry);
+    if (awaitServer) await upload;
   } catch (err) {
     console.warn('[AssetCache] persist skipped:', err?.message || err);
   }
@@ -115,9 +118,15 @@ const restoredMeta = (entry) => ({ ...(entry.assetMeta || {}), restoredFromCache
 // reuse it whole or redraw only the clashing slots. Returns a full result object
 // or null (fall through the ladder). Never generates a full set.
 async function tryMatchedReuse({ config, userPrompt, promptKey, onProgress, cancelToken, cacheOnly }) {
+  // Candidates = this browser's cache ∪ the shared server population (cards are
+  // entry-shaped, so the matcher consumes both interchangeably; local wins dedup).
   let candidates = [];
   try {
-    candidates = ((await backend.listGames()) || []).filter((e) => e.schemaVersion === SCHEMA_VERSION);
+    const local = ((await backend.listGames()) || []).filter((e) => e.schemaVersion === SCHEMA_VERSION);
+    const localIds = new Set(local.map((e) => e.id));
+    const remote = (await server.listGames())
+      .filter((c) => c.schemaVersion === SCHEMA_VERSION && !localIds.has(c.id));
+    candidates = [...local, ...remote];
   } catch {
     return null;
   }
@@ -138,22 +147,39 @@ async function tryMatchedReuse({ config, userPrompt, promptKey, onProgress, canc
   // Cache-only never spends: reuse the whole set as-is even when the matcher
   // suggested redraws. >3 clashing slots = mostly a different world — a full
   // fresh generation gives better coherence than stitching.
-  const slots = cacheOnly ? [] : (verdict.replaceSlots || []);
+  let slots = cacheOnly ? [] : (verdict.replaceSlots || []);
   if (slots.length > 3) return null;
 
-  const entry = await backend.getGame(verdict.matchId);
-  if (!entry || entry.schemaVersion !== SCHEMA_VERSION) return null; // evicted since listing
+  // Load the matched entry: local first, else the server population (write the
+  // server copy back locally so the next use of this game is instant).
+  let entry = await backend.getGame(verdict.matchId);
+  let fromServer = false;
+  if (!entry) {
+    entry = await server.getGame(verdict.matchId);
+    fromServer = !!entry;
+  }
+  if (!entry || entry.schemaVersion !== SCHEMA_VERSION) return null; // gone since listing
   let baseImages;
   try {
     baseImages = await rehydrateEntry(entry, cancelToken);
   } catch (err) {
     if (err?.cancelled) throw err;
-    backend.deleteGame(entry.id);
+    if (!fromServer) backend.deleteGame(entry.id);
     return null;
   }
-  backend.touch(entry.id);
+  if (fromServer) backend.putGame(entry);
+  else backend.touch(entry.id);
   const label = entry.config?.gameName || entry.sourcePrompt || entry.id.slice(0, 8);
   const reason = verdict.reason ? ` (${verdict.reason})` : '';
+
+  // Playerless population sets (bulk generates themes WITHOUT players): complete
+  // the missing player on first real keyed use — one static-player image ≈ $0.03.
+  // Cache-only/keyless skip this; the scene's theme-player fallback covers them.
+  // (Deliberately AFTER the ≤3 threshold — completing a player never disqualifies
+  // an otherwise-good match.)
+  if (!cacheOnly && !baseImages.player && !slots.includes('player') && isGeminiConfigured()) {
+    slots = [...slots, 'player'];
+  }
 
   if (!slots.length) {
     // Whole-set reuse: the NEW prompt's config drives mode/physics; only art +
@@ -173,8 +199,11 @@ async function tryMatchedReuse({ config, userPrompt, promptKey, onProgress, canc
   }
 
   // Partial reuse: redraw only the clashing slots (~$0.04/slot vs ~$0.40/game).
+  // 'player' stays the STATIC slot (not player_sheet) for now — the "players
+  // later" direction: animation sheets get their own round; the static sprite +
+  // procedural run-bob covers gameplay.
   onProgress?.(`[CACHE] Matched cached game "${label}"${reason} — reusing base art, redrawing: ${slots.join(', ')}`, 78);
-  const regenSlots = [...new Set(slots.map((s) => (s === 'player' ? 'player_sheet' : s)))];
+  const regenSlots = [...new Set(slots)];
   let regen = null;
   try {
     regen = await regenerateAssetSlots({ config, instruction: userPrompt, slots: regenSlots, onProgress, cancelToken });
@@ -252,10 +281,23 @@ export async function generateOrRestoreAssets({ config, userPrompt = '', promptK
     throw Object.assign(new Error('cache-only: no cached match'), { cacheOnlyMiss: true });
   }
 
-  const { preloadedImages, assetMeta } = await generateGameAssets({ config, userPrompt, onProgress, cancelToken });
+  return generateAndCache({ config, userPrompt, promptKey, onProgress, cancelToken });
+}
+
+/**
+ * Fresh generation + cache persist (the ladder's tier 3, also the bulk runner's
+ * engine). skipSlots skips whole slots ('player' = playerless population sets);
+ * awaitPersist makes the local put AND Blob upload complete before returning.
+ */
+export async function generateAndCache({ config, userPrompt = '', promptKey = null, onProgress, cancelToken, skipSlots = [], awaitPersist = false }) {
+  const { preloadedImages, assetMeta } = await generateGameAssets({ config, userPrompt, onProgress, cancelToken, skipSlots });
   const gameId = newGameId();
   const stampedConfig = { ...config, gameId, sourcePrompt: config?.sourcePrompt ?? userPrompt ?? '' };
-  persistRun({ id: gameId, promptKey, sourcePrompt: stampedConfig.sourcePrompt, config: stampedConfig, preloadedImages, assetMeta });
+  const persist = persistRun(
+    { id: gameId, promptKey, sourcePrompt: stampedConfig.sourcePrompt, config: stampedConfig, preloadedImages, assetMeta },
+    { awaitServer: awaitPersist }
+  );
+  if (awaitPersist) await persist;
   return { config: stampedConfig, preloadedImages, assetMeta, fromCache: false };
 }
 

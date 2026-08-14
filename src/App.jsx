@@ -120,6 +120,10 @@ function App() {
     if (geminiEnv) {
       localStorage.setItem('GEMINI_API_KEY', geminiEnv);
     }
+    // Dev/ops console tool: bulk cache population (see assetCache/bulkRunner.js).
+    // Lazy import keeps the runner + prompt list out of the hot path.
+    window.__PM_BULK = (list, opts) =>
+      import('./game/assetCache/bulkRunner.js').then((m) => m.runBulkPopulation(list, opts));
   }, []);
 
   // Detect touch device or narrow screen layout dynamically for mobile virtual D-pad

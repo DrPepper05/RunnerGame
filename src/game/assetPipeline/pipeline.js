@@ -876,7 +876,7 @@ function attachEntityTags(meta, design) {
  * Gemini is the only image provider — without a configured key this rejects
  * immediately, and every caller downgrades to built-in static theme art.
  */
-export async function generateGameAssets({ config, userPrompt = '', onProgress = () => {}, cancelToken = null }) {
+export async function generateGameAssets({ config, userPrompt = '', onProgress = () => {}, cancelToken = null, skipSlots = [] }) {
   if (!gemini.isGeminiConfigured()) {
     throw new Error('No Gemini API key configured — AI asset generation requires a key.');
   }
@@ -907,13 +907,17 @@ export async function generateGameAssets({ config, userPrompt = '', onProgress =
   // GENERATED_SLOTS order matters: required gameplay slots precede the optional
   // parallax layers, so the FIFO worker pool finishes the playable core first —
   // keep it that way.
-  const slots = GENERATED_SLOTS.map(s => (s === 'player' ? 'player_sheet' : s));
+  // skipSlots (bulk population): 'player' in the list means NO player art at all
+  // (neither sheet nor static — the scene falls back to the theme player); other
+  // slot names are simply filtered out of the run.
+  let slots = GENERATED_SLOTS.map(s => (s === 'player' && !skipSlots.includes('player') ? 'player_sheet' : s));
   // Platformer games shoot — generate their projectile too (optional slot: on failure
   // the game keeps its static SVG bolt). Runners never fire, skip the cost.
   if (config.gameType === 'platformer') slots.push('projectile');
   // Both modes spawn score pickups (optional slot: on failure the game keeps the
   // static coin.svg). Last in the FIFO so required slots always come first.
   slots.push('collectible');
+  slots = slots.filter(s => !skipSlots.includes(s));
 
   const { preloadedImages, meta } = await generateAssets({ finalPrompts, slots, onProgress, cancelToken });
 

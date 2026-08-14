@@ -365,9 +365,15 @@ export default class GameManagerScene extends Phaser.Scene {
     const playerX = 150;
     const playerType = this.activeTheme.playerType || 'dude';
     
+    // Playerless cached sets (bulk population generates themes WITHOUT players)
+    // fall back to the THEME player while everything else stays dynamic — the
+    // texture existence check is what routes them. All player-specific behavior
+    // below gates on this flag, not on dynamicAssetUrls alone.
+    this.useDynPlayer = !!this.gameConfig.dynamicAssetUrls && this.textures.exists('dyn_player');
+
     let playerTexture = playerType;
     let playerFrame = undefined;
-    if (this.gameConfig.dynamicAssetUrls) {
+    if (this.useDynPlayer) {
       playerTexture = 'dyn_player';
       playerFrame = undefined;
     } else if (playerType === 'yeti') {
@@ -380,7 +386,7 @@ export default class GameManagerScene extends Phaser.Scene {
     
     this.player = this.physics.add.sprite(playerX, this.LOGICAL_FLOOR_Y - playerYOffset, playerTexture, playerFrame);
     let scale = this.gameConfig.playerScale || (playerType === 'fox' || playerType === 'yeti' ? 1.8 : 1.5);
-    if (this.gameConfig.dynamicAssetUrls) {
+    if (this.useDynPlayer) {
       const textureObj = this.textures.get('dyn_player');
       const frame = textureObj?.get(0);
       const h = frame ? frame.height : 128;
@@ -390,7 +396,7 @@ export default class GameManagerScene extends Phaser.Scene {
     this.player.setScale(scale);
 
     // Use SpriteAlignmentManager for better ground contact
-    if (this.alignmentManager && this.gameConfig.dynamicAssetUrls) {
+    if (this.alignmentManager && this.useDynPlayer) {
       // Apply intelligent alignment for dynamic assets
       this.alignmentManager.initializeSprite(this.player, {
         type: 'character',
@@ -404,7 +410,7 @@ export default class GameManagerScene extends Phaser.Scene {
       });
     } else {
       // Set precise hitbox size and offsets for static assets
-      if (this.gameConfig.dynamicAssetUrls) {
+      if (this.useDynPlayer) {
         // Cropped textures fit the character content tightly, so use full texture bounds with zero offset
         this.player.body.setSize(this.player.width, this.player.height);
         this.player.body.setOffset(0, 0);
@@ -787,7 +793,7 @@ export default class GameManagerScene extends Phaser.Scene {
   }
 
   playPlayerAnim(animName) {
-    if (this.gameConfig.dynamicAssetUrls) {
+    if (this.useDynPlayer) {
       if (!this.player || !this.player.anims) return;
       // Generated run cycle when the pipeline delivered a sprite sheet; dedicated jump
       // pose when the sheet carries one (jumpFrameIndex), else a mid-stride frame
