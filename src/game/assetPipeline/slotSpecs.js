@@ -82,10 +82,10 @@ export const GAPS_CLAUSE =
 // sprite, and identity pressure makes models copy the reference's arm pose
 // verbatim unless the arm instruction leads the sentence.
 export const RUN_CYCLE_POSES = [
-  'LEFT arm punched far forward at shoulder height, RIGHT arm swung far behind the back, RIGHT leg planted far forward, LEFT leg stretched far behind — a wide running stride',
-  'both elbows bent at the sides mid-swing, both legs passing directly under the body, knees bent close together, body slightly higher than the stride poses',
-  'RIGHT arm punched far forward at shoulder height, LEFT arm swung far behind the back, LEFT leg planted far forward, RIGHT leg stretched far behind — the exact MIRROR of cell 1, arms AND legs swapped',
-  'both elbows bent at the sides mid-swing, both legs passing directly under the body, knees bent close together, body slightly higher than the stride poses'
+  'LEFT arm swinging forward with the elbow bent at a right angle and the fist at chest height, RIGHT arm swinging back behind the hip with a bent elbow — natural relaxed running arm pump, NOT a punch — RIGHT leg planted far forward, LEFT leg stretched far behind, a wide running stride',
+  'both elbows bent at the sides mid-pump, hands near the hips, both legs passing directly under the body, knees bent close together, body slightly higher than the stride poses',
+  'RIGHT arm swinging forward with the elbow bent at a right angle and the fist at chest height, LEFT arm swinging back behind the hip with a bent elbow — natural relaxed running arm pump, NOT a punch — LEFT leg planted far forward, RIGHT leg stretched far behind, the exact MIRROR of cell 1 with arms AND legs swapped',
+  'both elbows bent at the sides mid-pump, hands near the hips, both legs passing directly under the body, knees bent close together, body slightly higher than the stride poses'
 ];
 
 export const JUMP_POSE = 'mid-air jump pose with both knees tucked up and arms out for balance';
