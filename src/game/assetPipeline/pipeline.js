@@ -659,6 +659,9 @@ export async function generateAssets({
       };
 
       let sheet = null;
+      // A finished sheet rejected only for a SOFT cosmetic verdict (frozen arms /
+      // no leg swap) — ships if no later attempt produces something better.
+      let softCandidate = null;
       let review = null;
       let mirrored = false;
       let provider = null;
@@ -767,14 +770,12 @@ export async function generateAssets({
           dbg.scorerIssue = lastIssue;
           continue;
         }
-        // A run cycle whose legs never swap animates as a glide, not a run — the
-        // client-visible defect. This verdict was always ASKED of the vision model
-        // but never enforced (found 2026-08-16 when the cheap sheet model shipped
-        // a no-leg-swap cycle). It fails the attempt ONLY while a stronger rung
-        // remains — that's what drives the escalation to the premium sheet model.
-        // On the FINAL attempt the best-effort sheet SHIPS: a gliding multi-frame
-        // cycle still beats the static-bob fallback (which reads as "no animation"
-        // — the exact complaint that surfaced when this gate rejected everything).
+        // SOFT verdicts (legs never alternate / arms frozen) are cosmetic — they
+        // are detected here but handled AFTER finalize: the working sheet is kept
+        // as a standby candidate while one escalation tries for a better roll.
+        // Discarding a soft-flawed sheet outright was a live failure 2026-08-16:
+        // the arms gate threw away a good lite sheet, the premium re-roll broke
+        // identity, and the game shipped the static bob at full price.
         // Per-frame leadingLeg answers (when present and sane) beat the lazy
         // whole-strip boolean: the judge is forced to commit per frame, and the
         // code derives alternation — a real cycle names BOTH 'left' and 'right'.
@@ -782,29 +783,10 @@ export async function generateAssets({
         const legsOk = leading && leading.length >= 2
           ? (leading.includes('left') && leading.includes('right'))
           : review?.legsAlternate;
-        if (review && legsOk === false) {
-          if (attempt < maxSheetAttempts) {
-            lastIssue = 'never switches legs (vision QA)';
-            dbg.scorerIssue = lastIssue;
-            continue;
-          }
-          report('[ASSETS] Run cycle legs still not alternating on the final attempt — shipping best effort.');
-          dbg.outcome = 'shipped-best-effort';
-        }
-        // Frozen arms (legs animate, arms copied verbatim from the reference in
-        // every cell — live defect 2026-08-16): same escalate-not-reject shape
-        // as the legs gate. A frozen-arm sheet on the cheap rung buys one
-        // premium retry; on the final attempt it ships (mild defect, never
-        // worth the static fallback).
-        if (review && review.armsSwing === false) {
-          if (attempt < maxSheetAttempts) {
-            lastIssue = 'arms never swing (vision QA)';
-            dbg.scorerIssue = lastIssue;
-            continue;
-          }
-          report('[ASSETS] Arms still frozen on the final attempt — shipping best effort.');
-          dbg.outcome = 'shipped-best-effort';
-        }
+        const softIssue = review
+          ? (legsOk === false ? 'run cycle legs never alternate'
+            : (review.armsSwing === false ? 'arms never swing' : null))
+          : null;
         if (review?.badFrames?.length) {
           const badSet = new Set(review.badFrames.map((n) => n - 1)
             .filter((n) => n >= 0 && n < verdict.keptCells.length));
@@ -826,13 +808,38 @@ export async function generateAssets({
         if (!sheet) {
           lastIssue = 'had no visible content';
           dbg.scorerIssue = lastIssue;
+        } else if (softIssue && attempt < maxSheetAttempts) {
+          // Keep the WORKING sheet as the standby candidate and spend one
+          // escalation on a better roll — never discard a usable animation.
+          softCandidate = { sheet, review, mirrored, model: raw.model || attemptSpec.gen.model, dbg };
+          lastIssue = `${softIssue} (vision QA)`;
+          dbg.scorerIssue = lastIssue;
+          dbg.outcome = 'soft-rejected (kept as standby)';
+          dbg.framesMeta = sheet.frames;
+          sheet = null; // loop continues to the stronger rung; candidate stands by
         } else {
+          if (softIssue) {
+            report(`[ASSETS] ${softIssue} on the final attempt — shipping best effort.`);
+            dbg.outcome = 'shipped-best-effort';
+          }
           dbg.outcome = dbg.outcome || 'shipped';
           dbg.framesMeta = sheet.frames;
           if (verdict.dropped) {
             report(`[ASSETS] Dropped ${verdict.dropped} inconsistent frame(s) from the run cycle`);
           }
         }
+      }
+
+      // Escalation didn't produce a better sheet — ship the standby candidate
+      // rather than falling back to the static player (an animated sheet with
+      // frozen arms beats a tilting statue, and it is already paid for).
+      if (!sheet && softCandidate) {
+        sheet = softCandidate.sheet;
+        review = softCandidate.review;
+        mirrored = softCandidate.mirrored;
+        servedModel = softCandidate.model || servedModel;
+        softCandidate.dbg.outcome = 'shipped (standby after escalation failed)';
+        report('[ASSETS] Escalation did not improve the sheet — shipping the earlier animated version.');
       }
 
       // Per-frame escalation: quality mode only, and only within the call budget.
