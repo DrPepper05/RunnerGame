@@ -8,7 +8,7 @@
  * every caller handles it by downgrading to the built-in static theme asset set
  * (ScreenZero's toStaticThemeConfig; App surfaces it in the regen overlay).
  */
-import { SLOT_SPECS, BASELINE_SLOTS, GENERATED_SLOTS, GEMINI_PRO_SHEET_MODEL, GEMINI_IMAGE_FALLBACK_MODEL, PROPS_GRID_SPEC, BG_CLAUSE } from './slotSpecs';
+import { SLOT_SPECS, BASELINE_SLOTS, GENERATED_SLOTS, GEMINI_SHEET_MODEL, GEMINI_PRO_SHEET_MODEL, GEMINI_IMAGE_FALLBACK_MODEL, PROPS_GRID_SPEC, BG_CLAUSE } from './slotSpecs';
 import { postProcessAsset, mirrorImage, drawToCanvas, alphaFraction, borderResidueFraction, topBandOpaqueFraction, contentBoundsOf, processSheet, finalizeSheetFrames, loadImage, keyCellWithQuality, cleanKeyedEdges, alignFrames, maskIoU, composeFilmstrip, lockPalette, sliceRawGrid } from './postprocess';
 import { reviewSprite } from './qa';
 import * as gemini from './providers/geminiImage';
@@ -650,14 +650,24 @@ export async function generateAssets({
       for (let attempt = 1; attempt <= maxSheetAttempts && !sheet; attempt++) {
         if (runState.cancelToken?.cancelled) throw cancelledError();
         if (attempt === 3 && runState.skipGemini) break;
+        // Model ladder (2026-08-16): attempt 1 runs the spec default (the cheap
+        // 2.5 model since the cost flip), attempt 2 ESCALATES to the 3.1 sheet
+        // model whose choreography is markedly stronger — pay for the premium
+        // tier only when the cheap tier failed a gate. Attempt 3 (quality mode)
+        // stays the pro rescue.
+        const escalate = attempt === 2 && activeSpec.gen.model !== GEMINI_SHEET_MODEL;
         if (attempt > 1) {
           report(attempt === 3
             ? `[ASSETS] Sheet ${lastIssue} — trying the premium image model...`
-            : `[ASSETS] Sheet ${lastIssue}, regenerating...`);
+            : escalate
+              ? `[ASSETS] Sheet ${lastIssue} — retrying on the stronger sheet model...`
+              : `[ASSETS] Sheet ${lastIssue}, regenerating...`);
         }
         const attemptSpec = attempt === 3
           ? { ...activeSpec, gen: { ...activeSpec.gen, model: GEMINI_PRO_SHEET_MODEL } }
-          : activeSpec;
+          : escalate
+            ? { ...activeSpec, gen: { ...activeSpec.gen, model: GEMINI_SHEET_MODEL } }
+            : activeSpec;
         // The sheet is an image-editing call anchored to the static base; the
         // prompt preamble tells the model the attachment IS the character.
         const useReference = baseSrc && gemini.isGeminiConfigured() && !runState.skipGemini;
@@ -704,6 +714,15 @@ export async function generateAssets({
         // so imperfect-but-coherent strips ship instead of being redone.
         if (review && review.sameCharacter === false) {
           lastIssue = 'looks like different characters (vision QA)';
+          continue;
+        }
+        // A run cycle whose legs never swap animates as a glide, not a run — the
+        // client-visible defect. This verdict was always ASKED of the vision model
+        // but never enforced (found 2026-08-16 when the cheap sheet model shipped
+        // a no-leg-swap cycle); it now fails the attempt like sameCharacter, which
+        // is what triggers the escalation to the stronger sheet model.
+        if (review && review.legsAlternate === false) {
+          lastIssue = 'never switches legs (vision QA)';
           continue;
         }
         if (review?.badFrames?.length) {
