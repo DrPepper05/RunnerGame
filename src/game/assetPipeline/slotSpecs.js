@@ -25,15 +25,24 @@ export const GEMINI_TEXT_MODEL = 'gemini-flash-latest';
 // field-tested way to get a flat keyable field out of image models. promptDesigner
 // picks the color per slot so a green subject gets a magenta screen and vice versa.
 export const CHROMA_KEYS = {
-  green: { label: 'chroma key green', hex: '#00FF00', ban: 'green' },
-  magenta: { label: 'chroma key magenta', hex: '#FF00FF', ban: 'magenta or pink' }
+  green: { label: 'chroma key green', hex: '#00FF00', rgb: '0, 255, 0', ban: 'green' },
+  magenta: { label: 'chroma key magenta', hex: '#FF00FF', rgb: '255, 0, 255', ban: 'magenta or pink' }
 };
+// v2 (2026-08-16 prompt overhaul, research-grounded): positive constraint first
+// ("one perfectly uniform flat field… covering every pixel"), hex AND RGB anchors
+// (the best-evidenced chroma phrasing per practitioner postmortems), the caps
+// NO-list kept as belt-and-braces. The `EXACT hex #XXXXXX` token is LOAD-BEARING —
+// chromaFromPrompt regexes it to recover the keying color from the prompt text.
 export const BG_CLAUSE = (chroma) => {
   const c = CHROMA_KEYS[chroma];
-  if (!c) return 'isolated on a plain pure white background';
-  return `isolated on a solid flat ${c.label} background, EXACT hex ${c.hex}, the entire ` +
-    `background one uniform flat color with NO gradients, NO noise, NO texture, NO shadows, ` +
-    `and absolutely no ${c.ban} anywhere on the subject itself`;
+  if (!c) {
+    return 'The entire background is one perfectly uniform field of plain pure white, ' +
+      'covering every pixel that is not the subject';
+  }
+  return `The entire background is one perfectly uniform flat field of ${c.label}, ` +
+    `EXACT hex ${c.hex} (RGB ${c.rgb}), covering every pixel that is not the subject — ` +
+    `NO gradients, NO noise, NO texture, NO shadows, NO vignette, and absolutely no ` +
+    `${c.ban} anywhere on the subject itself`;
 };
 // Character-slot addition to BG_CLAUSE: models routinely paint the ENCLOSED gaps
 // (between an arm and the torso, between the legs) white instead of the backdrop
@@ -41,7 +50,7 @@ export const BG_CLAUSE = (chroma) => {
 // "inside" the sprite. Ask for the backdrop there explicitly; removeEnclosedPockets
 // in postprocess is the deterministic backstop.
 export const GAPS_CLAUSE =
-  'the background color also completely fills every gap and enclosed space between ' +
+  'The background color also completely fills every gap and enclosed space between ' +
   'the limbs and the body';
 
 /**
@@ -84,7 +93,7 @@ export const GAPS_CLAUSE =
 export const RUN_CYCLE_POSES = [
   'LEFT arm swinging forward with the elbow bent at a right angle and the fist at chest height, RIGHT arm swinging back behind the hip with a bent elbow — natural relaxed running arm pump, NOT a punch — RIGHT leg planted far forward, LEFT leg stretched far behind, a wide running stride',
   'both elbows bent at the sides mid-pump, hands near the hips, both legs passing directly under the body, knees bent close together, body slightly higher than the stride poses',
-  'RIGHT arm swinging forward with the elbow bent at a right angle and the fist at chest height, LEFT arm swinging back behind the hip with a bent elbow — natural relaxed running arm pump, NOT a punch — LEFT leg planted far forward, RIGHT leg stretched far behind, the exact MIRROR of cell 1 with arms AND legs swapped',
+  'RIGHT arm swinging forward with the elbow bent at a right angle and the fist at chest height, LEFT arm swinging back behind the hip with a bent elbow — natural relaxed running arm pump, NOT a punch — LEFT leg planted far forward, RIGHT leg stretched far behind, the exact MIRROR of frame 1 with arms AND legs swapped',
   'both elbows bent at the sides mid-pump, hands near the hips, both legs passing directly under the body, knees bent close together, body slightly higher than the stride poses'
 ];
 
@@ -92,17 +101,17 @@ export const JUMP_POSE = 'mid-air jump pose with both knees tucked up and arms o
 
 // Shared sheet-prompt clauses (identity first — see the design note on player_sheet).
 const SHEET_IDENTITY_CLAUSE = (count) =>
-  `IDENTICAL character in every cell — same face, same hair, same outfit, same colors, ` +
-  `same proportions, same held items — as if one drawing was copied ${count} times and ` +
-  `ONLY the arm and leg poses were redrawn.`;
+  `Keep every feature completely unchanged in every frame — same face, same hair, ` +
+  `same outfit, same colors, same proportions, same held items — as if one drawing ` +
+  `was copied ${count} times and ONLY the arm and leg poses were redrawn.`;
 const SHEET_HELD_ITEM_CLAUSE =
-  `Any weapon or held item stays gripped in the same hand in every cell and tilts ` +
+  `Any weapon or held item stays gripped in the same hand in every frame and tilts ` +
   `with that arm as it swings.`;
 const SHEET_FRAMING_CLAUSE = (chroma) =>
-  `Character faces right in side profile in every cell, same character size and same ` +
-  `ground line in every cell, each character centered in its own grid cell, ` +
-  `${BG_CLAUSE(chroma)} in every cell, ${GAPS_CLAUSE}, no scenery, no floor, no shadows, ` +
-  `no motion lines, no grid lines, no cell borders, no text`;
+  `The character faces right in side profile in every frame, at the same character ` +
+  `size and on the same ground line in every frame, each frame centered in its own ` +
+  `equal section. ${BG_CLAUSE(chroma)}, in every single frame. ${GAPS_CLAUSE}. ` +
+  `No scenery, no floor, no shadows, no motion lines, no frame borders, no dividers, no text`;
 
 export const SLOT_SPECS = {
   background_far: {
@@ -111,8 +120,8 @@ export const SLOT_SPECS = {
     gen: { aspectRatio: '16:9', model: GEMINI_SLOT_MODEL },
     post: { fit: 'cover', keying: null, trimBorder: false, crop: false },
     scaffold: (subject, style) =>
-      `wide side-scrolling video game background, ${subject}, distant landscape scenery, ` +
-      `no characters, no text, no logo, scene fills the entire frame, ${style}`,
+      `Paint a wide side-scrolling video game background: ${subject}. Distant landscape ` +
+      `scenery fills the entire frame — no characters, no text, no logo. ${style}`,
     fallbackSubject: (d) => d?.backgrounds
   },
   background_mid: {
@@ -123,14 +132,17 @@ export const SLOT_SPECS = {
     qa: { clean: true },
     optional: true,
     subjectKey: 'background_far',
+    // Narrative framing, but the contract clauses (blank upper half, "NOT a
+    // landscape painting", cutout language) survive VERBATIM — they are the
+    // battle-tested defense against the painted-sky failure mode.
     scaffold: (subject, style) =>
-      `a flat dark silhouette skyline strip themed after ${subject}, solid silhouette ` +
-      `cutout shapes like paper cutouts along the bottom edge of the frame, reaching at ` +
-      `most half the frame height, on a plain pure white background, the entire upper ` +
-      `half of the image is completely blank solid white with nothing in it, this is NOT ` +
-      `a landscape painting: no scene, no interior, no sky, no clouds, no aurora, no ` +
-      `stars, no gradient backdrop of any kind, ` +
-      `seamless horizontally tileable, no text, ${style}`,
+      `Draw a flat dark silhouette skyline strip themed after ${subject}. Solid ` +
+      `silhouette cutout shapes, like paper cutouts, run along the bottom edge of the ` +
+      `frame, reaching at most half the frame height, on a plain pure white background. ` +
+      `The entire upper half of the image is completely blank solid white with nothing ` +
+      `in it. This is NOT a landscape painting: no scene, no interior, no sky, no ` +
+      `clouds, no aurora, no stars, no gradient backdrop of any kind. Seamlessly ` +
+      `horizontally tileable, no text. ${style}`,
     fallbackSubject: (d) => d?.backgrounds
   },
   background_near: {
@@ -144,13 +156,13 @@ export const SLOT_SPECS = {
     optional: true,
     subjectKey: 'background_far',
     scaffold: (subject, style) =>
-      `three or four separate standalone decorative props themed after ${subject}, each a ` +
-      `distinct isolated object with gaps between them, on a plain pure white background, ` +
-      `props stand on the bottom edge of the frame, small, reaching at most one third of ` +
-      `the frame height, everything else in the image is completely blank solid white, ` +
-      `this is NOT a landscape painting: no scene, no landscape, no sky, no clouds, no ` +
-      `aurora, no gradient backdrop of any kind, only the isolated objects themselves, ` +
-      `seamless horizontally tileable, no text, ${style}`,
+      `Draw three or four separate standalone decorative props themed after ${subject}, ` +
+      `each a distinct isolated object with gaps between them, on a plain pure white ` +
+      `background. The props stand on the bottom edge of the frame and stay small, ` +
+      `reaching at most one third of the frame height; everything else in the image is ` +
+      `completely blank solid white. This is NOT a landscape painting: no scene, no ` +
+      `landscape, no sky, no clouds, no aurora, no gradient backdrop of any kind — only ` +
+      `the isolated objects themselves. Seamlessly horizontally tileable, no text. ${style}`,
     fallbackSubject: (d) => d?.backgrounds
   },
   floor: {
@@ -159,9 +171,9 @@ export const SLOT_SPECS = {
     gen: { aspectRatio: '1:1', model: GEMINI_SLOT_MODEL },
     post: { fit: 'stretch', keying: null, trimBorder: true, crop: false },
     scaffold: (subject, style) =>
-      `seamless horizontally tileable ground texture, ${subject}, side view game terrain block, ` +
-      `left and right edges match perfectly, texture fills the whole frame edge to edge, ` +
-      `no border, no vignette, ${style}`,
+      `Create a seamless horizontally tileable ground texture: ${subject}, seen from ` +
+      `the side as a game terrain block. The left and right edges match perfectly, and ` +
+      `the texture fills the whole frame edge to edge — no border, no vignette. ${style}`,
     fallbackSubject: (d) => d?.levelElements
   },
   platform: {
@@ -176,16 +188,16 @@ export const SLOT_SPECS = {
     // IS the collision edge (rounded pill shapes read as floating off their hitbox)
     post: { fit: 'stretch', keying: 'flood', trimBorder: false, crop: true, fillAfterCrop: true, solidify: true, outline: true },
     scaffold: (subject, style, { chroma } = {}) =>
-      `a single wide flat rectangular floating platform, ${subject}, side view, the ` +
-      `platform spans the full width of the frame from the left edge to the right edge, ` +
-      `flat level top surface, ${BG_CLAUSE(chroma)}, no shadow, ` +
-      `no reflection, ${style}`,
+      `Draw a single wide flat rectangular floating platform for a 2d video game: ` +
+      `${subject}. Seen from the side, the platform spans the full width of the frame ` +
+      `from the left edge to the right edge, with a perfectly flat level top surface. ` +
+      `${BG_CLAUSE(chroma)}. No shadow, no reflection. ${style}`,
     // Grid-cell variant of the scaffold: same invariants, minus the BG/isolation
     // clause (the combined-props prompt states the backdrop once for all cells).
     cellEssence: (subject, style) =>
-      `a single wide flat rectangular floating platform, ${subject}, side view, ` +
-      `stretching almost the full width of its cell, flat level top surface, ` +
-      `no shadow, no reflection, ${style}`,
+      `a single wide flat rectangular floating platform: ${subject}, seen from the ` +
+      `side, stretching almost the full width of its cell with a flat level top ` +
+      `surface, no shadow, no reflection, ${style}`,
     fallbackSubject: (d) => d?.platforms
   },
   // Ranged-attack projectile — generated only for platformer games (runner never
@@ -197,13 +209,13 @@ export const SLOT_SPECS = {
     post: { fit: 'stretch', keying: 'flood', trimBorder: false, crop: true, outline: true },
     optional: true,
     scaffold: (subject, style, { chroma } = {}) =>
-      `a single small 2d video game projectile sprite, ${subject}, flying to the right, ` +
-      `elongated horizontal shape, side view, centered, ${BG_CLAUSE(chroma)}, ` +
-      `no shadow, no motion trail, no text, ${style}`,
+      `Draw a single small projectile sprite for a 2d video game: ${subject}, flying ` +
+      `to the right as an elongated horizontal shape, side view, centered in the frame. ` +
+      `${BG_CLAUSE(chroma)}. No shadow, no motion trail, no text. ${style}`,
     cellEssence: (subject, style) =>
-      `a single small 2d video game projectile sprite, ${subject}, flying to the ` +
-      `right, elongated horizontal shape, side view, centered in its cell, ` +
-      `no shadow, no motion trail, ${style}`,
+      `a single small projectile sprite: ${subject}, flying to the right as an ` +
+      `elongated horizontal shape, side view, centered in its cell, no shadow, ` +
+      `no motion trail, ${style}`,
     fallbackSubject: (d) => d?.projectile
   },
   // Score pickup (coins by default, or whatever the player named — "gems", etc.).
@@ -216,13 +228,14 @@ export const SLOT_SPECS = {
     post: { fit: 'stretch', keying: 'flood', trimBorder: false, crop: true, outline: true },
     optional: true,
     scaffold: (subject, style, { chroma } = {}) =>
-      `a single small 2d video game collectible pickup sprite, ${subject}, one single ` +
-      `object, simple bold shape readable at tiny size, centered, ${BG_CLAUSE(chroma)}, ` +
-      `no shadow, no sparkle trail, no text, ${style}`,
+      `Draw a single small collectible pickup sprite for a 2d video game: ${subject}. ` +
+      `One single object with a simple bold shape that stays readable at tiny size, ` +
+      `centered in the frame. ${BG_CLAUSE(chroma)}. No shadow, no sparkle trail, ` +
+      `no text. ${style}`,
     cellEssence: (subject, style) =>
-      `a single small 2d video game collectible pickup sprite, ${subject}, one ` +
-      `single object, simple bold shape readable at tiny size, centered in its ` +
-      `cell, no shadow, no sparkle trail, ${style}`,
+      `a single small collectible pickup sprite: ${subject}, one single object with ` +
+      `a simple bold shape readable at tiny size, centered in its cell, no shadow, ` +
+      `no sparkle trail, ${style}`,
     fallbackSubject: (d) => d?.collectibles
   },
   player: {
@@ -239,10 +252,11 @@ export const SLOT_SPECS = {
     // Front-loaded pose language ("mid-run stride") avoids stiff standing poses;
     // "no ground, no motion lines" suppresses baked-in floor streaks under runners.
     scaffold: (subject, style, { chroma } = {}) =>
-      `2d video game character sprite, ${subject}, running to the right in a dynamic ` +
-      `mid-run stride, full body in side profile facing right, single character ` +
-      `filling most of the frame, ${BG_CLAUSE(chroma)}, ${GAPS_CLAUSE}, sharp ` +
-      `clean outline, no shadow, no ground, no motion lines, no text, ${style}`,
+      `Draw a 2d video game hero sprite: ${subject}. The character is caught mid-run ` +
+      `in a dynamic stride, full body in crisp side profile facing right, a single ` +
+      `character filling most of the frame with a sharp clean outline. ` +
+      `${BG_CLAUSE(chroma)}. ${GAPS_CLAUSE}. No shadow, no ground, no motion lines, ` +
+      `no text. ${style}`,
     fallbackSubject: (d) => d?.player
   },
   enemy: {
@@ -252,14 +266,14 @@ export const SLOT_SPECS = {
     post: { fit: 'stretch', keying: 'flood', trimBorder: false, crop: true, outline: true, pocketClean: true },
     qa: { facing: true },
     scaffold: (subject, style, { chroma } = {}) =>
-      `2d video game enemy sprite, ${subject}, prowling to the right, full body in ` +
-      `side profile facing right, single creature filling most of the frame, ` +
-      `${BG_CLAUSE(chroma)}, ${GAPS_CLAUSE}, sharp clean outline, no shadow, no ground, ` +
-      `no motion lines, no text, ${style}`,
+      `Draw a 2d video game enemy sprite: ${subject}, prowling to the right, full ` +
+      `body in side profile facing right, a single creature filling most of the frame ` +
+      `with a sharp clean outline. ${BG_CLAUSE(chroma)}. ${GAPS_CLAUSE}. No shadow, ` +
+      `no ground, no motion lines, no text. ${style}`,
     cellEssence: (subject, style) =>
-      `2d video game enemy sprite, ${subject}, prowling to the right, full body in ` +
-      `side profile facing right, single creature filling most of its cell, sharp ` +
-      `clean outline, no shadow, no ground, no motion lines, ${style}`,
+      `a 2d video game enemy sprite: ${subject}, prowling to the right, full body in ` +
+      `side profile facing right, a single creature filling most of its cell with a ` +
+      `sharp clean outline, no shadow, no ground, no motion lines, ${style}`,
     fallbackSubject: (d) => d?.enemy
   },
   // Animated player run cycle. The local geometry gate + transparency gate reject
@@ -269,7 +283,7 @@ export const SLOT_SPECS = {
   player_sheet: {
     textureKey: 'dyn_player',
     outputKey: 'player',
-    canvas: { width: 384, height: 256 },
+    canvas: { width: 640, height: 128 },
     // Cheap-first sheet rung (2026-08-16 cost flip, revised same day after 2.5
     // shipped a no-leg-swap cycle): 3.1-flash-lite bills the same $30/M as 2.5
     // but is the 3.x family whose character consistency the sheet path depends
@@ -277,12 +291,24 @@ export const SLOT_SPECS = {
     // whenever a gate — including the legsAlternate vision gate — rejects the
     // cheap tier, so premium is paid only on failure. Restore always-premium with
     // localStorage PM_MODEL_SHEET='gemini-3.1-flash-image'.
-    gen: { aspectRatio: '3:2', model: GEMINI_SLOT_MODEL, imageSize: '1K' },
+    // Layout is a HORIZONTAL 1×5 STRIP at 4:1 (2026-08-16 prompt overhaul):
+    // strips are the community's most reliable sheet layout (no interior cells,
+    // 3-6 items per row) and the 3.x family supports extreme ratios natively.
+    // sheetLayouts are the slicing CANDIDATES — processSheet picks the one whose
+    // detected gutters are emptiest, so a model that ignores 4:1 (the 2.5
+    // fallback, an unsupported ratio → provider drops the field) degrades to the
+    // 3×2 grid slicing automatically. usedCells trims trailing extras before
+    // scoring; the pipeline always ships a rebuilt 1×N strip.
+    gen: { aspectRatio: '4:1', model: GEMINI_SLOT_MODEL, imageSize: '1K' },
     post: { fit: 'stretch', keying: 'flood', trimBorder: false, crop: false, minAlphaFraction: 0.3, outline: true, pocketClean: true },
-    // 3×2 grid: cells 0-3 = the four-phase run cycle, cell 4 = jump pose, cell 5
-    // = prompted EMPTY (usedCells trims it before scoring — the pipeline always
-    // rebuilds a 1×N strip, so the blank cell never reaches the game).
-    frames: { cols: 3, rows: 2, runFrameCount: 4, jumpFrameIndex: 4, usedCells: 5 },
+    frames: { cols: 5, rows: 1, runFrameCount: 4, jumpFrameIndex: 4, usedCells: 5 },
+    sheetLayouts: [
+      { cols: 5, rows: 1, canvas: { width: 640, height: 128 } },
+      // Fallback for an ignored 4:1 request: the API default serve is 1:1, so the
+      // grid candidate's canvas is square (cells 128×192 — tall cells are fine,
+      // slicing re-centers and the union-crop normalizes).
+      { cols: 3, rows: 2, canvas: { width: 384, height: 384 } }
+    ],
     fallbackSlot: 'player',
     subjectKey: 'player',
     qa: { facing: true, grid: true },
@@ -297,17 +323,18 @@ export const SLOT_SPECS = {
     // passing pose (cells 2/4), and "dramatically different" pressure makes
     // models redesign the character per cell (regression observed 2026-07-30).
     scaffold: (subject, style, { chroma } = {}) =>
-      `sprite sheet, a 3x2 grid of six cells: five animation frames of the EXACT SAME ` +
-      `video game character: ${subject}. ${SHEET_IDENTITY_CLAUSE('five')} ` +
-      `Reading left to right, top to bottom, cells 1 to 4 are the four phases of one ` +
-      `full running stride with STRONGLY CONTRASTED leg positions: ` +
-      RUN_CYCLE_POSES.map((pose, i) => `cell ${i + 1}: ${pose}; `).join('') +
-      `cell 5: ${JUMP_POSE}; ` +
-      `cell 6 (bottom-right): completely empty, nothing drawn, only the flat backdrop color. ` +
-      `The arms swing opposite to the legs: whichever leg is forward, the OTHER side's arm ` +
-      `is forward — the arms are NEVER in the same position in two stride cells. ` +
+      `Draw one horizontal sprite-sheet strip of five animation frames, reading left ` +
+      `to right, of the EXACT SAME video game character: ${subject}. ` +
+      `${SHEET_IDENTITY_CLAUSE('five')} ` +
+      `Frames 1 to 4 are the four phases of one full running stride with strongly ` +
+      `contrasted arm and leg positions: ` +
+      RUN_CYCLE_POSES.map((pose, i) => `Frame ${i + 1}: ${pose}. `).join('') +
+      `Frame 5: ${JUMP_POSE}. ` +
+      `The arms swing opposite to the legs: whichever leg is forward, the OTHER side's ` +
+      `arm is forward — the arms are never in the same position in two stride frames. ` +
+      `All five frames keep consistent proportions and lighting. ` +
       `${SHEET_HELD_ITEM_CLAUSE} ` +
-      `${SHEET_FRAMING_CLAUSE(chroma)}, ${style}`,
+      `${SHEET_FRAMING_CLAUSE(chroma)}. ${style}`,
     fallbackSubject: (d) => d?.player
   },
   obstacle: {
@@ -316,10 +343,11 @@ export const SLOT_SPECS = {
     gen: { aspectRatio: '1:1', model: GEMINI_SLOT_MODEL },
     post: { fit: 'stretch', keying: 'flood', trimBorder: false, crop: true, outline: true },
     scaffold: (subject, style, { chroma } = {}) =>
-      `a single hazard object, ${subject}, roughly square proportions, side view, centered, ` +
-      `${BG_CLAUSE(chroma)}, no shadow, no text, ${style}`,
+      `Draw a single hazard object for a 2d video game: ${subject}. It has roughly ` +
+      `square proportions, shown from the side, centered in the frame. ` +
+      `${BG_CLAUSE(chroma)}. No shadow, no text. ${style}`,
     cellEssence: (subject, style) =>
-      `a single hazard object, ${subject}, roughly square proportions, side view, ` +
+      `a single hazard object: ${subject}, roughly square proportions, side view, ` +
       `centered in its cell, no shadow, ${style}`,
     fallbackSubject: (d) => d?.hazards
   }

@@ -495,13 +495,18 @@ export async function generateAssets({
         return alphaFraction(canvas);
       };
       // ---- Shared single-frame machinery (repair rung + per-frame escalation) ----
+      // Google's canonical edit phrasing: preservation language ("keep every
+      // feature completely unchanged") + NAMED roles for each reference image.
       const framePrompt = (poseText, hasPrevFrame = false) =>
-        `Use the character in the attached reference image${hasPrevFrame
-          ? 's (the FIRST image is the character; the SECOND is the previous animation frame — match its size and style)'
-          : ''}. ` +
-        `Redraw THIS EXACT character — identical design, colors, outfit and held items, do not reinvent ` +
-        `anything — in a new pose: ${poseText}. Full body in side profile facing right, same size and ` +
-        `style as the reference, centered, ${BG_CLAUSE(chroma)}, ${GAPS_CLAUSE}, no shadow, no ground, no motion lines, no text.`;
+        (hasPrevFrame
+          ? `You are given two images. Image 1 is the character reference; Image 2 is the ` +
+            `previous animation frame — use it ONLY for pose continuity and scale. `
+          : `You are given one image: the character reference. `) +
+        `Redraw the exact character from Image 1, keeping every feature completely ` +
+        `unchanged — same design, colors, outfit and held items, do not reinvent ` +
+        `anything — in a new pose: ${poseText}. Full body in side profile facing right, ` +
+        `same size and style as the reference, centered in the frame. ` +
+        `${BG_CLAUSE(chroma)}. ${GAPS_CLAUSE}. No shadow, no ground, no motion lines, no text.`;
 
       // Sending a keyed (transparent) frame as a reference is ambiguous to the model —
       // compose it on white first.
@@ -701,8 +706,9 @@ export async function generateAssets({
         // prompt preamble tells the model the attachment IS the character.
         const useReference = baseSrc && gemini.isGeminiConfigured() && !runState.skipGemini;
         const sheetPrompt = useReference
-          ? `Use the character in the attached reference image. Redraw THIS EXACT character — identical design, ` +
-            `colors, outfit and held items, do not reinvent anything about it — as the following sprite sheet. ${prompt}`
+          ? `Using the provided image of the character, redraw THIS EXACT character — keep ` +
+            `every feature completely unchanged, do not reinvent anything about it — as the ` +
+            `following sprite strip. ${prompt}`
           : prompt;
         const raw = await generateSlotImage(slot, sheetPrompt, seed + attempt * 13, report, maxAttemptsPerProvider, runState, onAttempt, useReference ? baseSrc : null, attemptSpec);
         noteSlotProgress(slot, 0.8);
@@ -724,6 +730,7 @@ export async function generateAssets({
         // backdrop of interior cells
         const processed = await processSheet(raw.dataUrl, attemptSpec, { chroma });
         const previewImg = processed.previewImg;
+        dbg.slicedLayout = processed.layout; // which candidate layout the slicer picked
         // Trim the prompted-empty trailing cell(s) before scoring — the layout
         // carries a blank 6th cell so the 5 real frames get a clean 3×2 grid.
         const cells = processed.cells.slice(0, attemptSpec.frames.usedCells ?? processed.cells.length);
@@ -787,15 +794,62 @@ export async function generateAssets({
           ? (legsOk === false ? 'run cycle legs never alternate'
             : (review.armsSwing === false ? 'arms never swing' : null))
           : null;
-        if (review?.badFrames?.length) {
-          const badSet = new Set(review.badFrames.map((n) => n - 1)
-            .filter((n) => n >= 0 && n < verdict.keptCells.length));
-          if (badSet.size) {
-            const culled = cullFromKept(verdict.keptCells, stripMeta, badSet);
-            if (culled) {
-              verdict = { ...verdict, ...culled, dropped: (verdict.dropped || 0) + badSet.size };
-            } else {
-              console.warn('[AssetPipeline] Vision flagged more frames than can be culled — shipping the strip as-is.');
+        const visionBadSet = new Set((review?.badFrames || []).map((n) => n - 1)
+          .filter((n) => n >= 0 && n < verdict.keptCells.length));
+        if (visionBadSet.size) {
+          const culled = cullFromKept(verdict.keptCells, stripMeta, visionBadSet);
+          if (culled) {
+            verdict = { ...verdict, ...culled, dropped: (verdict.dropped || 0) + visionBadSet.size };
+          } else {
+            console.warn('[AssetPipeline] Vision flagged more frames than can be culled — shipping the strip as-is.');
+          }
+        }
+        // Deterministic cycle ASSEMBLY from the judge's per-frame leg labels
+        // (2026-08-16, "legs switch very rarely"): models bias the cycle — pass
+        // frames drawn as extra right-lead strides leave one left-lead frame in
+        // four. Instead of trusting the model's cell order/balance, rebuild the
+        // run as [right-stride, pass, left-stride, pass]: first right-lead and
+        // first left-lead frame become the strides, neutral frames fill the
+        // passes (reusing one neutral for both slots is a legitimate cycle
+        // repeat), and biased stride DUPLICATES are dropped. No neutral at all →
+        // the 2-frame [right, left] alternation (choppy but alternating beats
+        // smooth-and-biased). Idempotent on a correct sheet; missing stride
+        // labels already failed legsOk above. $0 — pure reordering.
+        {
+          const reviewRunCount = stripMeta.runFrameCount ?? verdict.keptCells.length;
+          let labels = Array.isArray(review?.leadingLeg) && review.leadingLeg.length >= reviewRunCount
+            ? review.leadingLeg.slice(0, reviewRunCount)
+            : null;
+          if (labels && visionBadSet.size) labels = labels.filter((_, i) => !visionBadSet.has(i));
+          const metaNow = verdict.framesMeta;
+          const runNow = metaNow.runFrameCount ?? verdict.keptCells.length;
+          if (labels && labels.length === runNow && runNow >= 2) {
+            const runCells = verdict.keptCells.slice(0, runNow);
+            const hasDedicatedJump = metaNow.jumpFrameIndex != null && metaNow.jumpFrameIndex >= runNow;
+            const jumpCellNow = hasDedicatedJump ? verdict.keptCells[verdict.keptCells.length - 1] : null;
+            const jumpSrc = !hasDedicatedJump && metaNow.jumpFrameIndex != null ? runCells[metaNow.jumpFrameIndex] : null;
+            const idxR = labels.indexOf('right');
+            const idxL = labels.indexOf('left');
+            if (idxR >= 0 && idxL >= 0) {
+              const neutrals = labels
+                .map((v, i) => (v !== 'right' && v !== 'left' ? i : -1))
+                .filter((i) => i >= 0);
+              const newRun = neutrals.length
+                ? [runCells[idxR], runCells[neutrals[0]], runCells[idxL], runCells[neutrals[1] ?? neutrals[0]]]
+                : [runCells[idxR], runCells[idxL]];
+              const ji = jumpSrc ? newRun.indexOf(jumpSrc) : -1;
+              const cellsOut = jumpCellNow ? [...newRun, jumpCellNow] : newRun;
+              verdict = {
+                ...verdict,
+                keptCells: cellsOut,
+                framesMeta: {
+                  cols: cellsOut.length,
+                  rows: 1,
+                  runFrameCount: newRun.length,
+                  ...(jumpCellNow ? { jumpFrameIndex: newRun.length } : (ji >= 0 ? { jumpFrameIndex: ji } : {}))
+                }
+              };
+              dbg.resequenced = { labels, order: ['right', neutrals.length ? 'pass' : null, 'left', neutrals.length ? 'pass' : null].filter(Boolean) };
             }
           }
         }

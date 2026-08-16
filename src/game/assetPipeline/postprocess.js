@@ -912,6 +912,7 @@ export function detectGridCuts(canvas, { cols, rows }) {
     }
   }
 
+  const cutVals = [];
   const cutsFor = (profile, size, parts) => {
     const cuts = [0];
     for (let k = 1; k < parts; k++) {
@@ -925,11 +926,35 @@ export function detectGridCuts(canvas, { cols, rows }) {
         if (v < bestVal) { bestVal = v; best = p; }
       }
       cuts.push(best);
+      cutVals.push(profile[best] ?? 1);
     }
     cuts.push(size);
     return cuts;
   };
-  return { xCuts: cutsFor(colProfile, w, cols), yCuts: cutsFor(rowProfile, h, rows) };
+  const xCuts = cutsFor(colProfile, w, cols);
+  const yCuts = cutsFor(rowProfile, h, rows);
+  // cutScore: mean content density at the chosen interior gutters — 0 means the
+  // grid hypothesis found genuinely empty dividers; high values mean the cuts run
+  // through content. Used to pick between candidate sheet layouts.
+  const cutScore = cutVals.length ? cutVals.reduce((a, b) => a + b, 0) / cutVals.length : 0;
+  return { xCuts, yCuts, cutScore };
+}
+
+// Pick the sheet slicing layout whose grid hypothesis fits the served image best:
+// draw the image at each candidate's canvas, detect cuts, and take the layout with
+// the emptiest gutters. This is how the 1×5 strip request self-heals when a model
+// ignores the 4:1 aspect (ratio dropped by the provider fallback, or the 2.5
+// fallback model) and renders a grid arrangement instead.
+function pickSheetLayout(img, spec) {
+  const layouts = spec.sheetLayouts;
+  if (!layouts?.length) return { cols: spec.frames.cols, rows: spec.frames.rows, canvas: spec.canvas };
+  let best = null;
+  for (const layout of layouts) {
+    const canvas = drawToCanvas(img, { ...layout.canvas, fit: spec.post.fit });
+    const { cutScore } = detectGridCuts(canvas, layout);
+    if (!best || cutScore < best.cutScore - 1e-6) best = { ...layout, cutScore };
+  }
+  return best;
 }
 
 /**
@@ -980,9 +1005,12 @@ export async function sliceRawGrid(rawSrc, { cols, rows, insetFrac = 0.01 } = {}
  */
 export async function processSheet(rawSrc, spec, { inset = 3, chroma = null } = {}) {
   const img = await loadImage(rawSrc);
-  const canvas = drawToCanvas(img, { ...spec.canvas, fit: spec.post.fit });
-  const { cols, rows } = spec.frames;
-  const { xCuts, yCuts } = detectGridCuts(canvas, spec.frames);
+  // Candidate-layout pick (strip vs grid) from the served image itself — see
+  // pickSheetLayout. Specs without sheetLayouts keep their fixed frames grid.
+  const layout = pickSheetLayout(img, spec);
+  const canvas = drawToCanvas(img, { ...(layout.canvas || spec.canvas), fit: spec.post.fit });
+  const { cols, rows } = layout;
+  const { xCuts, yCuts } = detectGridCuts(canvas, { cols, rows });
   const cellW = Math.floor(canvas.width / cols);
   const cellH = Math.floor(canvas.height / rows);
   const rawCells = [];
@@ -1005,9 +1033,9 @@ export async function processSheet(rawSrc, spec, { inset = 3, chroma = null } = 
     .map((cell) => keyCellWithQuality(cell, { chroma }))
     .map((cell) => (spec.post.pocketClean ? removeEnclosedPockets(cell, { chroma }) : cell))
     .map((cell) => cleanKeyedEdges(cell, { erode: 1, outline: !!spec.post.outline, despill: chroma }));
-  const preview = assembleSheet(cells, spec.frames);
+  const preview = assembleSheet(cells, { cols, rows });
   const previewImg = await loadImage(preview.canvas.toDataURL('image/png'), { crossOrigin: null });
-  return { previewImg, cells };
+  return { previewImg, cells, layout: { cols, rows } };
 }
 
 /**

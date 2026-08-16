@@ -567,8 +567,13 @@ function slotStyleClauses(slotKey, styleGuide, { userNamed = false } = {}) {
     `a clearly defined lighter top edge`;
 }
 
+// Style tail v2 (2026-08-16 prompt overhaul): console-era + constraint vocabulary
+// beats the bare "pixel art" genre label (which yields smoothed pseudo-pixels);
+// the palette/edge constraints are what actually carry the look. The real pixel
+// guarantee stays programmatic (supersample + downscale).
 const styleBase = (styleGuide) =>
-  `${styleGuide.styleSummary}, 16-bit pixel art style, flat 2D game asset, sharp pixels, clear outlines`;
+  `${styleGuide.styleSummary}, rendered as a SNES-era 16-bit video game sprite: ` +
+  `limited color palette, hard pixel edges, no anti-aliasing, flat shading, bold readable shapes`;
 
 export function buildFinalPrompt(slotKey, subjects, styleGuide, { userNamed = false } = {}) {
   const spec = SLOT_SPECS[slotKey];
@@ -624,13 +629,13 @@ export function buildPropsGridPrompt(cellSlots, subjects, styleGuide, namedBySlo
     cellLines.push(`cell ${idx + 1} (${posFor(idx)}): completely empty, nothing drawn, only the flat backdrop color`);
   }
   const prompt =
-    `a ${layout.cols}x${layout.rows} grid of ${cellLines.length} cells, each cell containing one ` +
-    `separate standalone 2d video game asset sprite, each subject alone in its own grid cell, ` +
-    `centered with clear margin, subjects never touch or overlap each other or the cell ` +
-    `boundaries. Reading left to right, top to bottom: ` +
+    `Draw ${cellLines.length} separate standalone 2d video game asset sprites arranged ` +
+    `in a ${layout.cols}x${layout.rows} grid, one subject alone in each grid cell, ` +
+    `centered with clear margin — subjects never touch or overlap each other or the ` +
+    `cell boundaries. Reading left to right, top to bottom: ` +
     cellLines.join('; ') + `. ` +
-    `Every cell shares one continuous backdrop: ${BG_CLAUSE(chroma)}, in every single cell, ` +
-    `${GAPS_CLAUSE}, no grid lines, no cell borders, no dividers, no shadows, no text, ` +
+    `${BG_CLAUSE(chroma)}, continuous across every single cell. ${GAPS_CLAUSE}. ` +
+    `No grid lines, no cell borders, no dividers, no shadows, no text. ` +
     `${styleBase(styleGuide)}`;
   return { prompt, chroma, cellSlots: [...cellSlots], layout };
 }
