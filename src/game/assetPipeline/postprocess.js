@@ -940,6 +940,26 @@ export function detectGridCuts(canvas, { cols, rows }) {
   return { xCuts, yCuts, cutScore };
 }
 
+// Fraction of OPAQUE pixels that are chroma-screen colored — the "a green frame
+// shipped" detector (2026-08-16: a slice cut through touching strip frames left a
+// cell the border-flood couldn't key; the green backdrop survived every gate). Chroma
+// on a finished sprite is ALWAYS illegal (the prompt bans it on the subject), so
+// detection is unambiguous.
+export function chromaResidueFraction(canvas, chroma) {
+  if (!chroma) return 0;
+  const { width: w, height: h } = canvas;
+  const data = canvas.getContext('2d').getImageData(0, 0, w, h).data;
+  let opaque = 0, hit = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    if (data[i + 3] < 128) continue;
+    opaque++;
+    const r = data[i], g = data[i + 1], b = data[i + 2];
+    if (chroma === 'green' ? (g >= 140 && g >= r + 50 && g >= b + 50)
+      : (r >= 140 && b >= 140 && r >= g + 50 && b >= g + 50)) hit++;
+  }
+  return opaque ? hit / opaque : 0;
+}
+
 // Pick the sheet slicing layout whose grid hypothesis fits the served image best:
 // draw the image at each candidate's canvas, detect cuts, and take the layout with
 // the emptiest gutters. This is how the 1×5 strip request self-heals when a model
@@ -1032,6 +1052,16 @@ export async function processSheet(rawSrc, spec, { inset = 3, chroma = null } = 
     .map((cell) => insetCanvas(cell, inset))
     .map((cell) => keyCellWithQuality(cell, { chroma }))
     .map((cell) => (spec.post.pocketClean ? removeEnclosedPockets(cell, { chroma }) : cell))
+    // Chroma-residue rescue: when the border-flood failed a cell (content sliced
+    // across the boundary → wrong seed color) a swath of screen color survives.
+    // A global key of the chroma color is always safe — the prompt bans it on
+    // the subject — so sweep it before the edge chain.
+    .map((cell) => {
+      if (!chroma || chromaResidueFraction(cell, chroma) <= 0.08) return cell;
+      const rgb = chroma === 'green' ? { r: 0, g: 255, b: 0 } : { r: 255, g: 0, b: 255 };
+      removeFlatColor(cell, rgb, { tol: 110, soft: 60 });
+      return cell;
+    })
     .map((cell) => cleanKeyedEdges(cell, { erode: 1, outline: !!spec.post.outline, despill: chroma }));
   const preview = assembleSheet(cells, { cols, rows });
   const previewImg = await loadImage(preview.canvas.toDataURL('image/png'), { crossOrigin: null });

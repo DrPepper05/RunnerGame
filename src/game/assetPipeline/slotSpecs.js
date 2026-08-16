@@ -110,7 +110,9 @@ const SHEET_HELD_ITEM_CLAUSE =
 const SHEET_FRAMING_CLAUSE = (chroma) =>
   `The character faces right in side profile in every frame, at the same character ` +
   `size and on the same ground line in every frame, each frame centered in its own ` +
-  `equal section. ${BG_CLAUSE(chroma)}, in every single frame. ${GAPS_CLAUSE}. ` +
+  `equal section with a clear band of empty backdrop separating neighboring frames — ` +
+  `the characters never touch or overlap each other or the image edges. ` +
+  `${BG_CLAUSE(chroma)}, in every single frame. ${GAPS_CLAUSE}. ` +
   `No scenery, no floor, no shadows, no motion lines, no frame borders, no dividers, no text`;
 
 export const SLOT_SPECS = {

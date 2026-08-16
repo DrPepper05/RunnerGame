@@ -9,7 +9,7 @@
  * (ScreenZero's toStaticThemeConfig; App surfaces it in the regen overlay).
  */
 import { SLOT_SPECS, BASELINE_SLOTS, GENERATED_SLOTS, GEMINI_SHEET_MODEL, GEMINI_PRO_SHEET_MODEL, GEMINI_IMAGE_FALLBACK_MODEL, PROPS_GRID_SPEC, BG_CLAUSE, GAPS_CLAUSE } from './slotSpecs';
-import { postProcessAsset, mirrorImage, drawToCanvas, alphaFraction, borderResidueFraction, topBandOpaqueFraction, contentBoundsOf, processSheet, finalizeSheetFrames, loadImage, keyCellWithQuality, cleanKeyedEdges, alignFrames, maskIoU, composeFilmstrip, lockPalette, sliceRawGrid, removeEnclosedPockets } from './postprocess';
+import { postProcessAsset, mirrorImage, drawToCanvas, alphaFraction, borderResidueFraction, topBandOpaqueFraction, contentBoundsOf, processSheet, finalizeSheetFrames, loadImage, keyCellWithQuality, cleanKeyedEdges, alignFrames, maskIoU, composeFilmstrip, lockPalette, sliceRawGrid, removeEnclosedPockets, chromaResidueFraction } from './postprocess';
 import { reviewSprite } from './qa';
 import * as gemini from './providers/geminiImage';
 import { designAssetPrompts, buildFinalPrompt, buildPropsGridPrompt, chromaFromPrompt } from './promptDesigner';
@@ -179,7 +179,7 @@ function frameHistogramDistances(cells, runCount) {
 // Small-cycle thresholds (runCount ≤ 4): at most 1 culled run frame, ≥3
 // survivors, and a lower pose-jump IoU bar (contact↔pass deltas are larger by
 // design in the 4-pose cycle).
-export function evaluateAndCullCells(cells, gridMeta, runCountOverride = null) {
+export function evaluateAndCullCells(cells, gridMeta, runCountOverride = null, { preBadIndices = [] } = {}) {
   const runCount = Math.min(runCountOverride ?? gridMeta?.runFrameCount ?? cells.length, cells.length);
   const hasJump = cells.length > runCount;
   const jumpCell = hasJump ? cells[cells.length - 1] : null;
@@ -189,6 +189,11 @@ export function evaluateAndCullCells(cells, gridMeta, runCountOverride = null) {
 
   const bad = new Array(cells.length).fill(false);
   let geomIssue = null;
+  // Deterministic pre-flags from the caller (e.g. unrescuable chroma-stained
+  // cells) — treated like geometry failures.
+  for (const i of preBadIndices) {
+    if (i >= 0 && i < cells.length) { bad[i] = true; geomIssue = geomIssue || 'has backdrop-stained frames'; }
+  }
   cells.forEach((cell, i) => {
     const bounds = contentBoundsOf(cell);
     const issue = !bounds ? 'has empty cells'
@@ -739,9 +744,14 @@ export async function generateAssets({
           dbg.scorerIssue = lastIssue;
           continue;
         }
-        // gridMeta null → ALWAYS rebuild a 1×N strip: the grid meta describes 6
-        // cells including the blank, which must never register as a frame.
-        let verdict = evaluateAndCullCells(cells, null, attemptSpec.frames.runFrameCount);
+        // Deterministic per-cell chroma residue (post-rescue): a cell still
+        // carrying screen color is pre-flagged bad — a green frame must never
+        // reach the game (live defect 2026-08-16).
+        const residues = cells.map((c) => chromaResidueFraction(c, chroma));
+        const stained = residues.map((r, i) => (r > 0.08 ? i : -1)).filter((i) => i >= 0);
+        if (stained.length) dbg.stainedCells = stained.map((i) => ({ i, residue: +residues[i].toFixed(3) }));
+        // gridMeta null → ALWAYS rebuild a 1×N strip.
+        let verdict = evaluateAndCullCells(cells, null, attemptSpec.frames.runFrameCount, { preBadIndices: stained });
         if (verdict.issue) {
           // Repair rung: a handful of scorer-flagged frames get individually
           // redrawn — but ONLY on the LAST attempt (2026-08-16): while a cheaper
@@ -801,7 +811,20 @@ export async function generateAssets({
           if (culled) {
             verdict = { ...verdict, ...culled, dropped: (verdict.dropped || 0) + visionBadSet.size };
           } else {
-            console.warn('[AssetPipeline] Vision flagged more frames than can be culled — shipping the strip as-is.');
+            // Full cull would dip below the survivor minimum — drop only the
+            // WORST flagged frame instead of shipping all of them (a corrupt
+            // frame shipping "as-is" was the green-frame live defect).
+            const canRank = verdict.keptCells.length === cells.length;
+            const worst = canRank
+              ? [...visionBadSet].sort((a, b) => (residues[b] || 0) - (residues[a] || 0))[0]
+              : [...visionBadSet][0];
+            const partial = cullFromKept(verdict.keptCells, stripMeta, new Set([worst]));
+            if (partial) {
+              verdict = { ...verdict, ...partial, dropped: (verdict.dropped || 0) + 1 };
+              report('[ASSETS] Dropped the worst vision-flagged frame (full cull would leave too few).');
+            } else {
+              console.warn('[AssetPipeline] Vision flagged more frames than can be culled — shipping the strip as-is.');
+            }
           }
         }
         // Deterministic cycle ASSEMBLY from the judge's per-frame leg labels
