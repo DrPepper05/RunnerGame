@@ -722,11 +722,17 @@ export async function generateAssets({
         // A run cycle whose legs never swap animates as a glide, not a run — the
         // client-visible defect. This verdict was always ASKED of the vision model
         // but never enforced (found 2026-08-16 when the cheap sheet model shipped
-        // a no-leg-swap cycle); it now fails the attempt like sameCharacter, which
-        // is what triggers the escalation to the stronger sheet model.
+        // a no-leg-swap cycle). It fails the attempt ONLY while a stronger rung
+        // remains — that's what drives the escalation to the premium sheet model.
+        // On the FINAL attempt the best-effort sheet SHIPS: a gliding multi-frame
+        // cycle still beats the static-bob fallback (which reads as "no animation"
+        // — the exact complaint that surfaced when this gate rejected everything).
         if (review && review.legsAlternate === false) {
-          lastIssue = 'never switches legs (vision QA)';
-          continue;
+          if (attempt < maxSheetAttempts) {
+            lastIssue = 'never switches legs (vision QA)';
+            continue;
+          }
+          report('[ASSETS] Run cycle legs still not alternating on the final attempt — shipping best effort.');
         }
         if (review?.badFrames?.length) {
           const badSet = new Set(review.badFrames.map((n) => n - 1)
