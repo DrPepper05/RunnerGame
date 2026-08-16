@@ -215,10 +215,12 @@ export const SLOT_SPECS = {
   player: {
     textureKey: 'dyn_player',
     canvas: { width: 128, height: 128 },
-    // Sheet-tier model: this sprite is the identity reference every sheet/per-frame
-    // call anchors to — its quality compounds into all nine frames. 0.5K (512px)
-    // is still 4× supersampling for the 128px canvas at 2/3 the 1K price.
-    gen: { aspectRatio: '1:1', model: GEMINI_SHEET_MODEL, imageSize: '0.5K' },
+    // Lite model (2026-08-16 cost flip): billing is flat per image, and the sprite
+    // lands on a 128px canvas — the lite render supersamples it fine. The SHEET
+    // stays the expensive consistency task; this static base is its identity
+    // reference, so if animation quality drops, restore with
+    // localStorage PM_MODEL_PLAYER='gemini-3.1-flash-image'.
+    gen: { aspectRatio: '1:1', model: GEMINI_SLOT_MODEL, imageSize: '0.5K' },
     post: { fit: 'stretch', keying: 'flood', trimBorder: false, crop: true, outline: true },
     qa: { facing: true },
     // Front-loaded pose language ("mid-run stride") avoids stiff standing poses;
@@ -255,9 +257,13 @@ export const SLOT_SPECS = {
     textureKey: 'dyn_player',
     outputKey: 'player',
     canvas: { width: 384, height: 384 },
-    // 1K request downscaled to the 384px working canvas = ~2.7× supersampling —
-    // clean edges at 2/3 the 2K price. Quality mode restores the 2K render.
-    gen: { aspectRatio: '1:1', model: GEMINI_SHEET_MODEL, imageSize: '1K' },
+    // Half-price sheet model (2026-08-16 cost flip): 2.5-flash-image bills at the
+    // lite rate and supports the reference-edit call; every gate (per-cell scoring,
+    // repair, filmstrip QA) still applies unchanged. If sheets start failing gates
+    // or looking worse, restore with
+    // localStorage PM_MODEL_SHEET='gemini-3.1-flash-image'.
+    // (imageSize is 3.x-only — 2.5 rejects it and the provider drops + remembers.)
+    gen: { aspectRatio: '1:1', model: GEMINI_IMAGE_FALLBACK_MODEL, imageSize: '1K' },
     post: { fit: 'stretch', keying: 'flood', trimBorder: false, crop: false, minAlphaFraction: 0.3, outline: true },
     // Cells 0-7 (row-major) = full run cycle with alternating legs; cell 8 = jump pose
     frames: { cols: 3, rows: 3, runFrameCount: 8, jumpFrameIndex: 8 },

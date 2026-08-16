@@ -983,20 +983,24 @@ const DESIGN_SOURCE_LABELS = {
   local: 'local templates'
 };
 
-// Combined-props eligibility (PM_GRID_PROPS='1', read at run start like the other
-// cost knobs): ≥3 grid-able slots in this run — a restyle or partial redraw of 1-2
-// props stays on the individual path by construction. Returns the grid plan or
-// null (flag off, too few slots, or the chroma pick collided to white).
+// Combined-props eligibility (DEFAULT ON since 2026-08-16; PM_GRID_PROPS='0' is
+// the kill switch — read at run start like the other cost knobs): ≥3 grid-able
+// slots in this run — a restyle or partial redraw of 1-2 props stays on the
+// individual path by construction. Returns the grid plan or null (kill switch,
+// quality mode, too few slots, or the chroma pick collided to white).
 function planPropsGrid(slots, design, namedBySlot, onProgress) {
-  if (localStorage.getItem('PM_GRID_PROPS') !== '1') return null;
+  if (localStorage.getItem('PM_GRID_PROPS') === '0') return null;
   // Quality mode pays for individual calls + rescue rungs — never gridded.
   if (localStorage.getItem('PM_QUALITY_MODE') === '1') return null;
   const gridSlots = PROPS_GRID_SPEC.cellOrder.filter((s) => slots.includes(s));
   if (gridSlots.length < 3) return null;
   const plan = buildPropsGridPrompt(gridSlots, design.subjects, design.styleGuide, namedBySlot);
-  if (plan) {
-    onProgress(`[ASSETS] Combined props call: ${gridSlots.join(', ')} in one image.`, null);
-  }
+  // Every skip is VISIBLE — a silent bail made "why didn't the price drop"
+  // undiagnosable from the terminal.
+  onProgress(plan
+    ? `[ASSETS] Combined props call: ${gridSlots.join(', ')} in one image.`
+    : `[ASSETS] Combined props call skipped (green+magenta subject collision) — individual calls.`,
+  null);
   return plan;
 }
 

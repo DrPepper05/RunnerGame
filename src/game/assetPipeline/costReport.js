@@ -184,7 +184,7 @@ export function buildCostReport(liveParams) {
     if (avgPartial != null) lines.push(`  Measured avg partial reuse:    ${usd(avgPartial)}`);
     if (total) lines.push(`  Measured blended avg per generation: ${usd(spendAll / total)}`);
     lines.push('');
-    const fullAvg = avgFresh ?? 0.38;
+    const fullAvg = avgFresh ?? 0.33;
     lines.push('PRICING PROJECTION — average cost per user generation vs cache hit rate');
     lines.push(`(fresh generation ≈ ${usd(fullAvg)} measured${avgFresh == null ? ' [default estimate]' : ''}; ` +
       'a cache hit costs ≈ $0.001 in matching; partial reuse lands between):');

@@ -188,9 +188,10 @@ export async function runBulkPopulation(list = null, opts = {}) {
   const generated = perSet.filter((s) => s.status === 'generated');
   const skipped = perSet.filter((s) => s.status.startsWith('skipped'));
   const failed = perSet.filter((s) => s.status.startsWith('FAILED'));
-  // Organic prompts still generate WITH player+sheet; ~$0.38 assumes the combined
-  // props call (PM_GRID_PROPS) is on — without it a real fresh run measures ~$0.55.
-  const fullGenAvg = 0.38;
+  // Organic prompts still generate WITH player+sheet; ~$0.33 assumes the combined
+  // props call (default ON) + the lite player + the 2.5 sheet — the pre-flip
+  // individual-call pipeline measured ~$0.55.
+  const fullGenAvg = 0.33;
   const bulkAvg = generated.length ? totalEstUsd / generated.length : 0;
 
   const summaryText =

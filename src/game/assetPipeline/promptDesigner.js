@@ -604,8 +604,11 @@ export function buildPropsGridPrompt(cellSlots, subjects, styleGuide, namedBySlo
     const style = slotStyleClauses(slot, styleGuide, { userNamed: !!namedBySlot[slot] });
     cells.push({ slot, text: spec.cellEssence(subject, style), styleText: style, subject });
   }
-  const chroma = pickChromaColor(cells.map((c) => `${c.subject || ''} ${c.styleText}`).join(' '));
-  if (!chroma) return null; // white collision → individual calls
+  // Chroma from SUBJECTS only (not style text): accent-palette words ("violet",
+  // "neon teal") would trip the magenta regex on nearly every run and silently
+  // kill the grid. What actually collides with the screen is the drawn subject.
+  const chroma = pickChromaColor(cells.map((c) => c.subject || '').join(' '));
+  if (!chroma) return null; // green AND magenta subjects → white → individual calls
   // Positional naming ("cell 2 (top-right)") is the anti-cell-swap measure — the
   // sheet scaffold's numbered-cell convention, applied to arbitrary small grids.
   const posFor = (i) => {
