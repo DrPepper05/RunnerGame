@@ -791,6 +791,20 @@ export async function generateAssets({
           report('[ASSETS] Run cycle legs still not alternating on the final attempt — shipping best effort.');
           dbg.outcome = 'shipped-best-effort';
         }
+        // Frozen arms (legs animate, arms copied verbatim from the reference in
+        // every cell — live defect 2026-08-16): same escalate-not-reject shape
+        // as the legs gate. A frozen-arm sheet on the cheap rung buys one
+        // premium retry; on the final attempt it ships (mild defect, never
+        // worth the static fallback).
+        if (review && review.armsSwing === false) {
+          if (attempt < maxSheetAttempts) {
+            lastIssue = 'arms never swing (vision QA)';
+            dbg.scorerIssue = lastIssue;
+            continue;
+          }
+          report('[ASSETS] Arms still frozen on the final attempt — shipping best effort.');
+          dbg.outcome = 'shipped-best-effort';
+        }
         if (review?.badFrames?.length) {
           const badSet = new Set(review.badFrames.map((n) => n - 1)
             .filter((n) => n >= 0 && n < verdict.keptCells.length));

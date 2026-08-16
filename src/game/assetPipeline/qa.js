@@ -49,6 +49,7 @@ const STRIP_SCHEMA = {
       items: { type: 'STRING' },
       description: 'One entry PER RUN FRAME in order (frame 1 first): which leg is planted or leading in front — exactly "left", "right", "both-under-body" (passing pose, legs together under the body), or "unclear".'
     },
+    armsSwing: { type: 'BOOLEAN', description: 'Do the ARMS visibly change position across the run frames (swinging with the stride), rather than staying frozen in the same pose in every frame?' },
     badFrames: {
       type: 'ARRAY',
       items: { type: 'INTEGER' },
@@ -86,6 +87,8 @@ function buildPrompt(kind, grid) {
       `- leadingLeg: for EACH run frame 1 to ${runCount} in order, which leg is planted or leading in front: ` +
       '"left", "right", "both-under-body" (passing pose, legs together under the body), or "unclear". ' +
       'Look at each frame individually before answering.\n' +
+      '- armsSwing: do the ARMS visibly change position across the run frames, or are they ' +
+      'frozen in the exact same pose in every frame?\n' +
       '- badFrames: list the frame NUMBERS that break the animation (different-looking character, ' +
       'corrupted or incomplete drawing, leftover backdrop patch). Use an empty list when all frames are fine — ' +
       'normal pose differences between stride phases are NOT bad frames.'

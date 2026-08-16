@@ -77,11 +77,15 @@ export const GAPS_CLAUSE =
 // classic retro cycle and a far easier ask. Poses 2 and 4 are the same passing
 // pose ON PURPOSE (a real cycle repeats it; they are never IoU-adjacent so the
 // duplicate cull — consecutive pairs only — cannot fire on them).
+// ARMS FIRST in each pose text (2026-08-16, after a live sheet shipped with
+// legs animating but arms frozen): the sheet is an EDIT of the reference
+// sprite, and identity pressure makes models copy the reference's arm pose
+// verbatim unless the arm instruction leads the sentence.
 export const RUN_CYCLE_POSES = [
-  'RIGHT leg planted far forward, LEFT leg stretched far behind, LEFT arm swung forward, RIGHT arm swung back — a wide running stride',
-  'both legs passing directly under the body, knees bent close together, body slightly higher than the stride poses',
-  'LEFT leg planted far forward, RIGHT leg stretched far behind, RIGHT arm swung forward, LEFT arm swung back — the exact MIRROR of cell 1',
-  'both legs passing directly under the body, knees bent close together, body slightly higher than the stride poses'
+  'LEFT arm punched far forward at shoulder height, RIGHT arm swung far behind the back, RIGHT leg planted far forward, LEFT leg stretched far behind — a wide running stride',
+  'both elbows bent at the sides mid-swing, both legs passing directly under the body, knees bent close together, body slightly higher than the stride poses',
+  'RIGHT arm punched far forward at shoulder height, LEFT arm swung far behind the back, LEFT leg planted far forward, RIGHT leg stretched far behind — the exact MIRROR of cell 1, arms AND legs swapped',
+  'both elbows bent at the sides mid-swing, both legs passing directly under the body, knees bent close together, body slightly higher than the stride poses'
 ];
 
 export const JUMP_POSE = 'mid-air jump pose with both knees tucked up and arms out for balance';
@@ -300,6 +304,8 @@ export const SLOT_SPECS = {
       RUN_CYCLE_POSES.map((pose, i) => `cell ${i + 1}: ${pose}; `).join('') +
       `cell 5: ${JUMP_POSE}; ` +
       `cell 6 (bottom-right): completely empty, nothing drawn, only the flat backdrop color. ` +
+      `The arms swing opposite to the legs: whichever leg is forward, the OTHER side's arm ` +
+      `is forward — the arms are NEVER in the same position in two stride cells. ` +
       `${SHEET_HELD_ITEM_CLAUSE} ` +
       `${SHEET_FRAMING_CLAUSE(chroma)}, ${style}`,
     fallbackSubject: (d) => d?.player
