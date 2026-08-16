@@ -138,6 +138,74 @@ export function borderResidueFraction(canvas, { band = 0.12, threshold = 228, ch
 }
 
 /**
+ * Clear backdrop pockets ENCLOSED inside a keyed sprite (the gap between an arm
+ * and the torso): border-flood keying structurally can't reach them, and they
+ * render as solid white/green patches "inside" the character. Only the
+ * unambiguous cases are cleared:
+ * - leftover CHROMA-colored regions (the prompt bans chroma on the subject), and
+ * - flat near-pure-white regions when the render used a chroma screen (pixel-art
+ *   clothing is shaded — a flat ≥246 white region on a green-screen render is
+ *   mispainted backdrop, not a shirt).
+ * Guards: only interior components (border-touching ones are the flood's job),
+ * each ≤ maxAreaFrac of the opaque area, and the whole pass reverts when it
+ * would remove >30% of the sprite (a legitimately white/pale character).
+ */
+export function removeEnclosedPockets(canvas, { chroma = null, maxAreaFrac = 0.25 } = {}) {
+  const w = canvas.width, h = canvas.height;
+  const ctx = canvas.getContext('2d');
+  const imageData = ctx.getImageData(0, 0, w, h);
+  const data = imageData.data;
+  const isPocketColor = (i) => {
+    const r = data[i], g = data[i + 1], b = data[i + 2];
+    if (chroma === 'green' && g >= 140 && g >= r + 50 && g >= b + 50) return true;
+    if (chroma === 'magenta' && r >= 140 && b >= 140 && r >= g + 50 && b >= g + 50) return true;
+    if (chroma && r >= 246 && g >= 246 && b >= 246) return true;
+    return false;
+  };
+  let opaque = 0;
+  const target = new Uint8Array(w * h);
+  for (let p = 0; p < w * h; p++) {
+    if (data[p * 4 + 3] === 0) continue;
+    opaque++;
+    if (isPocketColor(p * 4)) target[p] = 1;
+  }
+  if (!opaque) return canvas;
+  const seen = new Uint8Array(w * h);
+  const stack = [];
+  let removedTotal = 0;
+  const clearedPixels = [];
+  for (let start = 0; start < w * h; start++) {
+    if (!target[start] || seen[start]) continue;
+    // Flood one connected pocket-colored component.
+    const component = [];
+    let touchesBorder = false;
+    stack.push(start);
+    seen[start] = 1;
+    while (stack.length) {
+      const p = stack.pop();
+      component.push(p);
+      const x = p % w, y = (p / w) | 0;
+      if (x === 0 || y === 0 || x === w - 1 || y === h - 1) touchesBorder = true;
+      const neighbors = [p - 1, p + 1, p - w, p + w];
+      for (const n of neighbors) {
+        if (n < 0 || n >= w * h || seen[n] || !target[n]) continue;
+        const nx = n % w;
+        if (Math.abs(nx - x) > 1) continue; // row wrap
+        seen[n] = 1;
+        stack.push(n);
+      }
+    }
+    if (touchesBorder || component.length < 6 || component.length > opaque * maxAreaFrac) continue;
+    removedTotal += component.length;
+    clearedPixels.push(...component);
+  }
+  if (!removedTotal || removedTotal > opaque * 0.3) return canvas; // nothing, or revert
+  for (const p of clearedPixels) data[p * 4 + 3] = 0;
+  ctx.putImageData(imageData, 0, 0);
+  return canvas;
+}
+
+/**
  * Stretch each column's opaque span to the full canvas height, alpha forced solid.
  * For platform art: the game shows the texture inside a fixed physics rectangle, so
  * rounded "pill" shapes with transparent corners read as a platform floating off its
@@ -934,6 +1002,7 @@ export async function processSheet(rawSrc, spec, { inset = 3, chroma = null } = 
   const cells = rawCells
     .map((cell) => insetCanvas(cell, inset))
     .map((cell) => keyCellWithQuality(cell, { chroma }))
+    .map((cell) => (spec.post.pocketClean ? removeEnclosedPockets(cell, { chroma }) : cell))
     .map((cell) => cleanKeyedEdges(cell, { erode: 1, outline: !!spec.post.outline, despill: chroma }));
   const preview = assembleSheet(cells, spec.frames);
   const previewImg = await loadImage(preview.canvas.toDataURL('image/png'), { crossOrigin: null });
@@ -1229,6 +1298,11 @@ export async function postProcessAsset(rawSrc, spec, opts = {}) {
     canvas = drawToCanvas(img, { ...spec.canvas, fit: spec.post.fit });
   }
   canvas = applyKeying(canvas, spec.post.keying, opts.keyOverrides);
+  // Enclosed-gap pockets (arm/torso gaps painted backdrop-color) BEFORE the edge
+  // chain, so the cleared gaps get the same outline treatment as real edges.
+  if (spec.post.keying && spec.post.pocketClean) {
+    removeEnclosedPockets(canvas, { chroma: opts.chroma || null });
+  }
   if (spec.post.keying) {
     cleanKeyedEdges(canvas, {
       erode: spec.post.edgeErode ?? 1,

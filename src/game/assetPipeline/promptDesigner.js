@@ -6,7 +6,7 @@
  * descriptors plus a style guide; the slot scaffolds in slotSpecs.js append the
  * non-negotiable constraints (white background, facing right, tileability, framing).
  */
-import { SLOT_SPECS, BASELINE_SLOTS, BG_CLAUSE, PROPS_GRID_SPEC } from './slotSpecs';
+import { SLOT_SPECS, BASELINE_SLOTS, BG_CLAUSE, GAPS_CLAUSE, PROPS_GRID_SPEC } from './slotSpecs';
 import { isGeminiConfigured, generateJson } from './providers/geminiImage';
 
 /**
@@ -630,7 +630,7 @@ export function buildPropsGridPrompt(cellSlots, subjects, styleGuide, namedBySlo
     `boundaries. Reading left to right, top to bottom: ` +
     cellLines.join('; ') + `. ` +
     `Every cell shares one continuous backdrop: ${BG_CLAUSE(chroma)}, in every single cell, ` +
-    `no grid lines, no cell borders, no dividers, no shadows, no text, ` +
+    `${GAPS_CLAUSE}, no grid lines, no cell borders, no dividers, no shadows, no text, ` +
     `${styleBase(styleGuide)}`;
   return { prompt, chroma, cellSlots: [...cellSlots], layout };
 }

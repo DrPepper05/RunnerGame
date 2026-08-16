@@ -8,8 +8,8 @@
  * every caller handles it by downgrading to the built-in static theme asset set
  * (ScreenZero's toStaticThemeConfig; App surfaces it in the regen overlay).
  */
-import { SLOT_SPECS, BASELINE_SLOTS, GENERATED_SLOTS, GEMINI_SHEET_MODEL, GEMINI_PRO_SHEET_MODEL, GEMINI_IMAGE_FALLBACK_MODEL, PROPS_GRID_SPEC, BG_CLAUSE } from './slotSpecs';
-import { postProcessAsset, mirrorImage, drawToCanvas, alphaFraction, borderResidueFraction, topBandOpaqueFraction, contentBoundsOf, processSheet, finalizeSheetFrames, loadImage, keyCellWithQuality, cleanKeyedEdges, alignFrames, maskIoU, composeFilmstrip, lockPalette, sliceRawGrid } from './postprocess';
+import { SLOT_SPECS, BASELINE_SLOTS, GENERATED_SLOTS, GEMINI_SHEET_MODEL, GEMINI_PRO_SHEET_MODEL, GEMINI_IMAGE_FALLBACK_MODEL, PROPS_GRID_SPEC, BG_CLAUSE, GAPS_CLAUSE } from './slotSpecs';
+import { postProcessAsset, mirrorImage, drawToCanvas, alphaFraction, borderResidueFraction, topBandOpaqueFraction, contentBoundsOf, processSheet, finalizeSheetFrames, loadImage, keyCellWithQuality, cleanKeyedEdges, alignFrames, maskIoU, composeFilmstrip, lockPalette, sliceRawGrid, removeEnclosedPockets } from './postprocess';
 import { reviewSprite } from './qa';
 import * as gemini from './providers/geminiImage';
 import { designAssetPrompts, buildFinalPrompt, buildPropsGridPrompt, chromaFromPrompt } from './promptDesigner';
@@ -447,7 +447,7 @@ export async function generateAssets({
           : ''}. ` +
         `Redraw THIS EXACT character — identical design, colors, outfit and held items, do not reinvent ` +
         `anything — in a new pose: ${poseText}. Full body in side profile facing right, same size and ` +
-        `style as the reference, centered, ${BG_CLAUSE(chroma)}, no shadow, no ground, no motion lines, no text.`;
+        `style as the reference, centered, ${BG_CLAUSE(chroma)}, ${GAPS_CLAUSE}, no shadow, no ground, no motion lines, no text.`;
 
       // Sending a keyed (transparent) frame as a reference is ambiguous to the model —
       // compose it on white first.
@@ -476,7 +476,7 @@ export async function generateAssets({
         });
         const img = await loadImage(raw.dataUrl);
         const cell = drawToCanvas(img, { width, height, fit: 'stretch' });
-        return cleanKeyedEdges(keyCellWithQuality(cell, { chroma }), {
+        return cleanKeyedEdges(removeEnclosedPockets(keyCellWithQuality(cell, { chroma }), { chroma }), {
           erode: 1,
           outline: !!spec.post.outline,
           despill: chroma
@@ -689,9 +689,12 @@ export async function generateAssets({
         }
         let verdict = evaluateAndCullCells(cells, attemptSpec.frames);
         if (verdict.issue) {
-          // Repair rung: a handful of scorer-flagged frames get individually redrawn
-          // before we pay for a whole new sheet.
-          const repaired = await tryRepairFrames(cells, verdict);
+          // Repair rung: a handful of scorer-flagged frames get individually
+          // redrawn — but ONLY on the LAST attempt (2026-08-16): while a cheaper
+          // escalation rung remains, escalating (~one call) beats repairing 2-3
+          // frames (2-3 calls at flat per-image prices). On the final attempt
+          // repair is what stands between the sheet and the static fallback.
+          const repaired = attempt === maxSheetAttempts ? await tryRepairFrames(cells, verdict) : null;
           if (repaired) {
             attempts += repaired.calls;
             verdict = repaired.verdict;

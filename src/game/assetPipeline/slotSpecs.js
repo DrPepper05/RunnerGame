@@ -35,6 +35,14 @@ export const BG_CLAUSE = (chroma) => {
     `background one uniform flat color with NO gradients, NO noise, NO texture, NO shadows, ` +
     `and absolutely no ${c.ban} anywhere on the subject itself`;
 };
+// Character-slot addition to BG_CLAUSE: models routinely paint the ENCLOSED gaps
+// (between an arm and the torso, between the legs) white instead of the backdrop
+// color — border-flood keying can't reach them, so they ship as white patches
+// "inside" the sprite. Ask for the backdrop there explicitly; removeEnclosedPockets
+// in postprocess is the deterministic backstop.
+export const GAPS_CLAUSE =
+  'the background color also completely fills every gap and enclosed space between ' +
+  'the limbs and the body';
 
 /**
  * Slot spec shape:
@@ -88,7 +96,7 @@ const SHEET_HELD_ITEM_CLAUSE =
 const SHEET_FRAMING_CLAUSE = (chroma) =>
   `Character faces right in side profile in every cell, same character size and same ` +
   `ground line in every cell, each character centered in its own grid cell, ` +
-  `${BG_CLAUSE(chroma)} in every cell, no scenery, no floor, no shadows, ` +
+  `${BG_CLAUSE(chroma)} in every cell, ${GAPS_CLAUSE}, no scenery, no floor, no shadows, ` +
   `no motion lines, no grid lines, no cell borders, no text`;
 
 export const SLOT_SPECS = {
@@ -221,14 +229,14 @@ export const SLOT_SPECS = {
     // reference, so if animation quality drops, restore with
     // localStorage PM_MODEL_PLAYER='gemini-3.1-flash-image'.
     gen: { aspectRatio: '1:1', model: GEMINI_SLOT_MODEL, imageSize: '0.5K' },
-    post: { fit: 'stretch', keying: 'flood', trimBorder: false, crop: true, outline: true },
+    post: { fit: 'stretch', keying: 'flood', trimBorder: false, crop: true, outline: true, pocketClean: true },
     qa: { facing: true },
     // Front-loaded pose language ("mid-run stride") avoids stiff standing poses;
     // "no ground, no motion lines" suppresses baked-in floor streaks under runners.
     scaffold: (subject, style, { chroma } = {}) =>
       `2d video game character sprite, ${subject}, running to the right in a dynamic ` +
       `mid-run stride, full body in side profile facing right, single character ` +
-      `filling most of the frame, ${BG_CLAUSE(chroma)}, sharp ` +
+      `filling most of the frame, ${BG_CLAUSE(chroma)}, ${GAPS_CLAUSE}, sharp ` +
       `clean outline, no shadow, no ground, no motion lines, no text, ${style}`,
     fallbackSubject: (d) => d?.player
   },
@@ -236,12 +244,12 @@ export const SLOT_SPECS = {
     textureKey: 'dyn_enemy',
     canvas: { width: 128, height: 128 },
     gen: { aspectRatio: '1:1', model: GEMINI_SLOT_MODEL },
-    post: { fit: 'stretch', keying: 'flood', trimBorder: false, crop: true, outline: true },
+    post: { fit: 'stretch', keying: 'flood', trimBorder: false, crop: true, outline: true, pocketClean: true },
     qa: { facing: true },
     scaffold: (subject, style, { chroma } = {}) =>
       `2d video game enemy sprite, ${subject}, prowling to the right, full body in ` +
       `side profile facing right, single creature filling most of the frame, ` +
-      `${BG_CLAUSE(chroma)}, sharp clean outline, no shadow, no ground, ` +
+      `${BG_CLAUSE(chroma)}, ${GAPS_CLAUSE}, sharp clean outline, no shadow, no ground, ` +
       `no motion lines, no text, ${style}`,
     cellEssence: (subject, style) =>
       `2d video game enemy sprite, ${subject}, prowling to the right, full body in ` +
@@ -257,14 +265,15 @@ export const SLOT_SPECS = {
     textureKey: 'dyn_player',
     outputKey: 'player',
     canvas: { width: 384, height: 384 },
-    // Half-price sheet model (2026-08-16 cost flip): 2.5-flash-image bills at the
-    // lite rate and supports the reference-edit call; every gate (per-cell scoring,
-    // repair, filmstrip QA) still applies unchanged. If sheets start failing gates
-    // or looking worse, restore with
+    // Cheap-first sheet rung (2026-08-16 cost flip, revised same day after 2.5
+    // shipped a no-leg-swap cycle): 3.1-flash-lite bills the same $30/M as 2.5
+    // but is the 3.x family whose character consistency the sheet path depends
+    // on. The pipeline's attempt 2 ESCALATES to GEMINI_SHEET_MODEL (3.1-flash)
+    // whenever a gate — including the legsAlternate vision gate — rejects the
+    // cheap tier, so premium is paid only on failure. Restore always-premium with
     // localStorage PM_MODEL_SHEET='gemini-3.1-flash-image'.
-    // (imageSize is 3.x-only — 2.5 rejects it and the provider drops + remembers.)
-    gen: { aspectRatio: '1:1', model: GEMINI_IMAGE_FALLBACK_MODEL, imageSize: '1K' },
-    post: { fit: 'stretch', keying: 'flood', trimBorder: false, crop: false, minAlphaFraction: 0.3, outline: true },
+    gen: { aspectRatio: '1:1', model: GEMINI_SLOT_MODEL, imageSize: '1K' },
+    post: { fit: 'stretch', keying: 'flood', trimBorder: false, crop: false, minAlphaFraction: 0.3, outline: true, pocketClean: true },
     // Cells 0-7 (row-major) = full run cycle with alternating legs; cell 8 = jump pose
     frames: { cols: 3, rows: 3, runFrameCount: 8, jumpFrameIndex: 8 },
     fallbackSlot: 'player',
