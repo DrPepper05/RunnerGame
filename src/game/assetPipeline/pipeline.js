@@ -14,6 +14,7 @@ import { reviewSprite } from './qa';
 import * as gemini from './providers/geminiImage';
 import { designAssetPrompts, buildFinalPrompt, buildPropsGridPrompt, chromaFromPrompt } from './promptDesigner';
 import { parsePromptKeywords } from '../promptUtils';
+import { recordSheetAttempt, registerSheetReplayDeps } from './sheetDebug';
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -31,6 +32,15 @@ export const createCancelToken = () => ({
 });
 
 const cancelledError = () => Object.assign(new Error('Generation cancelled'), { cancelled: true });
+
+// The $0 replay harness re-runs the sheet slicer + scorer on captured raws with
+// the CURRENT code — registration (instead of an import in sheetDebug) avoids a
+// module cycle.
+registerSheetReplayDeps({
+  processSheet,
+  evaluateAndCullCells: (...args) => evaluateAndCullCells(...args),
+  sheetSpec: SLOT_SPECS.player_sheet
+});
 
 /**
  * Generate one slot's raw image on Gemini (the only image provider).
@@ -92,6 +102,187 @@ async function generateSlotImage(slot, prompt, seed, onProgress, maxAttemptsPerP
   }
 
   throw new Error(`Image generation failed for asset "${slot}". Last error: ${lastError?.message || 'call budget exhausted'}`);
+}
+
+// ---- Sheet frame scoring ---------------------------------------------------
+// Module-level pure canvas math (no closure state) so the $0 replay harness in
+// sheetDebug.js can re-run the exact shipping verdict on a captured raw sheet.
+
+// A sheet of near-identical poses animates as a nervous shiver, not a run.
+// Compare consecutive run frames on a coarse 12×12 alpha grid; if most pairs
+// are effectively the same image, the model ignored the cycle choreography.
+// The Math.max(2, …) floor matters for the 4-frame cycle: the old formula
+// flagged a 4-frame set as static on ONE similar pair out of three.
+export function framesLookStatic(runCells) {
+  const signature = (cell) => {
+    const small = document.createElement('canvas');
+    small.width = 12; small.height = 12;
+    const ctx = small.getContext('2d');
+    ctx.drawImage(cell, 0, 0, 12, 12);
+    return ctx.getImageData(0, 0, 12, 12).data;
+  };
+  const sigs = runCells.map(signature);
+  let staticPairs = 0;
+  for (let i = 1; i < sigs.length; i++) {
+    let diff = 0;
+    for (let p = 3; p < sigs[i].length; p += 4) diff += Math.abs(sigs[i][p] - sigs[i - 1][p]);
+    if (diff / (144 * 255) < 0.015) staticPairs++;
+  }
+  return staticPairs >= Math.max(2, Math.floor((runCells.length - 1) / 2));
+}
+
+// Identity drift scoring. Same character in a new pose keeps its palette; a
+// redesigned character shifts it — compare per-cell coarse color histograms
+// (4×4×4 RGB buckets over opaque pixels) against the element-wise median of
+// the RUN cells. L1 distance ranges 0..2; >0.9 = mostly different palette.
+// Returns one distance per cell (jump scored against the run median too),
+// or null when too few cells have content (geometry's job to reject).
+function frameHistogramDistances(cells, runCount) {
+  const histogram = (cell) => {
+    const small = document.createElement('canvas');
+    small.width = 32; small.height = 32;
+    const ctx = small.getContext('2d');
+    ctx.drawImage(cell, 0, 0, 32, 32);
+    const data = ctx.getImageData(0, 0, 32, 32).data;
+    const buckets = new Array(64).fill(0);
+    let opaque = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      if (data[i + 3] < 128) continue;
+      buckets[(data[i] >> 6) * 16 + (data[i + 1] >> 6) * 4 + (data[i + 2] >> 6)]++;
+      opaque++;
+    }
+    return opaque ? buckets.map(b => b / opaque) : null;
+  };
+  const hists = cells.map(histogram);
+  const runHists = hists.slice(0, runCount).filter(Boolean);
+  if (runHists.length < 3) return null;
+  const median = runHists[0].map((_, i) => {
+    const col = runHists.map(h => h[i]).sort((a, b) => a - b);
+    return col[Math.floor(col.length / 2)];
+  });
+  return hists.map((h) => {
+    if (!h) return 0; // empty cell — geometry flags it
+    let dist = 0;
+    for (let i = 0; i < 64; i++) dist += Math.abs(h[i] - median[i]);
+    return dist;
+  });
+}
+
+// Per-frame quality verdict: instead of rejecting a whole sheet for one or two
+// bad cells (the old all-or-nothing gates threw away the good frames), score
+// every frame — geometry (empty/undersized) and identity (histogram outlier)
+// — and CULL bad run frames, rebuilding a 1×N strip. The scene derives its
+// layout entirely from the frames meta, so a strip needs no scene changes.
+// gridMeta is the meta to keep when nothing is culled; pass null to always get
+// a strip (the sheet path does this since the 4-frame layout — its 3×2 grid
+// carries a prompted-empty cell that must never be registered as a frame).
+// Small-cycle thresholds (runCount ≤ 4): at most 1 culled run frame, ≥3
+// survivors, and a lower pose-jump IoU bar (contact↔pass deltas are larger by
+// design in the 4-pose cycle).
+export function evaluateAndCullCells(cells, gridMeta, runCountOverride = null) {
+  const runCount = Math.min(runCountOverride ?? gridMeta?.runFrameCount ?? cells.length, cells.length);
+  const hasJump = cells.length > runCount;
+  const jumpCell = hasJump ? cells[cells.length - 1] : null;
+  const maxBadRun = runCount <= 4 ? 1 : 2;
+  const minKept = runCount <= 4 ? 3 : 4;
+  const lowIoU = runCount <= 4 ? 0.25 : 0.30;
+
+  const bad = new Array(cells.length).fill(false);
+  let geomIssue = null;
+  cells.forEach((cell, i) => {
+    const bounds = contentBoundsOf(cell);
+    const issue = !bounds ? 'has empty cells'
+      : (bounds.maxY - bounds.minY + 1 < cell.height * 0.3 ? 'has undersized frames' : null);
+    if (issue) { bad[i] = true; geomIssue = geomIssue || issue; }
+  });
+  const dists = frameHistogramDistances(cells, runCount);
+  let identityIssue = false;
+  if (dists) {
+    cells.forEach((_, i) => {
+      if (dists[i] > 0.9) { bad[i] = true; if (i < runCount) identityIssue = true; }
+    });
+  }
+
+  // Continuity scoring on ALIGNED copies (scoring unaligned cells would flag
+  // placement drift, which alignment fixes for free, instead of content faults).
+  // Consecutive run frames of one stride overlap substantially — a frame whose
+  // every healthy neighbor shares almost no silhouette is a pose/identity jump;
+  // a near-perfect overlap is a duplicated cell (animates as a stutter).
+  const aligned = alignFrames(cells, { runFrameCount: runCount });
+  const ious = [];
+  for (let i = 1; i < runCount && i < aligned.length; i++) {
+    ious[i] = (bad[i - 1] || bad[i]) ? null : maskIoU(aligned[i - 1], aligned[i]);
+  }
+  for (let i = 0; i < runCount; i++) {
+    if (bad[i]) continue;
+    const neighborIous = [i > 0 ? ious[i] : null, i + 1 < runCount ? ious[i + 1] : null]
+      .filter((v) => v != null);
+    if (neighborIous.length && neighborIous.every((v) => v < lowIoU)) bad[i] = true;
+  }
+  for (let i = 1; i < runCount; i++) {
+    if (!bad[i] && ious[i] != null && ious[i] > 0.965) bad[i] = true; // duplicate — keep the first
+  }
+
+  const badRunCount = bad.slice(0, runCount).filter(Boolean).length;
+  const keptRun = cells.slice(0, runCount).filter((_, i) => !bad[i]);
+  if (badRunCount > maxBadRun || keptRun.length < minKept) {
+    return {
+      issue: identityIssue ? 'draws a different character per frame' : (geomIssue || 'has inconsistent frames'),
+      // Which frames failed — lets the repair rung redraw exactly these.
+      badIndices: bad.map((b, i) => (b ? i : -1)).filter((i) => i >= 0)
+    };
+  }
+  // Survivors must still read as one coherent cycle (same thresholds as the
+  // old whole-sheet gates, applied to what actually ships).
+  if (framesLookStatic(keptRun)) return { issue: 'has near-identical frames' };
+  const heights = keptRun.map((c) => {
+    const b = contentBoundsOf(c);
+    return b.maxY - b.minY + 1;
+  });
+  if (Math.max(...heights) / Math.min(...heights) > 1.35) return { issue: 'has inconsistent frame sizes' };
+
+  const jumpKept = hasJump && !bad[cells.length - 1];
+  if (badRunCount === 0 && (!hasJump || jumpKept) && gridMeta) {
+    return { keptCells: cells, framesMeta: gridMeta, dropped: 0 };
+  }
+  const keptCells = jumpKept ? [...keptRun, jumpCell] : keptRun;
+  const framesMeta = {
+    cols: keptCells.length,
+    rows: 1,
+    runFrameCount: keptRun.length,
+    // jump dropped → omit jumpFrameIndex; playPlayerAnim falls back to frame 1
+    ...(jumpKept ? { jumpFrameIndex: keptRun.length } : {})
+  };
+  return { keptCells, framesMeta, dropped: cells.length - keptCells.length };
+}
+
+// Drop vision-flagged frames from an already-culled kept set, rebuilding strip
+// meta. Returns null when the survivors can't carry a cycle. A jumpFrameIndex
+// BELOW runFrameCount means a run frame doubles as the jump pose — it must be
+// remapped, never appended as an extra cell.
+function cullFromKept(keptCells, framesMeta, badSet) {
+  const runCount = framesMeta.runFrameCount ?? keptCells.length;
+  const minRun = runCount <= 4 ? 3 : 4;
+  const keptRun = [];
+  for (let i = 0; i < runCount; i++) if (!badSet.has(i)) keptRun.push(keptCells[i]);
+  if (keptRun.length < minRun) return null;
+  const cellsOut = [...keptRun];
+  let jumpMeta = {};
+  const jumpIdx = framesMeta.jumpFrameIndex;
+  if (jumpIdx != null && !badSet.has(jumpIdx)) {
+    if (jumpIdx >= runCount) {
+      cellsOut.push(keptCells[jumpIdx]); // dedicated jump cell rides along last
+      jumpMeta = { jumpFrameIndex: keptRun.length };
+    } else {
+      let newIdx = 0;
+      for (let i = 0; i < jumpIdx; i++) if (!badSet.has(i)) newIdx++;
+      jumpMeta = { jumpFrameIndex: newIdx };
+    }
+  }
+  return {
+    keptCells: cellsOut,
+    framesMeta: { cols: cellsOut.length, rows: 1, runFrameCount: keptRun.length, ...jumpMeta }
+  };
 }
 
 /**
@@ -303,143 +494,6 @@ export async function generateAssets({
         const canvas = drawToCanvas(img, { width: img.naturalWidth, height: img.naturalHeight, fit: 'stretch' });
         return alphaFraction(canvas);
       };
-      // A sheet of near-identical poses animates as a nervous shiver, not a run.
-      // Compare consecutive run frames on a coarse 12×12 alpha grid; if most pairs
-      // are effectively the same image, the model ignored the cycle choreography.
-      const framesLookStatic = (runCells) => {
-        const signature = (cell) => {
-          const small = document.createElement('canvas');
-          small.width = 12; small.height = 12;
-          const ctx = small.getContext('2d');
-          ctx.drawImage(cell, 0, 0, 12, 12);
-          return ctx.getImageData(0, 0, 12, 12).data;
-        };
-        const sigs = runCells.map(signature);
-        let staticPairs = 0;
-        for (let i = 1; i < sigs.length; i++) {
-          let diff = 0;
-          for (let p = 3; p < sigs[i].length; p += 4) diff += Math.abs(sigs[i][p] - sigs[i - 1][p]);
-          if (diff / (144 * 255) < 0.015) staticPairs++;
-        }
-        return staticPairs >= Math.floor((runCells.length - 1) / 2);
-      };
-      // Identity drift scoring. Same character in a new pose keeps its palette; a
-      // redesigned character shifts it — compare per-cell coarse color histograms
-      // (4×4×4 RGB buckets over opaque pixels) against the element-wise median of
-      // the RUN cells. L1 distance ranges 0..2; >0.9 = mostly different palette.
-      // Returns one distance per cell (jump scored against the run median too),
-      // or null when too few cells have content (geometry's job to reject).
-      const frameHistogramDistances = (cells, runCount) => {
-        const histogram = (cell) => {
-          const small = document.createElement('canvas');
-          small.width = 32; small.height = 32;
-          const ctx = small.getContext('2d');
-          ctx.drawImage(cell, 0, 0, 32, 32);
-          const data = ctx.getImageData(0, 0, 32, 32).data;
-          const buckets = new Array(64).fill(0);
-          let opaque = 0;
-          for (let i = 0; i < data.length; i += 4) {
-            if (data[i + 3] < 128) continue;
-            buckets[(data[i] >> 6) * 16 + (data[i + 1] >> 6) * 4 + (data[i + 2] >> 6)]++;
-            opaque++;
-          }
-          return opaque ? buckets.map(b => b / opaque) : null;
-        };
-        const hists = cells.map(histogram);
-        const runHists = hists.slice(0, runCount).filter(Boolean);
-        if (runHists.length < 3) return null;
-        const median = runHists[0].map((_, i) => {
-          const col = runHists.map(h => h[i]).sort((a, b) => a - b);
-          return col[Math.floor(col.length / 2)];
-        });
-        return hists.map((h) => {
-          if (!h) return 0; // empty cell — geometry flags it
-          let dist = 0;
-          for (let i = 0; i < 64; i++) dist += Math.abs(h[i] - median[i]);
-          return dist;
-        });
-      };
-      // Per-frame quality verdict: instead of rejecting a whole sheet for one or two
-      // bad cells (the old all-or-nothing gates threw away 7 good frames), score
-      // every frame — geometry (empty/undersized) and identity (histogram outlier)
-      // — and CULL up to two bad run frames, rebuilding a 1×N strip. The scene
-      // derives its layout entirely from the frames meta, so a strip needs no scene
-      // changes. gridMeta is the meta to keep when nothing is culled; pass null for
-      // already-loose frame lists (per-frame escalation) to always get a strip.
-      const evaluateAndCullCells = (cells, gridMeta, runCountOverride = null) => {
-        const runCount = Math.min(runCountOverride ?? gridMeta?.runFrameCount ?? cells.length, cells.length);
-        const hasJump = cells.length > runCount;
-        const jumpCell = hasJump ? cells[cells.length - 1] : null;
-
-        const bad = new Array(cells.length).fill(false);
-        let geomIssue = null;
-        cells.forEach((cell, i) => {
-          const bounds = contentBoundsOf(cell);
-          const issue = !bounds ? 'has empty cells'
-            : (bounds.maxY - bounds.minY + 1 < cell.height * 0.3 ? 'has undersized frames' : null);
-          if (issue) { bad[i] = true; geomIssue = geomIssue || issue; }
-        });
-        const dists = frameHistogramDistances(cells, runCount);
-        let identityIssue = false;
-        if (dists) {
-          cells.forEach((_, i) => {
-            if (dists[i] > 0.9) { bad[i] = true; if (i < runCount) identityIssue = true; }
-          });
-        }
-
-        // Continuity scoring on ALIGNED copies (scoring unaligned cells would flag
-        // placement drift, which alignment fixes for free, instead of content faults).
-        // Consecutive run frames of one stride overlap substantially — a frame whose
-        // every healthy neighbor shares almost no silhouette is a pose/identity jump;
-        // a near-perfect overlap is a duplicated cell (animates as a stutter).
-        const aligned = alignFrames(cells, { runFrameCount: runCount });
-        const ious = [];
-        for (let i = 1; i < runCount && i < aligned.length; i++) {
-          ious[i] = (bad[i - 1] || bad[i]) ? null : maskIoU(aligned[i - 1], aligned[i]);
-        }
-        for (let i = 0; i < runCount; i++) {
-          if (bad[i]) continue;
-          const neighborIous = [i > 0 ? ious[i] : null, i + 1 < runCount ? ious[i + 1] : null]
-            .filter((v) => v != null);
-          if (neighborIous.length && neighborIous.every((v) => v < 0.30)) bad[i] = true;
-        }
-        for (let i = 1; i < runCount; i++) {
-          if (!bad[i] && ious[i] != null && ious[i] > 0.965) bad[i] = true; // duplicate — keep the first
-        }
-
-        const badRunCount = bad.slice(0, runCount).filter(Boolean).length;
-        const keptRun = cells.slice(0, runCount).filter((_, i) => !bad[i]);
-        if (badRunCount > 2 || keptRun.length < 4) {
-          return {
-            issue: identityIssue ? 'draws a different character per frame' : (geomIssue || 'has inconsistent frames'),
-            // Which frames failed — lets the repair rung redraw exactly these.
-            badIndices: bad.map((b, i) => (b ? i : -1)).filter((i) => i >= 0)
-          };
-        }
-        // Survivors must still read as one coherent cycle (same thresholds as the
-        // old whole-sheet gates, applied to what actually ships).
-        if (framesLookStatic(keptRun)) return { issue: 'has near-identical frames' };
-        const heights = keptRun.map((c) => {
-          const b = contentBoundsOf(c);
-          return b.maxY - b.minY + 1;
-        });
-        if (Math.max(...heights) / Math.min(...heights) > 1.35) return { issue: 'has inconsistent frame sizes' };
-
-        const jumpKept = hasJump && !bad[cells.length - 1];
-        if (badRunCount === 0 && (!hasJump || jumpKept) && gridMeta) {
-          return { keptCells: cells, framesMeta: gridMeta, dropped: 0 };
-        }
-        const keptCells = jumpKept ? [...keptRun, jumpCell] : keptRun;
-        const framesMeta = {
-          cols: keptCells.length,
-          rows: 1,
-          runFrameCount: keptRun.length,
-          // jump dropped → omit jumpFrameIndex; playPlayerAnim falls back to frame 1
-          ...(jumpKept ? { jumpFrameIndex: keptRun.length } : {})
-        };
-        return { keptCells, framesMeta, dropped: cells.length - keptCells.length };
-      };
-
       // ---- Shared single-frame machinery (repair rung + per-frame escalation) ----
       const framePrompt = (poseText, hasPrevFrame = false) =>
         `Use the character in the attached reference image${hasPrevFrame
@@ -528,36 +582,8 @@ export async function generateAssets({
             return null;
           }
         }
-        const reVerdict = evaluateAndCullCells(repaired, activeSpec.frames);
+        const reVerdict = evaluateAndCullCells(repaired, null, activeSpec.frames.runFrameCount);
         return reVerdict.issue ? null : { verdict: reVerdict, calls };
-      };
-
-      // Drop vision-flagged frames from an already-culled kept set, rebuilding strip
-      // meta. Returns null when the survivors can't carry a cycle. A jumpFrameIndex
-      // BELOW runFrameCount means a run frame doubles as the jump pose (free 2×2) —
-      // it must be remapped, never appended as an extra cell.
-      const cullFromKept = (keptCells, framesMeta, badSet) => {
-        const runCount = framesMeta.runFrameCount ?? keptCells.length;
-        const keptRun = [];
-        for (let i = 0; i < runCount; i++) if (!badSet.has(i)) keptRun.push(keptCells[i]);
-        if (keptRun.length < 4) return null;
-        const cellsOut = [...keptRun];
-        let jumpMeta = {};
-        const jumpIdx = framesMeta.jumpFrameIndex;
-        if (jumpIdx != null && !badSet.has(jumpIdx)) {
-          if (jumpIdx >= runCount) {
-            cellsOut.push(keptCells[jumpIdx]); // dedicated jump cell rides along last
-            jumpMeta = { jumpFrameIndex: keptRun.length };
-          } else {
-            let newIdx = 0;
-            for (let i = 0; i < jumpIdx; i++) if (!badSet.has(i)) newIdx++;
-            jumpMeta = { jumpFrameIndex: newIdx };
-          }
-        }
-        return {
-          keptCells: cellsOut,
-          framesMeta: { cols: cellsOut.length, rows: 1, runFrameCount: keptRun.length, ...jumpMeta }
-        };
       };
 
       // Escalation rung: the cheap single-grid sheet failed its gates — draw every
@@ -680,14 +706,32 @@ export async function generateAssets({
         provider = raw.provider;
         servedModel = raw.model || servedModel;
         attempts += raw.attempts;
+        // Debug capture (in-memory, $0): the raw sheet + every verdict accrue on
+        // this record — __PM_SHEET_DEBUG.download() after a run hands over full
+        // diagnostic material, replay() re-scores it offline.
+        const dbg = recordSheetAttempt({
+          attempt,
+          model: raw.model || attemptSpec.gen.model,
+          prompt: sheetPrompt,
+          rawDataUrl: raw.dataUrl,
+          chroma,
+          baseSrc
+        });
         // Cells are keyed INDIVIDUALLY — whole-sheet flood keying can never reach the
-        // backdrop of interior cells (e.g. the center of a 3×3)
-        const { previewImg, cells } = await processSheet(raw.dataUrl, attemptSpec, { chroma });
+        // backdrop of interior cells
+        const processed = await processSheet(raw.dataUrl, attemptSpec, { chroma });
+        const previewImg = processed.previewImg;
+        // Trim the prompted-empty trailing cell(s) before scoring — the layout
+        // carries a blank 6th cell so the 5 real frames get a clean 3×2 grid.
+        const cells = processed.cells.slice(0, attemptSpec.frames.usedCells ?? processed.cells.length);
         if (sheetTransparency(previewImg) < attemptSpec.post.minAlphaFraction) {
           lastIssue = 'kept a painted background';
+          dbg.scorerIssue = lastIssue;
           continue;
         }
-        let verdict = evaluateAndCullCells(cells, attemptSpec.frames);
+        // gridMeta null → ALWAYS rebuild a 1×N strip: the grid meta describes 6
+        // cells including the blank, which must never register as a frame.
+        let verdict = evaluateAndCullCells(cells, null, attemptSpec.frames.runFrameCount);
         if (verdict.issue) {
           // Repair rung: a handful of scorer-flagged frames get individually
           // redrawn — but ONLY on the LAST attempt (2026-08-16): while a cheaper
@@ -700,6 +744,8 @@ export async function generateAssets({
             verdict = repaired.verdict;
           } else {
             lastIssue = verdict.issue;
+            dbg.scorerIssue = lastIssue;
+            dbg.badIndices = verdict.badIndices;
             continue;
           }
         }
@@ -712,11 +758,13 @@ export async function generateAssets({
           label: 'qa:player_sheet',
           grid: { frameCount: verdict.keptCells.length, runFrameCount: stripMeta.runFrameCount ?? verdict.keptCells.length }
         });
+        dbg.review = review;
         // Cost rule: vision verdicts are cull-only except the one terminal case
         // (wrong character) — a failed attempt here means another PAID generation,
         // so imperfect-but-coherent strips ship instead of being redone.
         if (review && review.sameCharacter === false) {
           lastIssue = 'looks like different characters (vision QA)';
+          dbg.scorerIssue = lastIssue;
           continue;
         }
         // A run cycle whose legs never swap animates as a glide, not a run — the
@@ -727,12 +775,21 @@ export async function generateAssets({
         // On the FINAL attempt the best-effort sheet SHIPS: a gliding multi-frame
         // cycle still beats the static-bob fallback (which reads as "no animation"
         // — the exact complaint that surfaced when this gate rejected everything).
-        if (review && review.legsAlternate === false) {
+        // Per-frame leadingLeg answers (when present and sane) beat the lazy
+        // whole-strip boolean: the judge is forced to commit per frame, and the
+        // code derives alternation — a real cycle names BOTH 'left' and 'right'.
+        const leading = Array.isArray(review?.leadingLeg) ? review.leadingLeg : null;
+        const legsOk = leading && leading.length >= 2
+          ? (leading.includes('left') && leading.includes('right'))
+          : review?.legsAlternate;
+        if (review && legsOk === false) {
           if (attempt < maxSheetAttempts) {
             lastIssue = 'never switches legs (vision QA)';
+            dbg.scorerIssue = lastIssue;
             continue;
           }
           report('[ASSETS] Run cycle legs still not alternating on the final attempt — shipping best effort.');
+          dbg.outcome = 'shipped-best-effort';
         }
         if (review?.badFrames?.length) {
           const badSet = new Set(review.badFrames.map((n) => n - 1)
@@ -754,8 +811,13 @@ export async function generateAssets({
         sheet = await finalizeSheetFrames(keptCells, activeSpec, { mirror: mirrored, framesMeta: verdict.framesMeta });
         if (!sheet) {
           lastIssue = 'had no visible content';
-        } else if (verdict.dropped) {
-          report(`[ASSETS] Dropped ${verdict.dropped} inconsistent frame(s) from the run cycle`);
+          dbg.scorerIssue = lastIssue;
+        } else {
+          dbg.outcome = dbg.outcome || 'shipped';
+          dbg.framesMeta = sheet.frames;
+          if (verdict.dropped) {
+            report(`[ASSETS] Dropped ${verdict.dropped} inconsistent frame(s) from the run cycle`);
+          }
         }
       }
 
@@ -792,6 +854,7 @@ export async function generateAssets({
       // The static base is already generated, keyed and registered — keep it.
       console.warn(`[AssetPipeline] Sprite sheet failed (${err.message}) — keeping the static "${spec.fallbackSlot}" sprite.`);
       report(`[ASSETS] Animated player unavailable, keeping static sprite.`);
+      recordSheetAttempt({ outcome: 'static-fallback', reason: err.message });
       delete slotFraction[slot];
     }
   };

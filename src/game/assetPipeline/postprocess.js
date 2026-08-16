@@ -140,15 +140,17 @@ export function borderResidueFraction(canvas, { band = 0.12, threshold = 228, ch
 /**
  * Clear backdrop pockets ENCLOSED inside a keyed sprite (the gap between an arm
  * and the torso): border-flood keying structurally can't reach them, and they
- * render as solid white/green patches "inside" the character. Only the
- * unambiguous cases are cleared:
- * - leftover CHROMA-colored regions (the prompt bans chroma on the subject), and
- * - flat near-pure-white regions when the render used a chroma screen (pixel-art
- *   clothing is shaded — a flat ≥246 white region on a green-screen render is
- *   mispainted backdrop, not a shirt).
+ * render as solid patches "inside" the character. ONLY leftover CHROMA-colored
+ * regions are cleared — the prompt bans chroma on the subject, so they are
+ * unambiguously backdrop. White pockets are deliberately NOT touched: a
+ * white-clearing variant shipped 2026-08-16 and shredded white-heavy characters
+ * (mummy bandages) differently per sheet cell, blowing up the per-cell identity
+ * scorer and killing every sheet attempt. White gaps are handled on the prompt
+ * side (GAPS_CLAUSE asks for backdrop color inside limb gaps — which makes them
+ * chroma-colored and therefore clearable here).
  * Guards: only interior components (border-touching ones are the flood's job),
  * each ≤ maxAreaFrac of the opaque area, and the whole pass reverts when it
- * would remove >30% of the sprite (a legitimately white/pale character).
+ * would remove >30% of the sprite.
  */
 export function removeEnclosedPockets(canvas, { chroma = null, maxAreaFrac = 0.25 } = {}) {
   const w = canvas.width, h = canvas.height;
@@ -159,7 +161,6 @@ export function removeEnclosedPockets(canvas, { chroma = null, maxAreaFrac = 0.2
     const r = data[i], g = data[i + 1], b = data[i + 2];
     if (chroma === 'green' && g >= 140 && g >= r + 50 && g >= b + 50) return true;
     if (chroma === 'magenta' && r >= 140 && b >= 140 && r >= g + 50 && b >= g + 50) return true;
-    if (chroma && r >= 246 && g >= 246 && b >= 246) return true;
     return false;
   };
   let opaque = 0;

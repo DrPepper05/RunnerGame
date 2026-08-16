@@ -41,6 +41,14 @@ const STRIP_SCHEMA = {
     facingRight: { type: 'BOOLEAN', description: 'Does the character face the RIGHT side of the image in the frames?' },
     sameCharacter: { type: 'BOOLEAN', description: 'Is every numbered frame clearly the SAME character (same design, colors, outfit)?' },
     legsAlternate: { type: 'BOOLEAN', description: 'Across the run frames, do some frames show the LEFT leg leading and others the RIGHT leg leading?' },
+    // Per-frame commitment beats a lazy whole-strip boolean: the pipeline derives
+    // alternation from this list in code (needs BOTH "left" and "right" present)
+    // and falls back to legsAlternate when the list is missing/short.
+    leadingLeg: {
+      type: 'ARRAY',
+      items: { type: 'STRING' },
+      description: 'One entry PER RUN FRAME in order (frame 1 first): which leg is planted or leading in front — exactly "left", "right", "both-under-body" (passing pose, legs together under the body), or "unclear".'
+    },
     badFrames: {
       type: 'ARRAY',
       items: { type: 'INTEGER' },
@@ -75,6 +83,9 @@ function buildPrompt(kind, grid) {
       '- facingRight: does the character face the RIGHT side of the image?\n' +
       '- sameCharacter: is every frame clearly the same character — same face, colors, outfit, held items?\n' +
       '- legsAlternate: across the run frames, do some frames show the LEFT leg leading and others the RIGHT?\n' +
+      `- leadingLeg: for EACH run frame 1 to ${runCount} in order, which leg is planted or leading in front: ` +
+      '"left", "right", "both-under-body" (passing pose, legs together under the body), or "unclear". ' +
+      'Look at each frame individually before answering.\n' +
       '- badFrames: list the frame NUMBERS that break the animation (different-looking character, ' +
       'corrupted or incomplete drawing, leftover backdrop patch). Use an empty list when all frames are fine — ' +
       'normal pose differences between stride phases are NOT bad frames.'

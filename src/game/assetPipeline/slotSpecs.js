@@ -69,18 +69,19 @@ export const GAPS_CLAUSE =
  *                      the designer (LLM or local) only supplies the subject descriptor
  *  - fallbackSubject   picks the subject out of assetDesignDirections when no designer ran
  */
-// The eight canonical run-cycle phases (contact/pass/airborne/reach, right lead then
-// left lead) — the single source for the 3×3 sheet scaffold and the Gemini
-// per-frame escalation prompts.
+// The four canonical run-cycle phases (contact-right / pass / contact-left / pass) —
+// the single source for the sheet scaffold, the repair rung and the per-frame
+// escalation prompts. Reduced from 8 phases on 2026-08-16: eight subtle stride
+// phases made image models collapse the poses (no leg swap) and drift the
+// character identity across nine cells; four STARKLY contrasted poses is the
+// classic retro cycle and a far easier ask. Poses 2 and 4 are the same passing
+// pose ON PURPOSE (a real cycle repeats it; they are never IoU-adjacent so the
+// duplicate cull — consecutive pairs only — cannot fire on them).
 export const RUN_CYCLE_POSES = [
-  'right foot planted on the ground ahead, left leg trailing behind, left arm swung forward, right arm swung back',
-  'legs passing close together under the crouched body, arms pumping at the sides',
-  'airborne, left knee lifted in front, right leg trailing behind, right arm swung forward',
-  'left foot reaching forward about to land, arms passing level',
-  'left foot planted on the ground ahead, right leg trailing behind, right arm swung forward, left arm swung back — the same stride as the first contact pose with the legs swapped',
-  'legs passing close together under the crouched body, arms pumping at the sides',
-  'airborne, right knee lifted in front, left leg trailing behind, left arm swung forward',
-  'right foot reaching forward about to land, arms passing level'
+  'RIGHT leg planted far forward, LEFT leg stretched far behind, LEFT arm swung forward, RIGHT arm swung back — a wide running stride',
+  'both legs passing directly under the body, knees bent close together, body slightly higher than the stride poses',
+  'LEFT leg planted far forward, RIGHT leg stretched far behind, RIGHT arm swung forward, LEFT arm swung back — the exact MIRROR of cell 1',
+  'both legs passing directly under the body, knees bent close together, body slightly higher than the stride poses'
 ];
 
 export const JUMP_POSE = 'mid-air jump pose with both knees tucked up and arms out for balance';
@@ -264,7 +265,7 @@ export const SLOT_SPECS = {
   player_sheet: {
     textureKey: 'dyn_player',
     outputKey: 'player',
-    canvas: { width: 384, height: 384 },
+    canvas: { width: 384, height: 256 },
     // Cheap-first sheet rung (2026-08-16 cost flip, revised same day after 2.5
     // shipped a no-leg-swap cycle): 3.1-flash-lite bills the same $30/M as 2.5
     // but is the 3.x family whose character consistency the sheet path depends
@@ -272,34 +273,33 @@ export const SLOT_SPECS = {
     // whenever a gate — including the legsAlternate vision gate — rejects the
     // cheap tier, so premium is paid only on failure. Restore always-premium with
     // localStorage PM_MODEL_SHEET='gemini-3.1-flash-image'.
-    gen: { aspectRatio: '1:1', model: GEMINI_SLOT_MODEL, imageSize: '1K' },
+    gen: { aspectRatio: '3:2', model: GEMINI_SLOT_MODEL, imageSize: '1K' },
     post: { fit: 'stretch', keying: 'flood', trimBorder: false, crop: false, minAlphaFraction: 0.3, outline: true, pocketClean: true },
-    // Cells 0-7 (row-major) = full run cycle with alternating legs; cell 8 = jump pose
-    frames: { cols: 3, rows: 3, runFrameCount: 8, jumpFrameIndex: 8 },
+    // 3×2 grid: cells 0-3 = the four-phase run cycle, cell 4 = jump pose, cell 5
+    // = prompted EMPTY (usedCells trims it before scoring — the pipeline always
+    // rebuilds a 1×N strip, so the blank cell never reaches the game).
+    frames: { cols: 3, rows: 2, runFrameCount: 4, jumpFrameIndex: 4, usedCells: 5 },
     fallbackSlot: 'player',
     subjectKey: 'player',
     qa: { facing: true, grid: true },
-    // Shared pose descriptors: the 3×3 scaffold and the Gemini per-frame
-    // escalation both draw from this single source.
+    // Shared pose descriptors: the sheet scaffold, the repair rung and the
+    // per-frame escalation all draw from this single source.
     poses: { run: RUN_CYCLE_POSES, jump: JUMP_POSE },
-    // The eight canonical run-cycle phases are named cell by cell — an abstract
-    // "alternating legs" instruction produces eight near-identical poses; explicit
-    // per-cell choreography (contact/down/passing/up, right lead then left lead)
-    // is what actually makes the legs swap.
-    // Identity FIRST, choreography second: the failure mode that ships is not "poses
-    // too subtle" but "a different-looking character in every cell" — so the prompt
-    // leads with copied-nine-times identity language, then gives the eight canonical
-    // run phases cell by cell (contact/pass/airborne/reach, right lead then left
-    // lead). Do NOT demand every cell differ from every OTHER cell: a run cycle
-    // legitimately repeats its passing poses (cells 2/6), and "dramatically
-    // different" pressure makes models redesign the character per cell.
+    // Identity FIRST, choreography second: the failure mode that ships is not
+    // "poses too subtle" but "a different-looking character in every cell" — so
+    // the prompt leads with copied-five-times identity language, then names the
+    // four starkly contrasted stride phases cell by cell. Do NOT demand every
+    // cell differ from every OTHER cell: the cycle legitimately repeats its
+    // passing pose (cells 2/4), and "dramatically different" pressure makes
+    // models redesign the character per cell (regression observed 2026-07-30).
     scaffold: (subject, style, { chroma } = {}) =>
-      `sprite sheet, a 3x3 grid of nine animation frames of the EXACT SAME video game ` +
-      `character: ${subject}. ${SHEET_IDENTITY_CLAUSE('nine')} ` +
-      `Reading left to right, top to bottom, cells 1 to 8 are the eight phases of one ` +
-      `full running stride: ` +
+      `sprite sheet, a 3x2 grid of six cells: five animation frames of the EXACT SAME ` +
+      `video game character: ${subject}. ${SHEET_IDENTITY_CLAUSE('five')} ` +
+      `Reading left to right, top to bottom, cells 1 to 4 are the four phases of one ` +
+      `full running stride with STRONGLY CONTRASTED leg positions: ` +
       RUN_CYCLE_POSES.map((pose, i) => `cell ${i + 1}: ${pose}; `).join('') +
-      `cell 9 (bottom-right): ${JUMP_POSE}. ` +
+      `cell 5: ${JUMP_POSE}; ` +
+      `cell 6 (bottom-right): completely empty, nothing drawn, only the flat backdrop color. ` +
       `${SHEET_HELD_ITEM_CLAUSE} ` +
       `${SHEET_FRAMING_CLAUSE(chroma)}, ${style}`,
     fallbackSubject: (d) => d?.player
