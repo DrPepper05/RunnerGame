@@ -259,13 +259,16 @@ async function tryMatchedReuse({ config, userPrompt, promptKey, onProgress, canc
   const reason = verdict.reason ? ` (${verdict.reason})` : '';
 
   // Playerless population sets (bulk generates themes WITHOUT players): complete
-  // the missing player on first real keyed use — one static-player image ≈ $0.04-0.08
-  // (billing is flat per image; the exact price is the player slot's model tier).
+  // the missing player on first real keyed use — the ANIMATED sheet path
+  // (static base + sheet ≈ $0.09-0.18; the old "players later" static-only
+  // top-up shipped every cache-matched game with the tilting bob, the top user
+  // complaint 2026-08-16). The completed set persists, so later hits get the
+  // animated player at $0.
   // Cache-only/keyless skip this; the scene's theme-player fallback covers them.
   // (Deliberately AFTER the ≤3 threshold — completing a player never disqualifies
   // an otherwise-good match.)
-  if (!cacheOnly && !baseImages.player && !slots.includes('player') && isGeminiConfigured()) {
-    slots = [...slots, 'player'];
+  if (!cacheOnly && !baseImages.player && !slots.includes('player') && !slots.includes('player_sheet') && isGeminiConfigured()) {
+    slots = [...slots, 'player_sheet'];
   }
 
   if (!slots.length) {
@@ -300,11 +303,11 @@ async function tryMatchedReuse({ config, userPrompt, promptKey, onProgress, canc
   }
 
   // Partial reuse: redraw only the clashing slots (~$0.04/slot vs ~$0.40/game).
-  // 'player' stays the STATIC slot (not player_sheet) for now — the "players
-  // later" direction: animation sheets get their own round; the static sprite +
-  // procedural run-bob covers gameplay.
+  // A player redraw always takes the ANIMATED sheet path (player→player_sheet;
+  // the sheet's output lands under the 'player' key with frames meta, so the
+  // merge below needs no special-casing).
   onProgress?.(`[CACHE] Matched cached game "${label}"${reason} — reusing base art, redrawing: ${slots.join(', ')}`, 78);
-  const regenSlots = [...new Set(slots)];
+  const regenSlots = [...new Set(slots.map((s) => (s === 'player' ? 'player_sheet' : s)))];
   let regen = null;
   try {
     regen = await regenerateAssetSlots({ config, instruction: userPrompt, slots: regenSlots, onProgress, cancelToken });
