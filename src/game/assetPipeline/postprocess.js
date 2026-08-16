@@ -864,6 +864,40 @@ export function detectGridCuts(canvas, { cols, rows }) {
 }
 
 /**
+ * Slice a RAW (un-keyed) grid image into per-cell PNG data URLs at DETECTED cell
+ * boundaries — the combined-props call's slicer. Unlike processSheet this does NO
+ * keying and NO re-centering: each cell data URL is handed to that slot's own
+ * postProcessAsset run, so the slot's full contract (keying, edge chain,
+ * fillAfterCrop/solidify, trim/crop) applies exactly as on an individual call.
+ * The inset discards model-drawn grid lines at cell edges. Degenerate cells
+ * (cuts collapsed to a sliver) come back as null so the caller can fall back
+ * per slot.
+ */
+export async function sliceRawGrid(rawSrc, { cols, rows, insetFrac = 0.01 } = {}) {
+  const img = await loadImage(rawSrc);
+  const w = img.naturalWidth || img.width;
+  const h = img.naturalHeight || img.height;
+  const canvas = drawToCanvas(img, { width: w, height: h, fit: 'stretch' });
+  const { xCuts, yCuts } = detectGridCuts(canvas, { cols, rows });
+  const cells = [];
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const sx = xCuts[c], sw = xCuts[c + 1] - sx;
+      const sy = yCuts[r], sh = yCuts[r + 1] - sy;
+      const inset = Math.max(2, Math.round(Math.min(sw, sh) * insetFrac));
+      const cw = sw - inset * 2, ch = sh - inset * 2;
+      if (cw < 16 || ch < 16) { cells.push(null); continue; }
+      const cell = document.createElement('canvas');
+      cell.width = cw;
+      cell.height = ch;
+      cell.getContext('2d').drawImage(canvas, sx + inset, sy + inset, cw, ch, 0, 0, cw, ch);
+      cells.push(cell.toDataURL('image/png'));
+    }
+  }
+  return cells;
+}
+
+/**
  * Draw a raw sheet at spec size, slice it at DETECTED cell boundaries, and flood-key
  * EACH CELL independently.
  *

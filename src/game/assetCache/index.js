@@ -259,7 +259,8 @@ async function tryMatchedReuse({ config, userPrompt, promptKey, onProgress, canc
   const reason = verdict.reason ? ` (${verdict.reason})` : '';
 
   // Playerless population sets (bulk generates themes WITHOUT players): complete
-  // the missing player on first real keyed use — one static-player image ≈ $0.03.
+  // the missing player on first real keyed use — one static-player image ≈ $0.04-0.08
+  // (billing is flat per image; the exact price is the player slot's model tier).
   // Cache-only/keyless skip this; the scene's theme-player fallback covers them.
   // (Deliberately AFTER the ≤3 threshold — completing a player never disqualifies
   // an otherwise-good match.)

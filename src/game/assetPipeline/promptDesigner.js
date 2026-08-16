@@ -6,7 +6,7 @@
  * descriptors plus a style guide; the slot scaffolds in slotSpecs.js append the
  * non-negotiable constraints (white background, facing right, tileability, framing).
  */
-import { SLOT_SPECS, BASELINE_SLOTS } from './slotSpecs';
+import { SLOT_SPECS, BASELINE_SLOTS, BG_CLAUSE, PROPS_GRID_SPEC } from './slotSpecs';
 import { isGeminiConfigured, generateJson } from './providers/geminiImage';
 
 /**
@@ -529,13 +529,13 @@ export function chromaFromPrompt(prompt) {
   return null;
 }
 
-export function buildFinalPrompt(slotKey, subjects, styleGuide, { userNamed = false } = {}) {
-  const spec = SLOT_SPECS[slotKey];
-  const subject = subjects[slotKey] ?? (spec.subjectKey ? subjects[spec.subjectKey] : undefined);
-  const base = `${styleGuide.styleSummary}, 16-bit pixel art style, flat 2D game asset, sharp pixels, clear outlines`;
+// Per-slot color/contrast clauses WITHOUT the shared base string — used by both
+// buildFinalPrompt (which prepends the base) and the combined-props grid prompt
+// (which states the base once for all cells). Keeping this in one place is what
+// preserves the readability buckets (gameplay accent vs user-named natural colors
+// vs collectible gold vs terrain palette) on every path.
+function slotStyleClauses(slotKey, styleGuide, { userNamed = false } = {}) {
   const accent = styleGuide.accentPalette || DEFAULT_ACCENT;
-
-  let style;
   if (GAMEPLAY_SLOTS.has(slotKey)) {
     // Accent-as-dominant is the readability rule for designer-invented sprites —
     // but when the USER named the entity ("spikes"), identity beats palette: a
@@ -545,26 +545,89 @@ export function buildFinalPrompt(slotKey, subjects, styleGuide, { userNamed = fa
     const colorClause = userNamed
       ? `its natural iconic colors, accented with ${accent} rim-light and trim details`
       : `dominant colors: ${accent}`;
-    style = `${base}, ${colorClause}, vivid and highly saturated, bold dark ` +
+    return `${colorClause}, vivid and highly saturated, bold dark ` +
       `outline, strong silhouette, must stand out instantly against a dark muted environment`;
-  } else if (slotKey === 'collectible') {
+  }
+  if (slotKey === 'collectible') {
     // Pickups read as rewards: bright metallic gold, never the accent hue (a coin
     // must look like a coin) — unless the designer's subject says otherwise.
-    style = `${base}, bright iconic colors with a metallic gold default, glowing ` +
+    return `bright iconic colors with a metallic gold default, glowing ` +
       `highlight, bold dark outline, instantly readable at very small size`;
-  } else if (slotKey === 'background_far') {
-    style = `${base}, color palette ${styleGuide.colorPalette}, muted desaturated tones, ` +
-      `soft atmospheric haze, gentle contrast so foreground gameplay elements stand out`;
-  } else if (slotKey === 'background_mid' || slotKey === 'background_near') {
-    style = `${base}, color palette ${styleGuide.colorPalette}, very dark near-black ` +
-      `silhouette tones, distinctly darker than a distant hazy background`;
-  } else {
-    // floor, platform — terrain: main palette, readable edges, medium-dark value
-    style = `${base}, color palette ${styleGuide.colorPalette}, medium-dark tones with ` +
-      `a clearly defined lighter top edge`;
   }
+  if (slotKey === 'background_far') {
+    return `color palette ${styleGuide.colorPalette}, muted desaturated tones, ` +
+      `soft atmospheric haze, gentle contrast so foreground gameplay elements stand out`;
+  }
+  if (slotKey === 'background_mid' || slotKey === 'background_near') {
+    return `color palette ${styleGuide.colorPalette}, very dark near-black ` +
+      `silhouette tones, distinctly darker than a distant hazy background`;
+  }
+  // floor, platform — terrain: main palette, readable edges, medium-dark value
+  return `color palette ${styleGuide.colorPalette}, medium-dark tones with ` +
+    `a clearly defined lighter top edge`;
+}
+
+const styleBase = (styleGuide) =>
+  `${styleGuide.styleSummary}, 16-bit pixel art style, flat 2D game asset, sharp pixels, clear outlines`;
+
+export function buildFinalPrompt(slotKey, subjects, styleGuide, { userNamed = false } = {}) {
+  const spec = SLOT_SPECS[slotKey];
+  const subject = subjects[slotKey] ?? (spec.subjectKey ? subjects[spec.subjectKey] : undefined);
+  const style = `${styleBase(styleGuide)}, ${slotStyleClauses(slotKey, styleGuide, { userNamed })}`;
   const chroma = KEYED_SPRITE_SLOTS.has(slotKey)
     ? pickChromaColor(`${subject || ''} ${style}`)
     : null;
   return spec.scaffold(subject, style, { chroma });
+}
+
+/**
+ * Compose the combined-props grid prompt (PM_GRID_PROPS): one image, one cell per
+ * slot, one shared chroma backdrop stated once. Each cell keeps its slot's
+ * invariants (via spec.cellEssence) and its style bucket (via slotStyleClauses);
+ * the shared base style is stated once in the tail. The BG_CLAUSE hex rides in the
+ * prompt text so chromaFromPrompt recovers the keying color as usual.
+ *
+ * Returns { prompt, chroma, cellSlots, layout } or NULL when:
+ * - the chroma pick collides to white (green AND magenta subjects) — a white
+ *   backdrop on light props is the known keying hazard, so the pipeline falls back
+ *   to individual calls where each slot picks its own screen; or
+ * - no layout exists for the slot count / a slot lacks a cellEssence.
+ */
+export function buildPropsGridPrompt(cellSlots, subjects, styleGuide, namedBySlot = {}) {
+  const layout = PROPS_GRID_SPEC.layouts[cellSlots.length];
+  if (!layout) return null;
+  const cells = [];
+  for (const slot of cellSlots) {
+    const spec = SLOT_SPECS[slot];
+    if (!spec?.cellEssence) return null;
+    const subject = subjects[slot] ?? (spec.subjectKey ? subjects[spec.subjectKey] : undefined);
+    const style = slotStyleClauses(slot, styleGuide, { userNamed: !!namedBySlot[slot] });
+    cells.push({ slot, text: spec.cellEssence(subject, style), styleText: style, subject });
+  }
+  const chroma = pickChromaColor(cells.map((c) => `${c.subject || ''} ${c.styleText}`).join(' '));
+  if (!chroma) return null; // white collision → individual calls
+  // Positional naming ("cell 2 (top-right)") is the anti-cell-swap measure — the
+  // sheet scaffold's numbered-cell convention, applied to arbitrary small grids.
+  const posFor = (i) => {
+    const col = i % layout.cols;
+    const colWord = col === 0 ? 'left' : (col === layout.cols - 1 ? 'right' : 'middle');
+    if (layout.rows === 1) return colWord;
+    const rowWord = Math.floor(i / layout.cols) === 0 ? 'top' : 'bottom';
+    return `${rowWord}-${colWord}`;
+  };
+  const cellLines = cells.map((c, i) => `cell ${i + 1} (${posFor(i)}): ${c.text}`);
+  for (let i = 0; i < (layout.emptyCells || 0); i++) {
+    const idx = cells.length + i;
+    cellLines.push(`cell ${idx + 1} (${posFor(idx)}): completely empty, nothing drawn, only the flat backdrop color`);
+  }
+  const prompt =
+    `a ${layout.cols}x${layout.rows} grid of ${cellLines.length} cells, each cell containing one ` +
+    `separate standalone 2d video game asset sprite, each subject alone in its own grid cell, ` +
+    `centered with clear margin, subjects never touch or overlap each other or the cell ` +
+    `boundaries. Reading left to right, top to bottom: ` +
+    cellLines.join('; ') + `. ` +
+    `Every cell shares one continuous backdrop: ${BG_CLAUSE(chroma)}, in every single cell, ` +
+    `no grid lines, no cell borders, no dividers, no shadows, no text, ` +
+    `${styleBase(styleGuide)}`;
+  return { prompt, chroma, cellSlots: [...cellSlots], layout };
 }

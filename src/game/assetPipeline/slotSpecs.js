@@ -167,6 +167,12 @@ export const SLOT_SPECS = {
       `platform spans the full width of the frame from the left edge to the right edge, ` +
       `flat level top surface, ${BG_CLAUSE(chroma)}, no shadow, ` +
       `no reflection, ${style}`,
+    // Grid-cell variant of the scaffold: same invariants, minus the BG/isolation
+    // clause (the combined-props prompt states the backdrop once for all cells).
+    cellEssence: (subject, style) =>
+      `a single wide flat rectangular floating platform, ${subject}, side view, ` +
+      `stretching almost the full width of its cell, flat level top surface, ` +
+      `no shadow, no reflection, ${style}`,
     fallbackSubject: (d) => d?.platforms
   },
   // Ranged-attack projectile — generated only for platformer games (runner never
@@ -181,6 +187,10 @@ export const SLOT_SPECS = {
       `a single small 2d video game projectile sprite, ${subject}, flying to the right, ` +
       `elongated horizontal shape, side view, centered, ${BG_CLAUSE(chroma)}, ` +
       `no shadow, no motion trail, no text, ${style}`,
+    cellEssence: (subject, style) =>
+      `a single small 2d video game projectile sprite, ${subject}, flying to the ` +
+      `right, elongated horizontal shape, side view, centered in its cell, ` +
+      `no shadow, no motion trail, ${style}`,
     fallbackSubject: (d) => d?.projectile
   },
   // Score pickup (coins by default, or whatever the player named — "gems", etc.).
@@ -196,6 +206,10 @@ export const SLOT_SPECS = {
       `a single small 2d video game collectible pickup sprite, ${subject}, one single ` +
       `object, simple bold shape readable at tiny size, centered, ${BG_CLAUSE(chroma)}, ` +
       `no shadow, no sparkle trail, no text, ${style}`,
+    cellEssence: (subject, style) =>
+      `a single small 2d video game collectible pickup sprite, ${subject}, one ` +
+      `single object, simple bold shape readable at tiny size, centered in its ` +
+      `cell, no shadow, no sparkle trail, ${style}`,
     fallbackSubject: (d) => d?.collectibles
   },
   player: {
@@ -227,6 +241,10 @@ export const SLOT_SPECS = {
       `side profile facing right, single creature filling most of the frame, ` +
       `${BG_CLAUSE(chroma)}, sharp clean outline, no shadow, no ground, ` +
       `no motion lines, no text, ${style}`,
+    cellEssence: (subject, style) =>
+      `2d video game enemy sprite, ${subject}, prowling to the right, full body in ` +
+      `side profile facing right, single creature filling most of its cell, sharp ` +
+      `clean outline, no shadow, no ground, no motion lines, ${style}`,
     fallbackSubject: (d) => d?.enemy
   },
   // Animated player run cycle. The local geometry gate + transparency gate reject
@@ -279,8 +297,26 @@ export const SLOT_SPECS = {
     scaffold: (subject, style, { chroma } = {}) =>
       `a single hazard object, ${subject}, roughly square proportions, side view, centered, ` +
       `${BG_CLAUSE(chroma)}, no shadow, no text, ${style}`,
+    cellEssence: (subject, style) =>
+      `a single hazard object, ${subject}, roughly square proportions, side view, ` +
+      `centered in its cell, no shadow, ${style}`,
     fallbackSubject: (d) => d?.hazards
   }
+};
+
+// Combined-props call (PM_GRID_PROPS): several small chroma-keyed sprites rendered
+// as ONE grid image, sliced content-aware, each cell then run through its slot's
+// normal single-slot pipeline. Under Gemini's flat-per-image billing this is the
+// dominant cost lever (4-5 lite calls → 1). cellOrder is the canonical cell
+// sequence — the prompt, the slice loop and the fallback wiring all follow it.
+export const PROPS_GRID_SPEC = {
+  gen: { model: GEMINI_SLOT_MODEL },
+  layouts: {
+    3: { cols: 3, rows: 1, aspectRatio: '16:9', emptyCells: 0 },
+    4: { cols: 2, rows: 2, aspectRatio: '1:1', emptyCells: 0 },
+    5: { cols: 3, rows: 2, aspectRatio: '3:2', emptyCells: 1 }
+  },
+  cellOrder: ['platform', 'enemy', 'obstacle', 'collectible', 'projectile']
 };
 
 export const BASELINE_SLOTS = ['background_far', 'floor', 'platform', 'player', 'enemy', 'obstacle'];

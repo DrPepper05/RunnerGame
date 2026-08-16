@@ -30,6 +30,7 @@ const toCard = (id, meta) => ({
     themeKey: meta.config?.themeKey ?? null
   },
   assetMeta: {
+    view: meta.assetMeta?.view || 'side',
     tags: meta.assetMeta?.tags || [],
     slots: Object.fromEntries(
       Object.entries(meta.assetMeta?.slots || {})

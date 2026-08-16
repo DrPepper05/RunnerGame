@@ -112,6 +112,17 @@ export function buildCostReport(liveParams) {
   // ── Per-asset summary with provenance + cost + time ────────────────────────
   const slotEntries = Object.entries(slots);
   if (slotEntries.length) {
+    // Shared combined calls (e.g. props_grid): one API call delivered several
+    // slots — split its cost evenly across the delivered members at render time
+    // (billing is flat per image, so there is no per-cell signal to weight by).
+    // The per-call log above stays 1:1 with real API calls.
+    const sharedCalls = {};
+    for (const [label, g] of Object.entries(byLabel)) {
+      const members = slotEntries
+        .filter(([, m]) => m && !m.dropped && m.via === label)
+        .map(([s]) => s);
+      if (members.length) sharedCalls[label] = { ...g, members, share: g.estUsd / members.length, msShare: g.ms / members.length };
+    }
     lines.push('Per-asset summary (this run):');
     slotEntries.forEach(([slot, m]) => {
       if (m.dropped) {
@@ -119,18 +130,24 @@ export function buildCostReport(liveParams) {
         return;
       }
       const roll = byLabel[slot];
-      const costBit = roll ? `, ${usd(roll.estUsd, 4)} in ${secs(roll.ms)} (${roll.calls} call(s))` : '';
+      const shared = m.via && sharedCalls[m.via];
+      const costBit = roll ? `, ${usd(roll.estUsd, 4)} in ${secs(roll.ms)} (${roll.calls} call(s))`
+        : shared ? `, via ${m.via} ≈ ${usd(shared.share, 4)} share` : '';
       const origin = m.source === 'cache' ? 'CACHE' : m.source === 'generated' ? 'GENERATED' : '?';
       lines.push(`- ${slot} [${origin}]: ${m.provider || 'cache'}${m.model ? ` (${m.model})` : ''}` +
         `${m.attempts ? `, ${m.attempts} attempt(s)` : ''}` +
         `${m.sheet ? `, animated${m.perFrame ? ' per-frame' : ''}` : ''}` +
         `${m.mirrored ? ', mirrored' : ''}${costBit}`);
     });
-    // Non-slot calls (design, cache-match, QA labels not matching a slot name)
+    // Non-slot calls: shared combined calls get their member list; the rest
+    // (design, cache-match, QA labels not matching a slot name) stay [overhead].
     const slotNames = new Set(Object.keys(slots));
     const other = Object.entries(byLabel).filter(([k]) => !slotNames.has(k));
     other.forEach(([k, g]) => {
-      lines.push(`- ${k} [overhead]: ${g.calls} call(s), ${usd(g.estUsd, 4)} in ${secs(g.ms)}`);
+      const shared = sharedCalls[k];
+      lines.push(shared
+        ? `- ${k} [shared → ${shared.members.join(', ')}]: ${g.calls} call(s), ${usd(g.estUsd, 4)} in ${secs(g.ms)}`
+        : `- ${k} [overhead]: ${g.calls} call(s), ${usd(g.estUsd, 4)} in ${secs(g.ms)}`);
     });
     lines.push('');
   }
@@ -167,7 +184,7 @@ export function buildCostReport(liveParams) {
     if (avgPartial != null) lines.push(`  Measured avg partial reuse:    ${usd(avgPartial)}`);
     if (total) lines.push(`  Measured blended avg per generation: ${usd(spendAll / total)}`);
     lines.push('');
-    const fullAvg = avgFresh ?? 0.35;
+    const fullAvg = avgFresh ?? 0.38;
     lines.push('PRICING PROJECTION — average cost per user generation vs cache hit rate');
     lines.push(`(fresh generation ≈ ${usd(fullAvg)} measured${avgFresh == null ? ' [default estimate]' : ''}; ` +
       'a cache hit costs ≈ $0.001 in matching; partial reuse lands between):');

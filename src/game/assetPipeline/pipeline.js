@@ -8,11 +8,11 @@
  * every caller handles it by downgrading to the built-in static theme asset set
  * (ScreenZero's toStaticThemeConfig; App surfaces it in the regen overlay).
  */
-import { SLOT_SPECS, BASELINE_SLOTS, GENERATED_SLOTS, GEMINI_PRO_SHEET_MODEL, BG_CLAUSE } from './slotSpecs';
-import { postProcessAsset, mirrorImage, drawToCanvas, alphaFraction, borderResidueFraction, topBandOpaqueFraction, contentBoundsOf, processSheet, finalizeSheetFrames, loadImage, keyCellWithQuality, cleanKeyedEdges, alignFrames, maskIoU, composeFilmstrip, lockPalette } from './postprocess';
+import { SLOT_SPECS, BASELINE_SLOTS, GENERATED_SLOTS, GEMINI_PRO_SHEET_MODEL, GEMINI_IMAGE_FALLBACK_MODEL, PROPS_GRID_SPEC, BG_CLAUSE } from './slotSpecs';
+import { postProcessAsset, mirrorImage, drawToCanvas, alphaFraction, borderResidueFraction, topBandOpaqueFraction, contentBoundsOf, processSheet, finalizeSheetFrames, loadImage, keyCellWithQuality, cleanKeyedEdges, alignFrames, maskIoU, composeFilmstrip, lockPalette, sliceRawGrid } from './postprocess';
 import { reviewSprite } from './qa';
 import * as gemini from './providers/geminiImage';
-import { designAssetPrompts, buildFinalPrompt, chromaFromPrompt } from './promptDesigner';
+import { designAssetPrompts, buildFinalPrompt, buildPropsGridPrompt, chromaFromPrompt } from './promptDesigner';
 import { parsePromptKeywords } from '../promptUtils';
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -105,7 +105,12 @@ export async function generateAssets({
   onProgress = () => {},
   concurrency = 3,
   maxAttemptsPerProvider = 2,
-  cancelToken = null
+  cancelToken = null,
+  // Combined-props plan from buildPropsGridPrompt (PM_GRID_PROPS): several small
+  // keyed slots delivered by ONE image call, with per-cell fallback to the normal
+  // individual path. Quality mode ignores it (the paid rescue rungs assume
+  // individual calls).
+  gridPlan = null
 }) {
   const preloadedImages = {};
   const meta = {};
@@ -120,6 +125,13 @@ export async function generateAssets({
     qualityMode: localStorage.getItem('PM_QUALITY_MODE') === '1',
     imageCalls: 0,
     maxImageCalls: parseInt(localStorage.getItem('PM_MAX_GEMINI_CALLS'), 10) || 12,
+    // Probe/experiment knobs (A/B protocol): override the image model for the
+    // static player / the sheet without touching slotSpecs. Normal runs leave
+    // them unset; a passed probe flips the slotSpecs default instead.
+    modelOverrides: {
+      player: localStorage.getItem('PM_MODEL_PLAYER') || null,
+      player_sheet: localStorage.getItem('PM_MODEL_SHEET') || null
+    },
     cancelToken
   };
   let doneCount = 0;
@@ -261,6 +273,9 @@ export async function generateAssets({
     // Quality mode pays for the 2K supersampled sheet; the default is the spec's 1K.
     if (runState.qualityMode && activeSpec.gen?.imageSize) {
       activeSpec = { ...activeSpec, gen: { ...activeSpec.gen, imageSize: '2K' } };
+    }
+    if (runState.modelOverrides?.player_sheet) {
+      activeSpec = { ...activeSpec, gen: { ...activeSpec.gen, model: runState.modelOverrides.player_sheet } };
     }
 
     report(`[ASSETS] Generating animated ${spec.outputKey || slot}...`);
@@ -449,13 +464,13 @@ export async function generateAssets({
 
       // One reference-anchored image-edit for a single pose, keyed and edge-cleaned to
       // a cell canvas. Throws like any Gemini call — callers own abort bookkeeping.
-      const generateSingleFrame = async (poseText, { width, height, extraRef = null }) => {
+      const generateSingleFrame = async (poseText, { width, height, extraRef = null, model = null }) => {
         runState.imageCalls++;
         const raw = await gemini.generateImage({
           prompt: framePrompt(poseText, !!extraRef),
           aspectRatio: '1:1',
           referenceImageDataUrls: extraRef ? [baseSrc, extraRef] : [baseSrc],
-          model: activeSpec.gen.model,
+          model: model || activeSpec.gen.model,
           imageSize: '0.5K', // frames land on 128px cells — 512px is 4× supersampling
           label: 'player_sheet:frame'
         });
@@ -496,7 +511,12 @@ export async function generateAssets({
             repaired[idx] = await generateSingleFrame(poseText, {
               width: cells[idx].width,
               height: cells[idx].height,
-              extraRef: neighbor ? onWhite(neighbor) : null
+              extraRef: neighbor ? onWhite(neighbor) : null,
+              // Flat-per-image billing makes repair frames on the sheet model cost
+              // MORE than a whole new sheet (3 × $0.09 vs $0.09) — route repairs to
+              // the cheaper fallback model; lockPalette + the re-verdict still gate
+              // any style drift, and a failed repair just resumes the normal ladder.
+              model: GEMINI_IMAGE_FALLBACK_MODEL
             });
             report(null);
           } catch (err) {
@@ -754,6 +774,10 @@ export async function generateAssets({
     if (!prompt) throw new Error(`No prompt provided for asset slot "${slot}".`);
     const spec = SLOT_SPECS[slot];
     if (spec.frames) return runSheetSlot(slot, spec, prompt);
+    // Probe override (PM_MODEL_PLAYER): swap the generation model for this slot
+    // only — post-processing/QA read the unchanged contract fields.
+    const override = runState.modelOverrides?.[slot];
+    const genSpec = override ? { ...spec, gen: { ...spec.gen, model: override } } : null;
     report(`[ASSETS] Generating ${slot}...`);
     const onAttempt = attemptTicker(slot);
     try {
@@ -775,7 +799,7 @@ export async function generateAssets({
           : null;
       };
       const attemptOnce = async (attemptSeed, attemptPrompt) => {
-        const raw = await generateSlotImage(slot, attemptPrompt, attemptSeed, report, maxAttemptsPerProvider, runState, onAttempt);
+        const raw = await generateSlotImage(slot, attemptPrompt, attemptSeed, report, maxAttemptsPerProvider, runState, onAttempt, null, genSpec);
         noteSlotProgress(slot, 0.8);
         // The prompt is the single source of truth for which backdrop was asked for —
         // keying itself is color-agnostic, but residue checks and despill need it.
@@ -840,12 +864,112 @@ export async function generateAssets({
     }
   };
 
+  // Combined-props call (PM_GRID_PROPS): ONE image call delivers all grid member
+  // slots; each cell is sliced raw and pushed through that slot's normal
+  // single-slot chain (postProcessAsset → enforceKeyQuality → QA) so every
+  // existing quality gate runs unchanged. Any cell that fails — or the whole
+  // call — falls back to the slot's normal individual path: worst case is
+  // today's behavior plus one wasted lite call.
+  const runPropsGrid = async (plan) => {
+    const members = plan.cellSlots;
+    const fallbackSlots = (list) => {
+      for (const s of list) {
+        if (SLOT_SPECS[s].optional) queue.push(s); // keeps the retry-then-drop tail position
+        else queue.unshift(s);                     // required slots go first
+      }
+    };
+    if (cancelToken?.cancelled) throw cancelledError();
+    report(`[ASSETS] Generating ${members.length} props in one combined call...`);
+    const onAttempt = attemptTicker('props_grid');
+    members.forEach((s) => noteSlotProgress(s, 0.25));
+    let raw;
+    try {
+      raw = await generateSlotImage('props_grid', plan.prompt, seed, report,
+        maxAttemptsPerProvider, runState, onAttempt, null,
+        { gen: { aspectRatio: plan.layout.aspectRatio, model: PROPS_GRID_SPEC.gen.model } });
+    } catch (err) {
+      if (err.cancelled) { fatal = true; throw err; }
+      console.warn(`[AssetPipeline] Combined props call failed (${err.message}) — falling back to individual slots.`);
+      delete slotFraction['props_grid'];
+      fallbackSlots(members);
+      return;
+    }
+    members.forEach((s) => noteSlotProgress(s, 0.6));
+    let cellUrls = null;
+    try {
+      cellUrls = await sliceRawGrid(raw.dataUrl, plan.layout);
+    } catch (err) {
+      console.warn(`[AssetPipeline] Grid slicing failed (${err.message}) — falling back to individual slots.`);
+    }
+    if (!cellUrls) {
+      delete slotFraction['props_grid'];
+      fallbackSlots(members);
+      return;
+    }
+    const chroma = chromaFromPrompt(plan.prompt);
+    for (let i = 0; i < members.length; i++) {
+      const slot = members[i];
+      const spec = SLOT_SPECS[slot];
+      const cellUrl = cellUrls[i];
+      try {
+        if (!cellUrl) throw new Error('grid cut produced a degenerate cell');
+        let img = await postProcessAsset(cellUrl, spec, { chroma });
+        img = await enforceKeyQuality(slot, spec, { dataUrl: cellUrl }, img, chroma);
+        // Deterministic acceptance: the processed cell must contain real art. Keying
+        // quality is enforceKeyQuality's job (same as the individual path); this
+        // gate only catches empty/sliver cells the model or the cuts produced.
+        const canvas = drawToCanvas(img, { width: img.naturalWidth, height: img.naturalHeight, fit: 'stretch' });
+        const bounds = contentBoundsOf(canvas, { alphaMin: 16 });
+        if (!bounds ||
+            (bounds.maxX - bounds.minX + 1) < canvas.width * 0.1 ||
+            (bounds.maxY - bounds.minY + 1) < canvas.height * 0.1) {
+          throw new Error('grid cell had no usable content');
+        }
+        let outcome = { qa: null, mirrored: false, facingVerified: false };
+        if (spec.qa) {
+          const reviewed = await applyQualityAssurance(slot, spec, { dataUrl: cellUrl }, img, plan.prompt);
+          img = reviewed.img;
+          outcome = reviewed.outcome;
+        }
+        preloadedImages[slot] = img;
+        meta[slot] = {
+          provider: raw.provider,
+          attempts: raw.attempts,
+          promptUsed: plan.prompt,
+          ...(raw.model ? { model: raw.model } : {}),
+          via: 'props_grid',
+          ...outcome
+        };
+        delete slotFraction[slot];
+        doneCount++;
+        report(`[ASSETS] Ready: ${slot} via combined props call (${doneCount}/${slots.length})`);
+      } catch (err) {
+        if (err.cancelled) { fatal = true; throw err; }
+        console.warn(`[AssetPipeline] Grid cell for "${slot}" rejected (${err.message}) — individual fallback.`);
+        fallbackSlots([slot]);
+      }
+    }
+    delete slotFraction['props_grid'];
+  };
+
   // Simple promise pool: at most `concurrency` slots in flight (a full 6-wide
   // burst just converts into image-model 429s)
   const queue = [...slots];
+  // Grid task first (its members are the required gameplay props — same "playable
+  // core before optional layers" FIFO rule as the plain slot order). It only runs
+  // when EVERY member is in this run's slot list — a partial overlap would desync
+  // the prompt's cell order from the slice order.
+  let activeGrid = null;
+  if (gridPlan && !runState.qualityMode && gridPlan.cellSlots.every((s) => queue.includes(s))) {
+    activeGrid = gridPlan;
+    for (const s of gridPlan.cellSlots) queue.splice(queue.indexOf(s), 1);
+    queue.unshift('__props_grid__');
+  }
   const workers = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
     while (queue.length > 0 && !fatal && !cancelToken?.cancelled) {
-      await runSlot(queue.shift());
+      const item = queue.shift();
+      if (item === '__props_grid__') await runPropsGrid(activeGrid);
+      else await runSlot(item);
     }
   });
   await Promise.all(workers);
@@ -858,6 +982,23 @@ const DESIGN_SOURCE_LABELS = {
   gemini: 'Gemini art director',
   local: 'local templates'
 };
+
+// Combined-props eligibility (PM_GRID_PROPS='1', read at run start like the other
+// cost knobs): ≥3 grid-able slots in this run — a restyle or partial redraw of 1-2
+// props stays on the individual path by construction. Returns the grid plan or
+// null (flag off, too few slots, or the chroma pick collided to white).
+function planPropsGrid(slots, design, namedBySlot, onProgress) {
+  if (localStorage.getItem('PM_GRID_PROPS') !== '1') return null;
+  // Quality mode pays for individual calls + rescue rungs — never gridded.
+  if (localStorage.getItem('PM_QUALITY_MODE') === '1') return null;
+  const gridSlots = PROPS_GRID_SPEC.cellOrder.filter((s) => slots.includes(s));
+  if (gridSlots.length < 3) return null;
+  const plan = buildPropsGridPrompt(gridSlots, design.subjects, design.styleGuide, namedBySlot);
+  if (plan) {
+    onProgress(`[ASSETS] Combined props call: ${gridSlots.join(', ')} in one image.`, null);
+  }
+  return plan;
+}
 
 // Stamp each generated slot's meta with its canonical entity noun (design.taxonomy:
 // LLM-tagged when the designer ran, user-named/local otherwise). Cache and search
@@ -919,7 +1060,8 @@ export async function generateGameAssets({ config, userPrompt = '', onProgress =
   slots.push('collectible');
   slots = slots.filter(s => !skipSlots.includes(s));
 
-  const { preloadedImages, meta } = await generateAssets({ finalPrompts, slots, onProgress, cancelToken });
+  const gridPlan = planPropsGrid(slots, design, namedBySlot, onProgress);
+  const { preloadedImages, meta } = await generateAssets({ finalPrompts, slots, onProgress, cancelToken, gridPlan });
 
   const generated = Object.values(meta).filter(m => !m.dropped).length;
   onProgress(
@@ -937,6 +1079,10 @@ export async function generateGameAssets({ config, userPrompt = '', onProgress =
   }
   const assetMeta = {
     designSource: design.source,
+    // Perspective the art was drawn for. Everything today is side-view; future
+    // top-down modes (shooter/RPG) stamp 'topdown' and the cache matcher refuses
+    // to reuse across views (a profile sprite is unusable from above).
+    view: 'side',
     slots: meta,
     ...(design.taxonomy?.tags?.length ? { tags: design.taxonomy.tags } : {}),
     ...(cost ? { cost } : {})
@@ -1001,7 +1147,8 @@ export async function regenerateAssetSlots({ config, instruction = '', slots, on
     }
   }
 
-  const { preloadedImages, meta } = await generateAssets({ finalPrompts, slots, onProgress, cancelToken });
+  const gridPlan = planPropsGrid(slots, design, namedBySlot, onProgress);
+  const { preloadedImages, meta } = await generateAssets({ finalPrompts, slots, onProgress, cancelToken, gridPlan });
 
   const updated = Object.values(meta).filter(m => !m.dropped).length;
   onProgress(

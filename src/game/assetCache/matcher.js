@@ -19,6 +19,11 @@ import { parsePromptKeywords } from '../promptUtils.js';
 
 const SLOT_VOCAB = [...GENERATED_SLOTS, 'projectile', 'collectible'];
 
+// Reuse never crosses viewpoints: side-view art (profile, ground-anchored) is
+// unusable in a top-down game and vice versa. Entries stamped before the view
+// field existed are all side-view. Mode-agnosticism holds WITHIN a view only.
+const sameView = (c, view) => (c.assetMeta?.view || 'side') === view;
+
 // Prompt-generated configs carry no themeKey — derive it from the entry's own
 // source prompt so theme comparison works for every candidate.
 const candidateTheme = (c) =>
@@ -67,7 +72,9 @@ const buildMatchPrompt = (userPrompt, payload) => (
   `- Nothing fits → matchId is an empty string.`
 );
 
-export async function matchCachedGame({ userPrompt, candidates }) {
+export async function matchCachedGame({ userPrompt, candidates, view = 'side' }) {
+  candidates = candidates.filter((c) => sameView(c, view));
+  if (!candidates.length) return null;
   const payload = candidates.map((c) => ({
     id: c.id,
     sourcePrompt: c.sourcePrompt || '',
@@ -95,7 +102,8 @@ export async function matchCachedGame({ userPrompt, candidates }) {
 // already be what the candidate depicts. Whole-set only (never proposes redraws —
 // redrawing costs money and this path exists to stay free). Candidates arrive
 // most-recently-used first, so the first hit is the freshest.
-export function localMatch({ userPrompt, candidates }) {
+export function localMatch({ userPrompt, candidates, view = 'side' }) {
+  candidates = candidates.filter((c) => sameView(c, view));
   const themeKey = parsePromptKeywords(userPrompt).themeKey;
   if (!themeKey) return null;
   const wanted = extractEntities(userPrompt);
