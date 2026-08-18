@@ -736,9 +736,24 @@ export async function generateAssets({
         const processed = await processSheet(raw.dataUrl, attemptSpec, { chroma });
         const previewImg = processed.previewImg;
         dbg.slicedLayout = processed.layout; // which candidate layout the slicer picked
-        // Trim the prompted-empty trailing cell(s) before scoring — the layout
-        // carries a blank 6th cell so the 5 real frames get a clean 3×2 grid.
+        // Trim trailing extras beyond the used cell count.
         const cells = processed.cells.slice(0, attemptSpec.frames.usedCells ?? processed.cells.length);
+        // Extract the IDLE cell before scoring: the scorer's contract is "run
+        // frames + optional trailing jump" — the idle stance is neither, so it
+        // is validated deterministically on its own and re-inserted before
+        // finalize; a bad idle is simply dropped (scene falls back to frame 0).
+        const idleSlot = attemptSpec.frames.idleFrameIndex;
+        let idleCell = null;
+        let scoringCells = cells;
+        if (idleSlot != null && cells.length > idleSlot + 1) {
+          idleCell = cells[idleSlot];
+          scoringCells = [...cells.slice(0, idleSlot), ...cells.slice(idleSlot + 1)];
+          const ib = contentBoundsOf(idleCell);
+          if (!ib || (ib.maxY - ib.minY + 1) < idleCell.height * 0.3 ||
+              chromaResidueFraction(idleCell, chroma) > 0.08) {
+            idleCell = null;
+          }
+        }
         if (sheetTransparency(previewImg) < attemptSpec.post.minAlphaFraction) {
           lastIssue = 'kept a painted background';
           dbg.scorerIssue = lastIssue;
@@ -747,18 +762,18 @@ export async function generateAssets({
         // Deterministic per-cell chroma residue (post-rescue): a cell still
         // carrying screen color is pre-flagged bad — a green frame must never
         // reach the game (live defect 2026-08-16).
-        const residues = cells.map((c) => chromaResidueFraction(c, chroma));
+        const residues = scoringCells.map((c) => chromaResidueFraction(c, chroma));
         const stained = residues.map((r, i) => (r > 0.08 ? i : -1)).filter((i) => i >= 0);
         if (stained.length) dbg.stainedCells = stained.map((i) => ({ i, residue: +residues[i].toFixed(3) }));
         // gridMeta null → ALWAYS rebuild a 1×N strip.
-        let verdict = evaluateAndCullCells(cells, null, attemptSpec.frames.runFrameCount, { preBadIndices: stained });
+        let verdict = evaluateAndCullCells(scoringCells, null, attemptSpec.frames.runFrameCount, { preBadIndices: stained });
         if (verdict.issue) {
           // Repair rung: a handful of scorer-flagged frames get individually
           // redrawn — but ONLY on the LAST attempt (2026-08-16): while a cheaper
           // escalation rung remains, escalating (~one call) beats repairing 2-3
           // frames (2-3 calls at flat per-image prices). On the final attempt
           // repair is what stands between the sheet and the static fallback.
-          const repaired = attempt === maxSheetAttempts ? await tryRepairFrames(cells, verdict) : null;
+          const repaired = attempt === maxSheetAttempts ? await tryRepairFrames(scoringCells, verdict) : null;
           if (repaired) {
             attempts += repaired.calls;
             verdict = repaired.verdict;
@@ -800,10 +815,15 @@ export async function generateAssets({
         const legsOk = leading && leading.length >= 2
           ? (leading.includes('left') && leading.includes('right'))
           : review?.legsAlternate;
-        const softIssue = review
-          ? (legsOk === false ? 'run cycle legs never alternate'
-            : (review.armsSwing === false ? 'arms never swing' : null))
-          : null;
+        // Leg-lead is ADVISORY only (demoted 2026-08-16): both model tiers drew
+        // all-right-lead strides repeatedly — escalating on it paid ~$0.10 per
+        // run to re-roll into the same bias. The eight distinct phases carry the
+        // motion; frozen ARMS remain a soft escalation trigger (the premium tier
+        // demonstrably fixes those).
+        if (review && legsOk === false) {
+          report('[ASSETS] Note: run cycle keeps one leading leg (known model bias) — phases still animate.');
+        }
+        const softIssue = review && review.armsSwing === false ? 'arms never swing' : null;
         const visionBadSet = new Set((review?.badFrames || []).map((n) => n - 1)
           .filter((n) => n >= 0 && n < verdict.keptCells.length));
         if (visionBadSet.size) {
@@ -814,7 +834,7 @@ export async function generateAssets({
             // Full cull would dip below the survivor minimum — drop only the
             // WORST flagged frame instead of shipping all of them (a corrupt
             // frame shipping "as-is" was the green-frame live defect).
-            const canRank = verdict.keptCells.length === cells.length;
+            const canRank = verdict.keptCells.length === scoringCells.length;
             const worst = canRank
               ? [...visionBadSet].sort((a, b) => (residues[b] || 0) - (residues[a] || 0))[0]
               : [...visionBadSet][0];
@@ -846,7 +866,9 @@ export async function generateAssets({
           if (labels && visionBadSet.size) labels = labels.filter((_, i) => !visionBadSet.has(i));
           const metaNow = verdict.framesMeta;
           const runNow = metaNow.runFrameCount ?? verdict.keptCells.length;
-          if (labels && labels.length === runNow && runNow >= 2) {
+          // Small cycles only: rebuilding an 8-phase cycle down to [R,pass,L,pass]
+          // would DISCARD phases; with ≥5 run frames the drawn order stands.
+          if (labels && labels.length === runNow && runNow >= 2 && runNow <= 4) {
             const runCells = verdict.keptCells.slice(0, runNow);
             const hasDedicatedJump = metaNow.jumpFrameIndex != null && metaNow.jumpFrameIndex >= runNow;
             const jumpCellNow = hasDedicatedJump ? verdict.keptCells[verdict.keptCells.length - 1] : null;
@@ -876,12 +898,33 @@ export async function generateAssets({
             }
           }
         }
+        // Re-insert the validated IDLE cell between the run frames and the jump:
+        // strip order [run..., idle, jump] with idleFrameIndex/jumpFrameIndex
+        // rebuilt (a dropped idle just omits the index — scene falls back to
+        // frame 0 for idle).
+        let keptCells = verdict.keptCells;
+        let shipMeta = verdict.framesMeta;
+        if (idleCell) {
+          const runLen = shipMeta.runFrameCount ?? keptCells.length;
+          const hasDedicatedJump = shipMeta.jumpFrameIndex != null && shipMeta.jumpFrameIndex >= runLen;
+          const runPart = keptCells.slice(0, runLen);
+          const jumpPart = hasDedicatedJump ? [keptCells[keptCells.length - 1]] : [];
+          keptCells = [...runPart, idleCell, ...jumpPart];
+          shipMeta = {
+            cols: keptCells.length,
+            rows: 1,
+            runFrameCount: runLen,
+            idleFrameIndex: runLen,
+            ...(hasDedicatedJump
+              ? { jumpFrameIndex: runLen + 1 }
+              : (shipMeta.jumpFrameIndex != null ? { jumpFrameIndex: shipMeta.jumpFrameIndex } : {}))
+          };
+        }
         // Shared-palette lock against the static reference — kills per-frame color
         // flicker; its internal guard skips frames whose colors genuinely diverged.
-        let keptCells = verdict.keptCells;
         if (baseCanvas) keptCells = lockPalette(keptCells, baseCanvas);
         mirrored = !!(review && review.facingRight === false);
-        sheet = await finalizeSheetFrames(keptCells, activeSpec, { mirror: mirrored, framesMeta: verdict.framesMeta });
+        sheet = await finalizeSheetFrames(keptCells, activeSpec, { mirror: mirrored, framesMeta: shipMeta });
         if (!sheet) {
           lastIssue = 'had no visible content';
           dbg.scorerIssue = lastIssue;

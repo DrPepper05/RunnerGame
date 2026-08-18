@@ -86,16 +86,28 @@ export const GAPS_CLAUSE =
 // classic retro cycle and a far easier ask. Poses 2 and 4 are the same passing
 // pose ON PURPOSE (a real cycle repeats it; they are never IoU-adjacent so the
 // duplicate cull — consecutive pairs only — cannot fire on them).
-// ARMS FIRST in each pose text (2026-08-16, after a live sheet shipped with
-// legs animating but arms frozen): the sheet is an EDIT of the reference
-// sprite, and identity pressure makes models copy the reference's arm pose
-// verbatim unless the arm instruction leads the sentence.
+// Eight-phase cycle (restored 2026-08-16 per client direction — the 4-frame
+// retro cycle read as too harsh; smoothness comes from PHASE variety at 12fps).
+// ARMS FIRST in each pose text (the sheet is an EDIT of the reference sprite,
+// and identity pressure makes models copy the reference's arms verbatim unless
+// the arm instruction leads the sentence). Live-measured caveat: these models
+// draw right-lead strides regardless of mirror instructions (leadingLeg labels
+// came back all-'right' on BOTH tiers repeatedly) — leg-lead is judged
+// advisory, never escalated; the eight distinct phases carry the motion.
 export const RUN_CYCLE_POSES = [
-  'LEFT arm swinging forward with the elbow bent at a right angle and the fist at chest height, RIGHT arm swinging back behind the hip with a bent elbow — natural relaxed running arm pump, NOT a punch — RIGHT leg planted far forward, LEFT leg stretched far behind, a wide running stride',
-  'both elbows bent at the sides mid-pump, hands near the hips, both legs passing directly under the body, knees bent close together, body slightly higher than the stride poses',
-  'RIGHT arm swinging forward with the elbow bent at a right angle and the fist at chest height, LEFT arm swinging back behind the hip with a bent elbow — natural relaxed running arm pump, NOT a punch — LEFT leg planted far forward, RIGHT leg stretched far behind, the exact MIRROR of frame 1 with arms AND legs swapped',
-  'both elbows bent at the sides mid-pump, hands near the hips, both legs passing directly under the body, knees bent close together, body slightly higher than the stride poses'
+  'LEFT arm swinging forward with a bent elbow and the fist at chest height, RIGHT arm swinging back behind the hip — natural relaxed running arm pump, NOT a punch — RIGHT foot planted on the ground ahead, LEFT leg trailing far behind, a wide running stride',
+  'both elbows bent at the sides mid-pump, the body dropping slightly, legs bending as the back foot lifts',
+  'both arms pumping close to the body, legs passing directly under the crouched body, knees close together',
+  'RIGHT arm swinging forward with a bent elbow, LEFT arm swinging back — the arms mid-swap — airborne with the LEFT knee lifting in front and the RIGHT leg pushing off behind',
+  'RIGHT arm swung fully forward with a bent elbow and the fist at chest height, LEFT arm swung back behind the hip — natural relaxed running arm pump, NOT a punch — LEFT foot planted on the ground ahead, RIGHT leg trailing far behind, the stride with the other leg leading',
+  'both elbows bent at the sides mid-pump, the body dropping slightly, legs bending as the back foot lifts',
+  'both arms pumping close to the body, legs passing directly under the crouched body, knees close together',
+  'LEFT arm swinging forward with a bent elbow, RIGHT arm swinging back — the arms mid-swap — airborne with the RIGHT knee lifting in front and the LEFT leg pushing off behind'
 ];
+
+export const IDLE_POSE =
+  'relaxed standing idle stance, both feet planted shoulder-width on the same ground line, ' +
+  'arms hanging naturally at the sides with slightly bent elbows, head up, chest out';
 
 export const JUMP_POSE = 'mid-air jump pose with both knees tucked up and arms out for balance';
 
@@ -285,7 +297,7 @@ export const SLOT_SPECS = {
   player_sheet: {
     textureKey: 'dyn_player',
     outputKey: 'player',
-    canvas: { width: 640, height: 128 },
+    canvas: { width: 1280, height: 128 },
     // Cheap-first sheet rung (2026-08-16 cost flip, revised same day after 2.5
     // shipped a no-leg-swap cycle): 3.1-flash-lite bills the same $30/M as 2.5
     // but is the 3.x family whose character consistency the sheet path depends
@@ -293,23 +305,26 @@ export const SLOT_SPECS = {
     // whenever a gate — including the legsAlternate vision gate — rejects the
     // cheap tier, so premium is paid only on failure. Restore always-premium with
     // localStorage PM_MODEL_SHEET='gemini-3.1-flash-image'.
-    // Layout is a HORIZONTAL 1×5 STRIP at 4:1 (2026-08-16 prompt overhaul):
-    // strips are the community's most reliable sheet layout (no interior cells,
-    // 3-6 items per row) and the 3.x family supports extreme ratios natively.
-    // sheetLayouts are the slicing CANDIDATES — processSheet picks the one whose
-    // detected gutters are emptiest, so a model that ignores 4:1 (the 2.5
-    // fallback, an unsupported ratio → provider drops the field) degrades to the
-    // 3×2 grid slicing automatically. usedCells trims trailing extras before
-    // scoring; the pipeline always ships a rebuilt 1×N strip.
-    gen: { aspectRatio: '4:1', model: GEMINI_SLOT_MODEL, imageSize: '1K' },
+    // Layout is a HORIZONTAL 1×10 STRIP at 8:1 (2026-08-16, 8-frame cycle
+    // restored + idle stance): frames 1-8 run phases, frame 9 idle, frame 10
+    // jump. Strips are the community's most reliable sheet layout (no interior
+    // cells) and the 3.x family supports extreme ratios natively. sheetLayouts
+    // are the slicing CANDIDATES — processSheet picks the one whose detected
+    // gutters are emptiest, so a model that ignores 8:1 (the 2.5 fallback, an
+    // unsupported ratio → provider drops the field) degrades to grid slicing
+    // automatically. usedCells trims trailing extras before scoring; the
+    // pipeline always ships a rebuilt 1×N strip. idleFrameIndex is validated
+    // deterministically and DROPPED (never fatal) when its cell is bad — the
+    // scene falls back to frame 0 for idle.
+    gen: { aspectRatio: '8:1', model: GEMINI_SLOT_MODEL, imageSize: '1K' },
     post: { fit: 'stretch', keying: 'flood', trimBorder: false, crop: false, minAlphaFraction: 0.3, outline: true, pocketClean: true },
-    frames: { cols: 5, rows: 1, runFrameCount: 4, jumpFrameIndex: 4, usedCells: 5 },
+    frames: { cols: 10, rows: 1, runFrameCount: 8, idleFrameIndex: 8, jumpFrameIndex: 9, usedCells: 10 },
     sheetLayouts: [
-      { cols: 5, rows: 1, canvas: { width: 640, height: 128 } },
-      // Fallback for an ignored 4:1 request: the API default serve is 1:1, so the
-      // grid candidate's canvas is square (cells 128×192 — tall cells are fine,
+      { cols: 10, rows: 1, canvas: { width: 1280, height: 128 } },
+      // Fallback for an ignored 8:1 request (API default serve is ~1:1): a 5×2
+      // grid on a square-ish canvas (cells 128×192 — tall cells are fine,
       // slicing re-centers and the union-crop normalizes).
-      { cols: 3, rows: 2, canvas: { width: 384, height: 384 } }
+      { cols: 5, rows: 2, canvas: { width: 640, height: 384 } }
     ],
     fallbackSlot: 'player',
     subjectKey: 'player',
@@ -325,16 +340,15 @@ export const SLOT_SPECS = {
     // passing pose (cells 2/4), and "dramatically different" pressure makes
     // models redesign the character per cell (regression observed 2026-07-30).
     scaffold: (subject, style, { chroma } = {}) =>
-      `Draw one horizontal sprite-sheet strip of five animation frames, reading left ` +
+      `Draw one horizontal sprite-sheet strip of ten animation frames, reading left ` +
       `to right, of the EXACT SAME video game character: ${subject}. ` +
-      `${SHEET_IDENTITY_CLAUSE('five')} ` +
-      `Frames 1 to 4 are the four phases of one full running stride with strongly ` +
-      `contrasted arm and leg positions: ` +
+      `${SHEET_IDENTITY_CLAUSE('ten')} ` +
+      `Frames 1 to 8 are the eight phases of one full running stride cycle: ` +
       RUN_CYCLE_POSES.map((pose, i) => `Frame ${i + 1}: ${pose}. `).join('') +
-      `Frame 5: ${JUMP_POSE}. ` +
-      `The arms swing opposite to the legs: whichever leg is forward, the OTHER side's ` +
-      `arm is forward — the arms are never in the same position in two stride frames. ` +
-      `All five frames keep consistent proportions and lighting. ` +
+      `Frame 9: ${IDLE_POSE}. ` +
+      `Frame 10: ${JUMP_POSE}. ` +
+      `The arms swing opposite to the legs and visibly change position between the ` +
+      `stride frames. All ten frames keep consistent proportions and lighting. ` +
       `${SHEET_HELD_ITEM_CLAUSE} ` +
       `${SHEET_FRAMING_CLAUSE(chroma)}. ${style}`,
     fallbackSubject: (d) => d?.player

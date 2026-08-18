@@ -803,7 +803,9 @@ export default class GameManagerScene extends Phaser.Scene {
           this.player.play('dyn_player_run', true);
         } else if (animName === 'idle') {
           this.player.anims.stop();
-          this.player.setFrame(0);
+          // Dedicated idle stance when the sheet carries one (idleFrameIndex,
+          // added 2026-08-16); else the first run frame.
+          this.player.setFrame(frames?.idleFrameIndex ?? 0);
         } else if (animName === 'jump') {
           this.player.anims.stop();
           this.player.setFrame(frames?.jumpFrameIndex ?? 1);
