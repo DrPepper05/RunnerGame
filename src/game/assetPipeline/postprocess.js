@@ -957,6 +957,20 @@ export function detectGridCuts(canvas, { cols, rows }) {
 // cell the border-flood couldn't key; the green backdrop survived every gate). Chroma
 // on a finished sprite is ALWAYS illegal (the prompt bans it on the subject), so
 // detection is unambiguous.
+// Saturated screen color OR its pale washed-out drift (models fade the backdrop
+// toward a desaturated tint across long strips — live defect 2026-08-18: pale
+// mint cells slipped past the exact-green sweep, poisoned the scorer and nulled
+// the idle frame). The pale branch demands high brightness AND chroma-channel
+// dominance, so white/gray content and skin tones never match.
+function isChromaResidue(r, g, b, chroma) {
+  if (chroma === 'green') {
+    return (g >= 140 && g >= r + 50 && g >= b + 50) ||
+      (g >= 170 && r >= 110 && b >= 110 && g >= r + 12 && g >= b + 12);
+  }
+  return (r >= 140 && b >= 140 && r >= g + 50 && b >= g + 50) ||
+    (r >= 170 && b >= 170 && g >= 110 && r >= g + 12 && b >= g + 12);
+}
+
 export function chromaResidueFraction(canvas, chroma) {
   if (!chroma) return 0;
   const { width: w, height: h } = canvas;
@@ -965,11 +979,36 @@ export function chromaResidueFraction(canvas, chroma) {
   for (let i = 0; i < data.length; i += 4) {
     if (data[i + 3] < 128) continue;
     opaque++;
-    const r = data[i], g = data[i + 1], b = data[i + 2];
-    if (chroma === 'green' ? (g >= 140 && g >= r + 50 && g >= b + 50)
-      : (r >= 140 && b >= 140 && r >= g + 50 && b >= g + 50)) hit++;
+    if (isChromaResidue(data[i], data[i + 1], data[i + 2], chroma)) hit++;
   }
   return opaque ? hit / opaque : 0;
+}
+
+// Clears every pixel matching the (saturated OR pale) chroma predicate. The
+// predicate is strict enough that matches are backdrop with high confidence
+// REGARDLESS of how much of the cell they cover (a badly-keyed cell is often
+// mostly wash — replay-measured 23-43% on the 2026-08-18 capture, which a low
+// guard reverted, re-shipping the stain). The guard only catches the
+// pathological all-backdrop cell; pickChromaColor already steers
+// chroma-adjacent subjects onto the other screen color.
+export function removeChromaResidue(canvas, chroma, { guard = 0.85 } = {}) {
+  if (!chroma) return canvas;
+  const { width: w, height: h } = canvas;
+  const ctx = canvas.getContext('2d');
+  const imageData = ctx.getImageData(0, 0, w, h);
+  const data = imageData.data;
+  let opaque = 0, removed = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    if (data[i + 3] < 128) continue;
+    opaque++;
+    if (isChromaResidue(data[i], data[i + 1], data[i + 2], chroma)) {
+      data[i + 3] = 0;
+      removed++;
+    }
+  }
+  if (!removed || (opaque && removed / opaque > guard)) return canvas; // guard: revert by not writing
+  ctx.putImageData(imageData, 0, 0);
+  return canvas;
 }
 
 // Pick the sheet slicing layout whose grid hypothesis fits the served image best:
@@ -1082,6 +1121,10 @@ export async function processSheet(rawSrc, spec, { inset = 3, chroma = null } = 
       if (!chroma || chromaResidueFraction(cell, chroma) <= 0.08) return cell;
       const rgb = chroma === 'green' ? { r: 0, g: 255, b: 0 } : { r: 255, g: 0, b: 255 };
       removeFlatColor(cell, rgb, { tol: 110, soft: 60 });
+      // Second rung for the PALE drift the exact sweep can't reach (mint/pink
+      // wash) — guarded predicate sweep; a rescued cell no longer pre-flags the
+      // scorer or nulls the idle frame.
+      if (chromaResidueFraction(cell, chroma) > 0.03) removeChromaResidue(cell, chroma);
       return cell;
     })
     // Transparent headroom BEFORE the edge chain (after keying — padding earlier

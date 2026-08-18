@@ -306,13 +306,13 @@ export const SLOT_SPECS = {
     textureKey: 'dyn_player',
     outputKey: 'player',
     canvas: { width: 1280, height: 128 },
-    // Cheap-first sheet rung (2026-08-16 cost flip, revised same day after 2.5
-    // shipped a no-leg-swap cycle): 3.1-flash-lite bills the same $30/M as 2.5
-    // but is the 3.x family whose character consistency the sheet path depends
-    // on. The pipeline's attempt 2 ESCALATES to GEMINI_SHEET_MODEL (3.1-flash)
-    // whenever a gate — including the legsAlternate vision gate — rejects the
-    // cheap tier, so premium is paid only on failure. Restore always-premium with
-    // localStorage PM_MODEL_SHEET='gemini-3.1-flash-image'.
+    // All-lite sheet rungs (2026-08-18, client direction "not go to flash"):
+    // 3.1-flash-lite bills the same $30/M as 2.5 but is the 3.x family whose
+    // character consistency the sheet path depends on. BOTH normal attempts
+    // re-roll on this model (the old attempt-2 escalation to 3.1-flash cost
+    // ~2× per rung); the pale-chroma rescue + free stain-cull are what make
+    // lite rolls survivable. Restore always-premium with localStorage
+    // PM_MODEL_SHEET='gemini-3.1-flash-image'.
     // Layout is a HORIZONTAL 1×10 STRIP at 8:1 (2026-08-16, 8-frame cycle
     // restored + idle stance): frames 1-8 run phases, frame 9 idle, frame 10
     // jump. Strips are the community's most reliable sheet layout (no interior

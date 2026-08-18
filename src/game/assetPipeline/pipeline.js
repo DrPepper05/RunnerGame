@@ -8,7 +8,7 @@
  * every caller handles it by downgrading to the built-in static theme asset set
  * (ScreenZero's toStaticThemeConfig; App surfaces it in the regen overlay).
  */
-import { SLOT_SPECS, BASELINE_SLOTS, GENERATED_SLOTS, GEMINI_SHEET_MODEL, GEMINI_PRO_SHEET_MODEL, GEMINI_IMAGE_FALLBACK_MODEL, PROPS_GRID_SPEC, BG_CLAUSE, GAPS_CLAUSE } from './slotSpecs';
+import { SLOT_SPECS, BASELINE_SLOTS, GENERATED_SLOTS, GEMINI_PRO_SHEET_MODEL, PROPS_GRID_SPEC, BG_CLAUSE, GAPS_CLAUSE } from './slotSpecs';
 import { postProcessAsset, mirrorImage, drawToCanvas, alphaFraction, borderResidueFraction, topBandOpaqueFraction, brightResidueFraction, contentBoundsOf, processSheet, finalizeSheetFrames, loadImage, keyCellWithQuality, cleanKeyedEdges, alignFrames, maskIoU, composeFilmstrip, lockPalette, sliceRawGrid, removeEnclosedPockets, chromaResidueFraction } from './postprocess';
 import { reviewSprite } from './qa';
 import * as gemini from './providers/geminiImage';
@@ -208,9 +208,15 @@ export function evaluateAndCullCells(cells, gridMeta, runCountOverride = null, {
   const bad = new Array(cells.length).fill(false);
   let geomIssue = null;
   // Deterministic pre-flags from the caller (e.g. unrescuable chroma-stained
-  // cells) — treated like geometry failures.
-  for (const i of preBadIndices) {
-    if (i >= 0 && i < cells.length) { bad[i] = true; geomIssue = geomIssue || 'has backdrop-stained frames'; }
+  // cells). Tracked separately from organic failures: a stain is a KEYING
+  // artifact, not an animation fault — culling it is free and correct, so it
+  // must not burn the maxBadRun budget (2026-08-18: two stained cells pushed a
+  // good sheet into the repair rung, which redrew them on a different tier and
+  // shipped visibly mismatched frames). minKept still applies.
+  const preBadSet = new Set(preBadIndices.filter((i) => i >= 0 && i < cells.length));
+  for (const i of preBadSet) {
+    bad[i] = true;
+    geomIssue = geomIssue || 'has backdrop-stained frames';
   }
   cells.forEach((cell, i) => {
     const bounds = contentBoundsOf(cell);
@@ -246,7 +252,9 @@ export function evaluateAndCullCells(cells, gridMeta, runCountOverride = null, {
     if (!bad[i] && ious[i] != null && ious[i] > 0.965) bad[i] = true; // duplicate — keep the first
   }
 
-  const badRunCount = bad.slice(0, runCount).filter(Boolean).length;
+  // Only ORGANIC failures (geometry/identity/continuity) count against the
+  // cull budget; pre-flagged stains are culled for free (minKept still guards).
+  const badRunCount = bad.slice(0, runCount).filter((b, i) => b && !preBadSet.has(i)).length;
   const keptRun = cells.slice(0, runCount).filter((_, i) => !bad[i]);
   if (badRunCount > maxBadRun || keptRun.length < minKept) {
     return {
@@ -613,11 +621,11 @@ export async function generateAssets({
               width: cells[idx].width,
               height: cells[idx].height,
               extraRef: neighbor ? onWhite(neighbor) : null,
-              // Flat-per-image billing makes repair frames on the sheet model cost
-              // MORE than a whole new sheet (3 × $0.09 vs $0.09) — route repairs to
-              // the cheaper fallback model; lockPalette + the re-verdict still gate
-              // any style drift, and a failed repair just resumes the normal ladder.
-              model: GEMINI_IMAGE_FALLBACK_MODEL
+              // Repairs render on the SAME tier as the sheet they patch (2026-08-18):
+              // routing them to the 2.5 fallback saved nothing (lite bills the same
+              // $30/M) and injected visibly mismatched frames into a 3.x sheet — the
+              // "one frame from a different game" live complaint.
+              model: activeSpec.gen.model
             });
             report(null);
           } catch (err) {
@@ -726,24 +734,20 @@ export async function generateAssets({
       for (let attempt = 1; attempt <= maxSheetAttempts && !sheet; attempt++) {
         if (runState.cancelToken?.cancelled) throw cancelledError();
         if (attempt === 3 && runState.skipGemini) break;
-        // Model ladder (2026-08-16): attempt 1 runs the spec default (the cheap
-        // 2.5 model since the cost flip), attempt 2 ESCALATES to the 3.1 sheet
-        // model whose choreography is markedly stronger — pay for the premium
-        // tier only when the cheap tier failed a gate. Attempt 3 (quality mode)
-        // stays the pro rescue.
-        const escalate = attempt === 2 && activeSpec.gen.model !== GEMINI_SHEET_MODEL;
+        // Cost ladder (2026-08-18, client direction "not go to flash"): BOTH
+        // normal attempts run the spec/default lite tier — a lite re-roll costs
+        // ~half the old 3.1-flash escalation, and the stain-cull + pale-chroma
+        // rescue changes are what make lite rolls survivable. PM_MODEL_SHEET
+        // still overrides the tier per run; attempt 3 (quality mode only)
+        // remains the pro rescue.
         if (attempt > 1) {
           report(attempt === 3
             ? `[ASSETS] Sheet ${lastIssue} — trying the premium image model...`
-            : escalate
-              ? `[ASSETS] Sheet ${lastIssue} — retrying on the stronger sheet model...`
-              : `[ASSETS] Sheet ${lastIssue}, regenerating...`);
+            : `[ASSETS] Sheet ${lastIssue}, regenerating...`);
         }
         const attemptSpec = attempt === 3
           ? { ...activeSpec, gen: { ...activeSpec.gen, model: GEMINI_PRO_SHEET_MODEL } }
-          : escalate
-            ? { ...activeSpec, gen: { ...activeSpec.gen, model: GEMINI_SHEET_MODEL } }
-            : activeSpec;
+          : activeSpec;
         // The sheet is an image-editing call anchored to the static base; the
         // prompt preamble tells the model the attachment IS the character.
         const useReference = baseSrc && gemini.isGeminiConfigured() && !runState.skipGemini;
