@@ -9,12 +9,13 @@
  * (ScreenZero's toStaticThemeConfig; App surfaces it in the regen overlay).
  */
 import { SLOT_SPECS, BASELINE_SLOTS, GENERATED_SLOTS, GEMINI_SHEET_MODEL, GEMINI_PRO_SHEET_MODEL, GEMINI_IMAGE_FALLBACK_MODEL, PROPS_GRID_SPEC, BG_CLAUSE, GAPS_CLAUSE } from './slotSpecs';
-import { postProcessAsset, mirrorImage, drawToCanvas, alphaFraction, borderResidueFraction, topBandOpaqueFraction, contentBoundsOf, processSheet, finalizeSheetFrames, loadImage, keyCellWithQuality, cleanKeyedEdges, alignFrames, maskIoU, composeFilmstrip, lockPalette, sliceRawGrid, removeEnclosedPockets, chromaResidueFraction } from './postprocess';
+import { postProcessAsset, mirrorImage, drawToCanvas, alphaFraction, borderResidueFraction, topBandOpaqueFraction, brightResidueFraction, contentBoundsOf, processSheet, finalizeSheetFrames, loadImage, keyCellWithQuality, cleanKeyedEdges, alignFrames, maskIoU, composeFilmstrip, lockPalette, sliceRawGrid, removeEnclosedPockets, chromaResidueFraction } from './postprocess';
 import { reviewSprite } from './qa';
 import * as gemini from './providers/geminiImage';
 import { designAssetPrompts, buildFinalPrompt, buildPropsGridPrompt, chromaFromPrompt } from './promptDesigner';
 import { parsePromptKeywords } from '../promptUtils';
 import { recordSheetAttempt, registerSheetReplayDeps } from './sheetDebug';
+import { recordLayerAttempt, registerLayerReplayDeps } from './layerDebug';
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -40,6 +41,23 @@ registerSheetReplayDeps({
   processSheet,
   evaluateAndCullCells: (...args) => evaluateAndCullCells(...args),
   sheetSpec: SLOT_SPECS.player_sheet
+});
+
+// Deterministic layer measurements — shared by the __PM_LAYER_DEBUG harness and
+// the per-attempt capture in runSlot (the same numbers the gates read).
+const measureLayerImage = (image, spec) => {
+  const canvas = drawToCanvas(image, { width: image.naturalWidth, height: image.naturalHeight, fit: 'stretch' });
+  return {
+    transparent: alphaFraction(canvas),
+    topBand: topBandOpaqueFraction(canvas),
+    bright: brightResidueFraction(canvas, { minChannel: Math.round(225 * (spec.post.darken ?? 1)) })
+  };
+};
+
+registerLayerReplayDeps({
+  postProcessAsset,
+  specFor: (slot) => SLOT_SPECS[slot],
+  measureLayer: measureLayerImage
 });
 
 /**
@@ -372,7 +390,10 @@ export async function generateAssets({
       return {
         transparent: alphaFraction(canvas),
         residue: spec.post.crop ? borderResidueFraction(canvas, { chroma }) : 0,
-        topBand: spec.post.crop ? 0 : topBandOpaqueFraction(canvas)
+        topBand: spec.post.crop ? 0 : topBandOpaqueFraction(canvas),
+        // Whole-canvas pale-patch fraction (layers only). Measured POST-darken, so
+        // the near-white bar scales with the slot's darken factor.
+        bright: spec.post.crop ? 0 : brightResidueFraction(canvas, { minChannel: Math.round(225 * (spec.post.darken ?? 1)) })
       };
     };
     const before = measure(img);
@@ -380,11 +401,27 @@ export async function generateAssets({
     // Non-cropped keyed slots are the parallax layers: their contract is "everything
     // above the shapes is empty", so surviving backdrop shows as an opaque top band.
     if (!spec.post.crop) {
-      if (before.topBand <= 0.10) return img;
-      report(`[ASSETS] Re-keying ${slot} (backdrop left in the top band)...`);
-      const retried = await postProcessAsset(raw.dataUrl, spec, { keyOverrides: { seedTol: 70, stepTol: 24 }, chroma });
-      const after = measure(retried);
-      return after.transparent < 0.97 && after.topBand < before.topBand ? retried : img;
+      if (before.topBand > 0.10) {
+        report(`[ASSETS] Re-keying ${slot} (backdrop left in the top band)...`);
+        const retried = await postProcessAsset(raw.dataUrl, spec, { keyOverrides: { seedTol: 70, stepTol: 24 }, chroma });
+        const after = measure(retried);
+        return after.transparent < 0.97 && after.topBand < before.topBand ? retried : img;
+      }
+      // Enclosed pale pockets (white sky partitioned off from the border by thin
+      // shapes) live BELOW the top band — invisible to the check above. One re-key
+      // with a looser white pass; safe on silhouette slots because the dissolve
+      // guard trusts big white removals when the surviving content is near-black.
+      if (before.bright > 0.03) {
+        report(`[ASSETS] Re-keying ${slot} (pale patches left after keying)...`);
+        const retried = await postProcessAsset(raw.dataUrl, spec, {
+          keyOverrides: { seedTol: 70, stepTol: 24 },
+          ...(spec.post.silhouette ? { whiteOverrides: { threshold: 215, hardCut: 240 } } : {}),
+          chroma
+        });
+        const after = measure(retried);
+        return after.transparent < 0.97 && after.bright < before.bright ? retried : img;
+      }
+      return img;
     }
 
     // A cropped sprite that is >92% transparent inside its own bounding box got
@@ -1026,8 +1063,14 @@ export async function generateAssets({
         // A layer can pass the global transparency bar and still carry a painted sky —
         // the strip contract is a mostly-empty top band, so gate on that too.
         const topBand = topBandOpaqueFraction(canvas);
-        return topBand > 0.35
-          ? `layer kept a painted sky (${Math.round(topBand * 100)}% of the top band opaque)`
+        if (topBand > 0.35) {
+          return `layer kept a painted sky (${Math.round(topBand * 100)}% of the top band opaque)`;
+        }
+        // Enclosed pale pockets survive both checks above (below the top band,
+        // opaque, un-floodable) — the shipped-white-patches failure mode.
+        const bright = brightResidueFraction(canvas, { minChannel: Math.round(225 * (spec.post.darken ?? 1)) });
+        return bright > 0.06
+          ? `layer kept large pale patches (${Math.round(bright * 100)}% near-white)`
           : null;
       };
       const attemptOnce = async (attemptSeed, attemptPrompt) => {
@@ -1039,6 +1082,14 @@ export async function generateAssets({
         let img = await postProcessAsset(raw.dataUrl, spec, { chroma });
         img = await enforceKeyQuality(slot, spec, raw, img, chroma);
         const { img: finalImg, outcome } = await applyQualityAssurance(slot, spec, raw, img, attemptPrompt);
+        if (spec.qa?.clean) {
+          recordLayerAttempt({
+            slot,
+            rawDataUrl: raw.dataUrl,
+            finalDataUrl: finalImg.src,
+            measurements: measureLayerImage(finalImg, spec)
+          });
+        }
         return { raw, finalImg, outcome };
       };
 

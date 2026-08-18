@@ -26,7 +26,7 @@ const SPRITE_SCHEMA = {
 const LAYER_SCHEMA = {
   type: 'OBJECT',
   properties: {
-    backgroundClean: { type: 'BOOLEAN', description: 'Is everything outside the shapes fully transparent/empty (no leftover backdrop or color field)?' },
+    backgroundClean: { type: 'BOOLEAN', description: 'Is everything that is not a shape fully transparent/empty — no leftover backdrop, color field, or large white or pale patches anywhere, including between, around, or above the shapes?' },
     cutoutShapes: { type: 'BOOLEAN', description: 'Do the opaque areas consist ONLY of irregular cutout silhouettes/objects? Answer false if any opaque area is a rectangular panel, framed picture, painted sky patch, or full scene.' }
   },
   required: ['backgroundClean', 'cutoutShapes']
@@ -116,8 +116,9 @@ function buildPrompt(kind, grid) {
       'This image should be a decorative parallax strip for a side-scrolling game: only ' +
       'isolated cutout shapes (silhouettes, props, objects) on a transparent background ' +
       '(shown as checkerboard or empty). Answer strictly:\n' +
-      '- backgroundClean: is everything outside the shapes transparent/empty, with no ' +
-      'leftover backdrop color or color field?\n' +
+      '- backgroundClean: is everything that is not a shape transparent/empty, with no ' +
+      'leftover backdrop color, color field, or large white or pale patch anywhere — ' +
+      'including between, around, or above the shapes?\n' +
       '- cutoutShapes: are ALL opaque areas irregular object/silhouette cutouts? Answer ' +
       'false if ANY opaque area is a rectangular panel, a framed picture, a painted sky ' +
       'or gradient patch, or a full miniature scene.'

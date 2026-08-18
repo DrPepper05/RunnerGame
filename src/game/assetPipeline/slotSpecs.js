@@ -122,7 +122,8 @@ const SHEET_HELD_ITEM_CLAUSE =
 const SHEET_FRAMING_CLAUSE = (chroma) =>
   `The character faces right in side profile in every frame, at the same character ` +
   `size and on the same ground line in every frame, each frame centered in its own ` +
-  `equal section with a clear band of empty backdrop separating neighboring frames — ` +
+  `equal section with a clear band of empty backdrop separating neighboring frames ` +
+  `and a thin margin of backdrop above the character's head in every frame — ` +
   `the characters never touch or overlap each other or the image edges. ` +
   `${BG_CLAUSE(chroma)}, in every single frame. ${GAPS_CLAUSE}. ` +
   `No scenery, no floor, no shadows, no motion lines, no frame borders, no dividers, no text`;
@@ -130,8 +131,13 @@ const SHEET_FRAMING_CLAUSE = (chroma) =>
 export const SLOT_SPECS = {
   background_far: {
     textureKey: 'dyn_bg_far',
-    canvas: { width: 1024, height: 512 },
-    gen: { aspectRatio: '16:9', model: GEMINI_SLOT_MODEL },
+    // 2048×1024 (POT) + imageSize '2K': billing is FLAT per image, so the 2K
+    // request is a $0 resolution lever — the ~2688×1512 serve supersamples down
+    // instead of the old ~1344×768 serve upscaling ~2× in-game under NEAREST
+    // (the "blocky background" complaint). If the model rejects/drops the size
+    // field the smaller serve just gets a smooth upscale — no worse than before.
+    canvas: { width: 2048, height: 1024 },
+    gen: { aspectRatio: '16:9', model: GEMINI_SLOT_MODEL, imageSize: '2K' },
     post: { fit: 'cover', keying: null, trimBorder: false, crop: false },
     scaffold: (subject, style) =>
       `Paint a wide side-scrolling video game background: ${subject}. Distant landscape ` +
@@ -142,7 +148,9 @@ export const SLOT_SPECS = {
     textureKey: 'dyn_bg_mid',
     canvas: { width: 1024, height: 512 },
     gen: { aspectRatio: '16:9', model: GEMINI_SLOT_MODEL },
-    post: { fit: 'cover', keying: 'flood+white', trimBorder: false, crop: false, minAlphaFraction: 0.15, edgeErode: 2, darken: 0.85 },
+    // silhouette: content is near-black BY CONTRACT — lets the white-pass
+    // dissolve guard trust big white removals (enclosed sky pockets) safely.
+    post: { fit: 'cover', keying: 'flood+white', trimBorder: false, crop: false, minAlphaFraction: 0.15, edgeErode: 2, darken: 0.85, silhouette: true },
     qa: { clean: true },
     optional: true,
     subjectKey: 'background_far',
@@ -165,7 +173,7 @@ export const SLOT_SPECS = {
     gen: { aspectRatio: '16:9', model: GEMINI_SLOT_MODEL },
     // edgeErode 1 (not 2): near props are detailed decor, 2px erosion shreds thin
     // details; bleedEdgeColors still covers the halo
-    post: { fit: 'cover', keying: 'flood+white', trimBorder: false, crop: false, minAlphaFraction: 0.15, edgeErode: 1, darken: 0.72 },
+    post: { fit: 'cover', keying: 'flood+white', trimBorder: false, crop: false, minAlphaFraction: 0.15, edgeErode: 1, darken: 0.72, silhouette: true },
     qa: { clean: true },
     optional: true,
     subjectKey: 'background_far',

@@ -821,14 +821,26 @@ export function assembleSheet(frames, { cols, rows }) {
   return { canvas, frameWidth, frameHeight };
 }
 
-function insetCanvas(canvas, inset) {
-  const w = canvas.width - inset * 2;
-  const h = canvas.height - inset * 2;
+function insetCanvas(canvas, insetX, insetY = insetX) {
+  const w = canvas.width - insetX * 2;
+  const h = canvas.height - insetY * 2;
   if (w <= 0 || h <= 0) return canvas;
   const out = document.createElement('canvas');
   out.width = w;
   out.height = h;
-  out.getContext('2d').drawImage(canvas, inset, inset, w, h, 0, 0, w, h);
+  out.getContext('2d').drawImage(canvas, insetX, insetY, w, h, 0, 0, w, h);
+  return out;
+}
+
+// Extends a canvas upward with transparent headroom. Sheet cells hold full-body
+// characters whose heads sit at (or on) the cell's top edge; without headroom the
+// edge chain treats the canvas border as void (erode eats the head's top row and
+// addOutline cannot cap it), which reads as a flat guillotined head in-game.
+function padCanvasTop(canvas, px) {
+  const out = document.createElement('canvas');
+  out.width = canvas.width;
+  out.height = canvas.height + px;
+  out.getContext('2d').drawImage(canvas, 0, px);
   return out;
 }
 
@@ -1041,15 +1053,25 @@ export async function processSheet(rawSrc, spec, { inset = 3, chroma = null } = 
       const cell = document.createElement('canvas');
       cell.width = cellW;
       cell.height = cellH;
+      // Detected cuts can exceed the uniform cell size (the ±6% search window);
+      // an unclamped draw put the overflow OFF-canvas (negative dest) and clipped
+      // heads on multi-row layouts. Scale-to-fit keeps all content; alignFrames'
+      // height normalization absorbs the small per-cell size delta.
+      const fitScale = Math.min(1, cellW / sw, cellH / sh);
+      const dw = Math.round(sw * fitScale);
+      const dh = Math.round(sh * fitScale);
       cell.getContext('2d').drawImage(
         canvas, sx, sy, sw, sh,
-        Math.floor((cellW - sw) / 2), Math.floor((cellH - sh) / 2), sw, sh
+        Math.floor((cellW - dw) / 2), Math.floor((cellH - dh) / 2), dw, dh
       );
       rawCells.push(cell);
     }
   }
   const cells = rawCells
-    .map((cell) => insetCanvas(cell, inset))
+    // Strip layouts (rows 1) have only VERTICAL gutters/dividers to discard —
+    // a full 3px vertical inset was shaving the top of every head flat (a
+    // full-body character fills the 128px cell). 1px still drops edge artifacts.
+    .map((cell) => insetCanvas(cell, inset, rows > 1 ? inset : 1))
     .map((cell) => keyCellWithQuality(cell, { chroma }))
     .map((cell) => (spec.post.pocketClean ? removeEnclosedPockets(cell, { chroma }) : cell))
     // Chroma-residue rescue: when the border-flood failed a cell (content sliced
@@ -1062,6 +1084,10 @@ export async function processSheet(rawSrc, spec, { inset = 3, chroma = null } = 
       removeFlatColor(cell, rgb, { tol: 110, soft: 60 });
       return cell;
     })
+    // Transparent headroom BEFORE the edge chain (after keying — padding earlier
+    // would poison the border-seeded flood) so erode/outline treat the head's top
+    // like any other edge. Uniform across cells; the union crop trims it back off.
+    .map((cell) => padCanvasTop(cell, 4))
     .map((cell) => cleanKeyedEdges(cell, { erode: 1, outline: !!spec.post.outline, despill: chroma }));
   const preview = assembleSheet(cells, { cols, rows });
   const previewImg = await loadImage(preview.canvas.toDataURL('image/png'), { crossOrigin: null });
@@ -1308,7 +1334,37 @@ export function cleanKeyedEdges(canvas, { erode = 1, outline = false, outlineThi
   return canvas;
 }
 
-function applyKeying(canvas, keying, keyOverrides) {
+// Mean luma (0.299r+0.587g+0.114b) over meaningfully-opaque pixels; null when none.
+function meanOpaqueLuma(canvas) {
+  const { width: w, height: h } = canvas;
+  const data = canvas.getContext('2d').getImageData(0, 0, w, h).data;
+  let sum = 0, n = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    if (data[i + 3] < 128) continue;
+    sum += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+    n++;
+  }
+  return n ? sum / n : null;
+}
+
+/**
+ * Fraction of the whole canvas that is opaque AND near-white/pale — the layer-slot
+ * failure signature (white sky pockets partitioned off from the border by thin shapes
+ * crossing the frame, which the border flood can never reach). Whole-canvas on
+ * purpose: the existing gates only look at the top band or the border.
+ */
+export function brightResidueFraction(canvas, { minChannel = 225 } = {}) {
+  const { width: w, height: h } = canvas;
+  const data = canvas.getContext('2d').getImageData(0, 0, w, h).data;
+  let bright = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    if (data[i + 3] < 128) continue;
+    if (data[i] >= minChannel && data[i + 1] >= minChannel && data[i + 2] >= minChannel) bright++;
+  }
+  return bright / (w * h);
+}
+
+function applyKeying(canvas, keying, keyOverrides, post = {}, whiteOverrides = null) {
   if (keying === 'flood') return removeBorderBackground(canvas, keyOverrides);
   if (keying === 'white') return removeWhiteBackground(canvas, keyOverrides);
   if (keying === 'flood+white') {
@@ -1321,12 +1377,17 @@ function applyKeying(canvas, keying, keyOverrides) {
     const ctx = canvas.getContext('2d');
     const beforeWhite = ctx.getImageData(0, 0, canvas.width, canvas.height);
     const keptBefore = 1 - alphaFraction(canvas);
-    removeWhiteBackground(canvas, { threshold: 236, hardCut: 248 });
+    removeWhiteBackground(canvas, whiteOverrides || { threshold: 236, hardCut: 248 });
     const removedByWhite = keptBefore - (1 - alphaFraction(canvas));
     // Dissolve guard: a pocket-clearing pass should nibble, not devour. If it removed
     // more than 20% of what the flood had kept, it was eating content — revert it.
+    // EXCEPT on silhouette slots whose surviving content is near-black (the layer
+    // contract): there a big white removal is exactly the enclosed-sky pocket this
+    // pass exists for, and the old unconditional revert was what SHIPPED the white
+    // patches (the bigger the patch, the more certainly it got reverted).
     if (keptBefore > 0 && removedByWhite / keptBefore > 0.2) {
-      ctx.putImageData(beforeWhite, 0, 0);
+      const darkContent = post.silhouette && (meanOpaqueLuma(canvas) ?? 255) < 110;
+      if (!darkContent) ctx.putImageData(beforeWhite, 0, 0);
     }
     return canvas;
   }
@@ -1341,6 +1402,8 @@ function applyKeying(canvas, keying, keyOverrides) {
  * spec.post: { fit, keying: 'flood'|'white'|null, trimBorder, crop, minAlphaFraction? }
  * opts.keyOverrides — looser tolerances for QA-driven re-key retries; requires rawSrc,
  * so callers keep the raw source around.
+ * opts.whiteOverrides — looser white-pass thresholds for the 'flood+white' secondary
+ * pass (silhouette-layer re-keys only).
  * opts.chroma — 'green'|'magenta' when the prompt asked for a chroma-key backdrop;
  * enables the edge despill pass (the flood keyer itself is backdrop-color agnostic).
  */
@@ -1356,7 +1419,7 @@ export async function postProcessAsset(rawSrc, spec, opts = {}) {
   } else {
     canvas = drawToCanvas(img, { ...spec.canvas, fit: spec.post.fit });
   }
-  canvas = applyKeying(canvas, spec.post.keying, opts.keyOverrides);
+  canvas = applyKeying(canvas, spec.post.keying, opts.keyOverrides, spec.post, opts.whiteOverrides || null);
   // Enclosed-gap pockets (arm/torso gaps painted backdrop-color) BEFORE the edge
   // chain, so the cleared gaps get the same outline treatment as real edges.
   if (spec.post.keying && spec.post.pocketClean) {

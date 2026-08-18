@@ -555,8 +555,14 @@ function slotStyleClauses(slotKey, styleGuide, { userNamed = false } = {}) {
       `highlight, bold dark outline, instantly readable at very small size`;
   }
   if (slotKey === 'background_far') {
-    return `color palette ${styleGuide.colorPalette}, muted desaturated tones, ` +
-      `soft atmospheric haze, gentle contrast so foreground gameplay elements stand out`;
+    // No soft-edge vocabulary here: "soft atmospheric haze" trailed the SNES-era
+    // "hard pixel edges" tail and (recency-weighted) overrode it — the far layer
+    // rendered as a smooth painting while every sprite stayed pixel art. Haze is
+    // now expressed in pixel-native terms (dither, clusters).
+    return `color palette ${styleGuide.colorPalette}, muted desaturated colors, hazy ` +
+      `distant forms suggested with fine dithered pixel gradients instead of smooth ` +
+      `blends, detail simplified into clean pixel clusters, gentle contrast so ` +
+      `foreground gameplay elements stand out`;
   }
   if (slotKey === 'background_mid' || slotKey === 'background_near') {
     return `color palette ${styleGuide.colorPalette}, very dark near-black ` +
