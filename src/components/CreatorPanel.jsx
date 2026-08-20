@@ -2,6 +2,8 @@ import React, { useState } from 'react';
 import { GAME_PRESETS } from '../gameConfig';
 import { IconShare, IconExport, IconImport, IconReset, IconHome } from './Icons';
 import { downloadCostReport } from '../game/assetPipeline/costReport';
+import { downloadMetricsReport } from '../game/metricsReport';
+import { getRecords as getTimingRecords } from '../game/metrics';
 import { encodeShareConfig } from '../game/shareLink';
 import { ensureUploaded } from '../game/assetCache';
 
@@ -198,6 +200,9 @@ const CreatorPanel = ({
   onHomeClick,
 }) => {
   const isCustom = presetKey === 'custom';
+  // Read only while the drawer is open — a localStorage hit per closed-panel
+  // render would be pure waste, and the count only needs to be right on open.
+  const timingRuns = isOpen ? getTimingRecords().length : 0;
   const [promptText, setPromptText] = useState('');
   const [promptBusy, setPromptBusy] = useState(false);
   const [promptResult, setPromptResult] = useState(null);
@@ -461,6 +466,19 @@ const CreatorPanel = ({
               title="Download a text report of this run: outcome (cache vs generated), per-call/per-asset cost + timing, cache hit rate and pricing projection"
             >
               💾 Cost Report (≈ ${(liveParams.assetMeta.cost?.estUsd ?? 0).toFixed(2)} this run)
+            </button>
+          )}
+          {/* Segmented timing report. Deliberately NOT gated on assetMeta: the
+              share-link path is the one the client times, and a restored boot can
+              arrive without assetMeta — the very case the cost-report gate hides. */}
+          {timingRuns > 0 && (
+            <button
+              className="pm-btn pm-btn-outline"
+              onClick={() => downloadMetricsReport()}
+              style={{ width: '100%', padding: '10px' }}
+              title="Download a text report of load times, split by scenario: fresh generation, cache-assisted generation, exact cache hit and shared-link load"
+            >
+              ⏱️ Timing Report ({timingRuns} run{timingRuns === 1 ? '' : 's'})
             </button>
           )}
           <ConfigActions liveParams={liveParams} setLiveParams={setLiveParams} setPresetKey={setPresetKey} onHomeClick={onHomeClick} />

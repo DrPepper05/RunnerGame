@@ -10,10 +10,13 @@ export default class RunnerMode extends BaseMode {
     this.obstacles = null;
     this.obstacleTimer = null;
     this.coins = null;
-
-    // Mobile control and keyboard state
-    this.mobileControls = [];
-    this.uiContainer = null;
+    // Airborne/grounded edge detection, for landing feedback. `lastVy` is the
+    // previous frame's vertical velocity: a grounded edge only counts as a
+    // landing when the player was actually FALLING — `touching.down` can
+    // flicker on a resting body and must never spawn dust or a squash.
+    this.wasGrounded = true;
+    this.lastVy = 0;
+    this.lastLandingAt = 0;
   }
 
   create() {
@@ -38,8 +41,12 @@ export default class RunnerMode extends BaseMode {
     this.coins = this.scene.physics.add.group();
     this.scene.physics.add.overlap(this.scene.player, this.coins, (player, coin) => {
       if (!coin || !coin.active) return;
+      const value = this.scene.gameConfig.coinValue ?? 25;
+      // Read the position before destroying — the burst needs to spawn where the
+      // coin was, not where the (fixed-position) player is.
+      this.scene.fx?.pickup(coin.x, coin.y, value);
       coin.destroy();
-      this.scene.score += (this.scene.gameConfig.coinValue ?? 25);
+      this.scene.score += value;
       window.dispatchEvent(new CustomEvent('update-score', { detail: this.scene.score }));
     }, null, this);
 
@@ -122,9 +129,25 @@ export default class RunnerMode extends BaseMode {
   update(time, delta) {
     if (this.scene.isGameOver || this.scene.isGamePaused) return;
 
-    if (this.scene.player.body.touching.down || this.scene.player.body.blocked.down) {
+    const player = this.scene.player;
+    const grounded = player.body.touching.down || player.body.blocked.down;
+    if (grounded) {
+      if (!this.wasGrounded && this.lastVy > 140 && time - this.lastLandingAt > 120) {
+        // Touchdown after a real fall: a squash and a puff of dust, so landings
+        // have weight. Velocity-gated + rate-limited (see init).
+        this.lastLandingAt = time;
+        this.scene.fx?.landing(player.x, player.body.bottom);
+        this.scene.fx?.pulse(player, 1.16, 0.84, 90);
+      }
       this.scene.playPlayerAnim('run');
+      // Tie playback rate to actual speed. The run cycle is authored at one
+      // fixed frame rate, so as speedIncrement ramps the feet visibly skate.
+      if (player.anims) {
+        player.anims.timeScale = Phaser.Math.Clamp(this.runSpeed / (this.baseSpeed || 1), 0.6, 1.5);
+      }
     }
+    this.wasGrounded = grounded;
+    this.lastVy = player.body.velocity.y;
 
     // Scroll floor
     if (this.scene.floorSegments) {
@@ -170,6 +193,8 @@ export default class RunnerMode extends BaseMode {
     if (this.scene.player.body.touching.down || this.scene.player.body.blocked.down) {
       this.scene.player.body.setVelocityY(-(this.scene.gameConfig.jumpForce || 750));
       this.scene.playPlayerAnim('jump');
+      this.scene.fx?.pulse(this.scene.player, 0.86, 1.18, 80); // stretch on takeoff
+      this.wasGrounded = false;
     }
   }
 

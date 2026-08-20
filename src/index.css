@@ -430,50 +430,78 @@ canvas {
   justify-content: space-between;
   align-items: flex-end;
   box-sizing: border-box;
-  padding: env(safe-area-inset-top, 20px) env(safe-area-inset-right, 20px) calc(env(safe-area-inset-bottom, 20px) + 12px) env(safe-area-inset-left, 20px);
+  /* Button geometry lives in these three custom properties so every rule below
+     scales together — and so the footprint MobileControls measures for the
+     camera gutter stays truthful when the sizes change. vmin (not vw/vh) keeps
+     a button the same size in both orientations. */
+  --pm-btn: clamp(46px, 12vmin, 58px);
+  --pm-btn-jump: clamp(54px, 14vmin, 66px);
+  --pm-btn-gap: clamp(8px, 2.5vmin, 14px);
+  /* env(x, fallback) only uses the fallback where env() is UNSUPPORTED, so the
+     old `env(safe-area-inset-left, 20px)` resolved to 0 on every ordinary phone
+     and the buttons sat flush against the screen edge. max() is a real minimum. */
+  padding-top: max(8px, env(safe-area-inset-top));
+  padding-right: max(12px, env(safe-area-inset-right));
+  padding-bottom: max(12px, env(safe-area-inset-bottom));
+  padding-left: max(12px, env(safe-area-inset-left));
   width: 100%;
   height: 100%;
+}
+
+/* Landscape phones are the worst case — full-size buttons against a ~390px
+   tall viewport. Same breakpoint the HUD header already compacts at. */
+@media (max-height: 480px) {
+  .pm-mobile-overlay {
+    --pm-btn: clamp(42px, 11vmin, 50px);
+    --pm-btn-jump: clamp(46px, 12vmin, 56px);
+    --pm-btn-gap: 8px;
+    padding-bottom: max(8px, env(safe-area-inset-bottom));
+  }
 }
 
 .pm-mobile-dpad {
   pointer-events: auto;
   display: flex;
-  gap: 16px;
+  gap: var(--pm-btn-gap);
   align-items: center;
 }
 
 .pm-mobile-actions {
   pointer-events: auto;
   display: flex;
-  gap: 14px;
+  gap: var(--pm-btn-gap);
   align-items: center;
 }
 
-/* Beautiful Glassmorphic Touch Buttons */
+/* Glassmorphic touch buttons, sized from the custom properties above. */
 .pm-touch-btn {
   -webkit-tap-highlight-color: transparent;
   user-select: none;
-  width: 66px;
-  height: 66px;
+  width: var(--pm-btn);
+  height: var(--pm-btn);
   border-radius: 50%;
-  border: 1px solid rgba(255, 255, 255, 0.18);
-  background: rgba(18, 24, 37, 0.5);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  background: rgba(18, 24, 37, 0.6);
   color: #ffffff;
   display: flex;
   justify-content: center;
   align-items: center;
-  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.35), inset 0 2px 4px rgba(255, 255, 255, 0.05);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
   cursor: pointer;
-  transition: transform 0.05s ease, background 0.1s ease, border-color 0.1s ease, box-shadow 0.1s ease;
+  /* Resting translucency is the direct lever on "the controls hide gameplay".
+     No backdrop-filter here any more: a per-frame GPU blur over an animating
+     canvas costs real frames on exactly the phones this is meant to help, and
+     at this opacity the blur was invisible anyway. */
+  opacity: 0.6;
+  transition: transform 0.05s ease, opacity 0.12s ease, background 0.1s ease, border-color 0.1s ease, box-shadow 0.1s ease;
   padding: 0;
   margin: 0;
   outline: none;
 }
 
-/* Active Pressed Feedback */
+/* Pressed: full opacity + theme glow, so touch feedback is unmistakable. */
 .pm-touch-btn:active {
+  opacity: 1;
   transform: scale(0.9);
   background: var(--theme-accent-semi, rgba(0, 229, 153, 0.25));
   border-color: var(--theme-accent, #00E599);
@@ -481,34 +509,101 @@ canvas {
 }
 
 .pm-touch-btn svg {
-  width: 28px;
-  height: 28px;
+  width: calc(var(--pm-btn) * 0.44);
+  height: calc(var(--pm-btn) * 0.44);
   fill: currentColor;
   pointer-events: none;
 }
 
-/* Larger Action Button for Jump */
+/* The primary action stays the largest and least transparent target. */
 .pm-touch-btn--jump {
-  width: 78px;
-  height: 78px;
-  border-color: rgba(255, 255, 255, 0.22);
+  width: var(--pm-btn-jump);
+  height: var(--pm-btn-jump);
+  border-color: rgba(255, 255, 255, 0.28);
+  opacity: 0.68;
 }
 
 .pm-touch-btn--jump svg {
-  width: 32px;
-  height: 32px;
+  width: calc(var(--pm-btn-jump) * 0.44);
+  height: calc(var(--pm-btn-jump) * 0.44);
 }
 
-/* Combat buttons stacked/aligned layout styling */
+/* Combat cluster: ONE row (shoot · melee · jump), never a stack. A stacked
+   cluster is ~130px tall and its top sits ABOVE the floor line — that is the
+   exact overlap the "enemies under the buttons" complaint was about, and the
+   reason the ground once had to be lifted. One row keeps the tallest control
+   at the jump button's height, so the floor's top edge clears it everywhere. */
 .pm-mobile-actions-stack {
   display: flex;
-  flex-direction: column;
-  gap: 12px;
+  flex-direction: row;
+  gap: var(--pm-btn-gap);
   align-items: flex-end;
 }
 
 .pm-mobile-actions-row {
   display: flex;
-  gap: 12px;
+  gap: var(--pm-btn-gap);
   align-items: flex-end;
+}
+
+/* ── Capture mode (?capture=1 / ?capture=clean) ──────────────────────────────
+   A chrome-free view for recording demos and marketing material. Everything is
+   driven by one class on <body>, so no component needs to know the mode exists
+   and nothing has to be threaded through props. App.jsx owns the flag; the URL
+   owns the truth, so a recording setup is reproducible and survives the remounts
+   that restyles and share-link restores trigger. */
+body.pm-capture .hud-header,
+body.pm-capture .pm-keyboard-hint {
+  display: none !important;
+}
+
+/* The touch controls stay usable — someone still has to PLAY the demo — but
+   drop far enough back to be effectively invisible on camera. ?capture=clean
+   removes them outright, for footage recorded on desktop with a keyboard. */
+body.pm-capture .pm-touch-btn {
+  opacity: 0.12;
+}
+
+body.pm-capture .pm-touch-btn:active {
+  opacity: 0.35;
+}
+
+body.pm-capture--clean .pm-mobile-overlay {
+  display: none !important;
+}
+
+/* The way out. It must be reachable at any moment yet never show up in the
+   recording, so it announces itself for a couple of seconds on entry and then
+   fades to fully transparent — still hoverable, still focusable, still
+   tappable at the top-left corner on a phone. Esc works throughout. */
+.pm-capture-exit {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 12000;
+  margin: 6px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  background: rgba(11, 14, 20, 0.9);
+  color: #ffffff;
+  font-family: Inter, system-ui, sans-serif;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+  pointer-events: auto;
+  opacity: 0;
+  animation: pm-capture-exit-hint 3.6s ease forwards;
+}
+
+.pm-capture-exit:hover,
+.pm-capture-exit:focus-visible {
+  animation: none;
+  opacity: 1;
+}
+
+@keyframes pm-capture-exit-hint {
+  0%, 65% { opacity: 1; }
+  100% { opacity: 0; }
 }

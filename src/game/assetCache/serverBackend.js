@@ -11,6 +11,7 @@
 // findByPromptKey/touch/deleteGame are local-only concerns for now.
 
 import { upload } from '@vercel/blob/client';
+import { mark as timeMark, annotate as timeAnnotate } from '../metrics.js';
 
 const UPLOAD_ENDPOINT = '/api/games/upload';
 
@@ -31,10 +32,12 @@ let basePromise = null;
 const resolveBase = () => {
   if (ENV_BASE) return Promise.resolve(ENV_BASE);
   if (!basePromise) {
+    timeMark('blob-base-discovery-start');
     basePromise = fetch(UPLOAD_ENDPOINT)
       .then((res) => (res.ok ? res.json() : null))
       .then((data) => data?.baseUrl || '')
-      .catch(() => ''); // no endpoint (plain vite dev) or offline — local-only
+      .catch(() => '') // no endpoint (plain vite dev) or offline — local-only
+      .then((base) => { timeMark('blob-base-discovery'); return base; });
   }
   return basePromise;
 };
@@ -55,12 +58,15 @@ export const getGame = async (id) => {
     const meta = await metaRes.json();
     const slots = Array.isArray(meta.slots) ? meta.slots : [];
     if (!slots.length) return null;
+    timeMark('server-meta');
     const images = {};
     await Promise.all(slots.map(async (slot) => {
       const res = await fetch(slotUrl(base, id, slot));
       if (!res.ok) throw new Error(`missing slot ${slot}`);
       images[slot] = await res.blob();
     }));
+    timeMark('server-images');
+    timeAnnotate({ bytes: Object.values(images).reduce((sum, b) => sum + (b?.size || 0), 0) });
     return {
       id,
       schemaVersion: meta.schemaVersion,

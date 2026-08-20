@@ -17,6 +17,7 @@ import { loadImage } from '../assetPipeline/postprocess.js';
 import * as backend from './idbBackend.js';
 import * as server from './serverBackend.js';
 import { matchCachedGame, localMatch } from './matcher.js';
+import { mark as timeMark, annotate as timeAnnotate } from '../metrics.js';
 
 const SCHEMA_VERSION = 1;
 
@@ -148,11 +149,17 @@ const mergeCosts = (...parts) => {
   return sum;
 };
 
-const runInfo = (tier, t0, extra = {}) => ({
-  tier,
-  elapsedMs: Math.round(performance.now() - t0),
-  ...extra
-});
+const runInfo = (tier, t0, extra = {}) => {
+  // Mirror the outcome into the timing run (src/game/metrics.js) from the ONE
+  // place every tier already funnels through, so the segmented report can never
+  // disagree with assetMeta.run about which scenario a boot was.
+  timeAnnotate({ tier, ...(extra.estUsd != null ? { estUsd: extra.estUsd } : {}) });
+  return {
+    tier,
+    elapsedMs: Math.round(performance.now() - t0),
+    ...extra
+  };
+};
 
 // Per-browser outcome counters (PM_SPEND_TOTAL conventions) — the measured cache
 // hit rate + per-tier averages that feed the cost report's pricing projection.
@@ -168,7 +175,7 @@ const readStats = () => {
 const bumpStats = (field, usd = 0, matcherUsd = 0) => {
   try {
     const s = readStats() || {
-      exact: 0, reuse: 0, reusePartial: 0, fresh: 0, staticMiss: 0,
+      exact: 0, reuse: 0, reusePartial: 0, fresh: 0, staticMiss: 0, restored: 0,
       freshUsd: 0, partialUsd: 0, matcherUsd: 0, since: new Date().toISOString()
     };
     s[field] = (s[field] || 0) + 1;
@@ -210,6 +217,7 @@ async function tryMatchedReuse({ config, userPrompt, promptKey, onProgress, canc
   } catch {
     return null;
   }
+  timeMark('cache-candidates');
   if (!candidates.length) return null;
 
   let verdict = null;
@@ -226,7 +234,13 @@ async function tryMatchedReuse({ config, userPrompt, promptKey, onProgress, canc
     matcherCost = getUsageTally();
     if (box) box.matcherCost = matcherCost; // no-match → the fresh run still owns this spend
   }
+  // Which matcher actually decided: on the keyless path localMatch leaves no
+  // call record anywhere, so without this "ran locally in 2ms" and "never ran"
+  // look identical in the numbers.
+  const matcherMode = verdict ? 'llm' : (isGeminiConfigured() ? 'llm-failed-local' : 'local');
   if (!verdict) verdict = localMatch({ userPrompt, candidates });
+  timeMark('matcher');
+  timeAnnotate({ matcherMode });
   if (cancelToken?.cancelled) throw cancelledError();
   if (!verdict?.matchId) return null;
 
@@ -253,6 +267,8 @@ async function tryMatchedReuse({ config, userPrompt, promptKey, onProgress, canc
     if (!fromServer) backend.deleteGame(entry.id);
     return null;
   }
+  timeMark('rehydrate');
+  timeAnnotate({ source: fromServer ? 'server' : 'local' });
   if (fromServer) backend.putGame(entry);
   else backend.touch(entry.id);
   const label = entry.config?.gameName || entry.sourcePrompt || entry.id.slice(0, 8);
@@ -369,9 +385,11 @@ export async function generateOrRestoreAssets({ config, userPrompt = '', promptK
   // Tier 1 — exact prompt match: instant whole-set restore, exactly $0.
   if (promptKey) {
     const entry = await backend.findByPromptKey(promptKey);
+    timeMark('cache-lookup');
     if (entry && entry.schemaVersion === SCHEMA_VERSION) {
       try {
         const preloadedImages = await rehydrateEntry(entry, cancelToken);
+        timeMark('rehydrate');
         backend.touch(entry.id);
         onProgress?.('[CACHE] Exact match found — restored artwork from local cache ($0 this run)', 90);
         onProgress?.('[CACHE] Want a fresh look? Open the Creator Panel in-game and ask it to redraw everything.', null);
@@ -428,6 +446,7 @@ export async function generateOrRestoreAssets({ config, userPrompt = '', promptK
 export async function generateAndCache({ config, userPrompt = '', promptKey = null, onProgress, cancelToken, skipSlots = [], awaitPersist = false, t0 = null, extraCost = null, trackStats = true }) {
   const started = t0 ?? performance.now();
   const { preloadedImages, assetMeta } = await generateGameAssets({ config, userPrompt, onProgress, cancelToken, skipSlots });
+  timeMark('assets-generated');
   // Run-truth telemetry: every generated slot is provenance-marked, the run cost
   // includes any pre-generation matcher spend, and the run block records timing.
   for (const m of Object.values(assetMeta.slots || {})) {
@@ -478,16 +497,21 @@ export async function updateGameArt(gameId, { config, preloadedImages, assetMeta
 export async function getGameById(id) {
   const t0 = performance.now();
   let entry = await backend.getGame(id);
+  timeMark('cache-lookup');
   let fromServer = false;
   if (!entry) {
     entry = await server.getGame(id);
     fromServer = !!entry;
+    timeMark('server-fetch');
   }
   if (!entry || entry.schemaVersion !== SCHEMA_VERSION) return null;
   try {
     const preloadedImages = await rehydrateEntry(entry);
+    timeMark('rehydrate');
+    timeAnnotate({ source: fromServer ? 'server' : 'local' });
     if (fromServer) backend.putGame(entry);
     else backend.touch(entry.id);
+    bumpStats('restored');
     return {
       config: { ...entry.config, gameId: entry.id, dynamicAssetUrls: true },
       preloadedImages,
@@ -496,6 +520,9 @@ export async function getGameById(id) {
         cost: zeroCost(),
         run: runInfo('restored', t0, {
           matchedGameId: entry.id,
+          // local IDB read vs a cross-device Blob download — very different
+          // latencies, and the distinction the timing report is built on.
+          source: fromServer ? 'server' : 'local',
           reusedSlots: Object.keys(preloadedImages),
           generatedSlots: [],
           estUsd: 0

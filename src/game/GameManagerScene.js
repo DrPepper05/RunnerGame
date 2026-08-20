@@ -5,6 +5,7 @@ import GameModeManager from './GameModeManager';
 import MultiCameraManager from './MultiCameraManager';
 import ParallaxGroundSystem from './ParallaxGroundSystem';
 import SpriteAlignmentManager from './SpriteAlignmentManager';
+import HitFx from './fx/HitFx';
 
 
 export default class GameManagerScene extends Phaser.Scene {
@@ -177,6 +178,7 @@ export default class GameManagerScene extends Phaser.Scene {
     // Initialize improvement systems
     this.parallaxSystem = new ParallaxGroundSystem(this);
     this.alignmentManager = new SpriteAlignmentManager(this);
+    this.fx = new HitFx(this);
 
     // Create a smooth background gradient
     this.bgGraphics = this.add.graphics();
@@ -224,14 +226,14 @@ export default class GameManagerScene extends Phaser.Scene {
       this.floor = this.add.rectangle(0, this.LOGICAL_FLOOR_Y, floorWidth, floorHeight, 0x000000, 0);
       this.floor.setOrigin(0, 0);
 
-      this.createFloorFill(floorWidth, floorHeight, floorTexture, floorFrameIndex, scaleY);
+      this.createFloorFill(floorWidth, floorHeight, floorTexture, floorFrameIndex);
     } else {
       this.floor = this.add.tileSprite(0, this.LOGICAL_FLOOR_Y, floorWidth, floorHeight, floorTexture, floorFrameIndex).setOrigin(0, 0);
       const themeTileScale = this.secondaryTheme?.floorTileScale || this.activeTheme.floorTileScale || 0.15;
       this.floor.tileScaleX = this.gameConfig.dynamicAssetUrls ? 1.0 : (this.gameConfig.floorTileScale || themeTileScale);
       this.floor.tileScaleY = this.gameConfig.dynamicAssetUrls ? 1.0 : (this.gameConfig.floorTileScale || themeTileScale);
 
-      this.createFloorFill(floorWidth, floorHeight, floorTexture, floorFrameIndex, this.floor.tileScaleX);
+      this.createFloorFill(floorWidth, floorHeight, floorTexture, floorFrameIndex);
     }
     this.physics.add.existing(this.floor, true); // Static
 
@@ -557,6 +559,18 @@ export default class GameManagerScene extends Phaser.Scene {
     };
     window.addEventListener('toggle-pause-game', this.togglePauseListener);
 
+    // Touch controls measured or re-measured themselves: re-apply the camera so
+    // the ground line clears them. Camera-only — the floor and parallax are
+    // world-space / re-pinned every frame, so they follow without a rebuild.
+    this.controlZonesListener = () => {
+      if (!this.cameraManager || !this.scale) return;
+      this.cameraManager.handleResize({
+        width: Math.max(1, this.scale.width),
+        height: Math.max(1, this.scale.height)
+      });
+    };
+    window.addEventListener('pm-control-zones', this.controlZonesListener);
+
     this.events.on('shutdown', () => {
       window.removeEventListener('keydown', this.domKeyDown);
       window.removeEventListener('keyup', this.domKeyUp);
@@ -564,6 +578,7 @@ export default class GameManagerScene extends Phaser.Scene {
       window.removeEventListener('update-game-config', this.updateConfigListener);
       window.removeEventListener('orientationchange', this.orientationHandler);
       window.removeEventListener('restart-game', this.restartGameListener);
+      window.removeEventListener('pm-control-zones', this.controlZonesListener);
       if (screen.orientation) {
         screen.orientation.removeEventListener('change', this.orientationHandler);
       }
@@ -588,18 +603,58 @@ export default class GameManagerScene extends Phaser.Scene {
   }
 
   // Visual-only underground fill from the floor's bottom edge downward, so the floor
-  // never ends in empty space above the viewport border on tall screens. Darkened
-  // repeat of the floor texture reads as depth. Collision is untouched (this.floor).
-  createFloorFill(floorWidth, floorHeight, floorTexture, floorFrameIndex, tileScale) {
+  // never ends in empty space above the viewport border. Collision is untouched
+  // (this.floor). It is a FLAT dark band, not a tiled repeat of the floor: the
+  // tiled version (darkened floor texture, rows and rows of it) was never visible
+  // until the 2026-08-20 ground lift exposed it, and it read as "multiple lines of
+  // the same floor". Tone is sampled from the floor texture so it stays on-theme,
+  // with a soft shadow under the floor's edge so the ground reads as solid.
+  createFloorFill(floorWidth, floorHeight, floorTexture, floorFrameIndex) {
     if (this.floorFill) {
       this.floorFill.destroy();
       this.floorFill = null;
     }
-    this.floorFill = this.add.tileSprite(
-      0, this.LOGICAL_FLOOR_Y + floorHeight, floorWidth, 1000, floorTexture, floorFrameIndex
-    ).setOrigin(0, 0).setTint(0x555560);
-    this.floorFill.tileScaleX = tileScale;
-    this.floorFill.tileScaleY = tileScale;
+    if (this.floorFillShadow) {
+      this.floorFillShadow.destroy();
+      this.floorFillShadow = null;
+    }
+    const top = this.LOGICAL_FLOOR_Y + floorHeight;
+    const color = this.sampleFloorShade(floorTexture, floorFrameIndex);
+    this.floorFill = this.add.rectangle(0, top, floorWidth, 1000, color).setOrigin(0, 0);
+    // A 24px shadow from the floor's underside, fading out downward.
+    const shadow = this.add.graphics();
+    shadow.fillGradientStyle(0x000000, 0x000000, 0x000000, 0x000000, 0.45, 0.45, 0, 0);
+    shadow.fillRect(0, 0, floorWidth, 24);
+    shadow.setPosition(0, top);
+    this.floorFillShadow = shadow;
+    // Behind everything the modes create, above the parallax layers (depth -5..-3).
+    this.floorFill.setDepth(-2);
+    this.floorFillShadow.setDepth(-1);
+  }
+
+  // Average of a few pixels from the floor texture's lower rows, darkened, so the
+  // underground band matches whatever theme or generated art the floor uses.
+  // Falls back to a neutral near-black when the texture can't be read.
+  sampleFloorShade(textureKey, frameIndex) {
+    const FALLBACK = 0x15131c;
+    try {
+      const texture = this.textures.get(textureKey);
+      const frame = texture?.get(frameIndex ?? 0) || texture?.get(0);
+      if (!frame || !frame.width || !frame.height) return FALLBACK;
+      let r = 0, g = 0, b = 0, n = 0;
+      const y = Math.floor(frame.height * 0.85);
+      for (let i = 0; i < 8; i++) {
+        const x = Math.floor((i + 0.5) * frame.width / 8);
+        const px = this.textures.getPixel(x, y, textureKey, frame.name);
+        if (!px || px.alpha < 128) continue;
+        r += px.red; g += px.green; b += px.blue; n += 1;
+      }
+      if (!n) return FALLBACK;
+      const shade = (c) => Math.max(0, Math.min(255, Math.round((c / n) * 0.35)));
+      return (shade(r) << 16) | (shade(g) << 8) | shade(b);
+    } catch {
+      return FALLBACK;
+    }
   }
 
   createBackgroundLayers() {
@@ -758,8 +813,9 @@ export default class GameManagerScene extends Phaser.Scene {
           if (this.floorFill) {
             this.floorFill.setPosition(0, this.LOGICAL_FLOOR_Y + floorHeight);
             this.floorFill.setSize(floorWidth, 1000);
-            this.floorFill.tileScaleX = scaleY;
-            this.floorFill.tileScaleY = scaleY;
+          }
+          if (this.floorFillShadow) {
+            this.floorFillShadow.setPosition(0, this.LOGICAL_FLOOR_Y + floorHeight);
           }
         }
       }
@@ -771,13 +827,21 @@ export default class GameManagerScene extends Phaser.Scene {
     }, 150);
   }
 
+  // Fallback motion for a generated player that never got a sprite sheet: the
+  // character must never look frozen. Softened 2026-08-20 — the original
+  // ±3°/110ms read as a conspicuous tilt-wobble (the top complaint about
+  // cache-matched games) rather than as running. Slower and shallower still
+  // reads as alive without drawing attention to itself.
+  //
+  // Angle, not position: these sprites are anchored bottom-centre by
+  // SpriteAlignmentManager, so bobbing y would lift the feet off the ground.
   startPlayerBob() {
     if (this.playerBobTween && this.playerBobTween.isPlaying()) return;
     this.stopPlayerBob();
     this.playerBobTween = this.tweens.add({
       targets: this.player,
-      angle: { from: -3, to: 3 },
-      duration: 110,
+      angle: { from: -1.5, to: 1.5 },
+      duration: 170,
       yoyo: true,
       repeat: -1,
       ease: 'Sine.easeInOut'
@@ -889,8 +953,17 @@ export default class GameManagerScene extends Phaser.Scene {
 
     this.physics.pause();
     this.player.anims.stop();
+    this.stopPlayerBob();
 
-    this.createGameOverUI(false, 0x888888, 0);
+    // Play the impact BEFORE handing the screen to the React overlay. physics
+    // is paused but tweens and the scene clock keep running, so the flash,
+    // shake and debris all read. A scene.restart() (the retry path) clears this
+    // timer, and the guard covers anything else that resets the run.
+    this.fx?.playerHit(this.player);
+    this.time.delayedCall(240, () => {
+      if (!this.isGameOver) return;
+      this.createGameOverUI(false, 0x888888, 0);
+    });
   }
 
   winGame() {
@@ -900,8 +973,16 @@ export default class GameManagerScene extends Phaser.Scene {
 
     this.physics.pause();
     this.player.anims.stop();
+    this.stopPlayerBob();
 
-    this.createGameOverUI(true, 0x00FF00, 500);
+    this.fx?.flash(90, 230, 140, 220);
+    this.fx?.burst(this.player.x, this.player.body?.center?.y ?? this.player.y, {
+      color: 0x7CFFB2, count: 18, speed: 260, gravityY: 120, scale: 1.2
+    });
+    this.time.delayedCall(240, () => {
+      if (!this.isGameOver) return;
+      this.createGameOverUI(true, 0x00FF00, 500);
+    });
   }
 
   update(time, delta) {
@@ -941,11 +1022,6 @@ export default class GameManagerScene extends Phaser.Scene {
       });
     }
 
-    // Runner floor segments move; the underground fill must scroll in lockstep or its
-    // pattern visibly slides against the floor's top row
-    if (this.floorFill && this.gameConfig.gameType === 'runner') {
-      this.floorFill.tilePositionX = (this.virtualScrollX || 0) / (this.floorFill.tileScaleX || 1);
-    }
     this.gameModeManager.update(time, delta);
   }
 }

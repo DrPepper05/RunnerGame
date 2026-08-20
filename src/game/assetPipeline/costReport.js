@@ -91,7 +91,10 @@ export function buildCostReport(liveParams) {
         const size = c.kind === 'image'
           ? `${c.requestedSize || 'default'}→${c.servedW ? `${c.servedW}×${c.servedH}` : '?'}`
           : '';
-        lines.push(pad(i + 1, 4) + pad(c.at, 26) + pad(c.label || c.kind, 20) + pad(c.model, 28) +
+        // Failed calls are logged too (since 2026-08-20): they cost $0 but burn
+        // real seconds, and a run that reads as slow-for-no-reason is usually a
+        // timeout that used to be invisible here.
+        lines.push(pad(i + 1, 4) + pad(c.at, 26) + pad((c.failed ? '✗ ' : '') + (c.label || c.kind), 20) + pad(c.model, 28) +
           pad(size, 20) + pad(c.promptTokens, 7) + pad(c.outputTokens, 7) + pad(c.thoughtsTokens, 7) +
           pad(c.elapsedMs ?? '?', 8) + `$${(c.estUsd ?? 0).toFixed(4)}`);
       });

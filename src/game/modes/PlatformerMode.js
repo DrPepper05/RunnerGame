@@ -2,6 +2,7 @@ import Phaser from 'phaser';
 import BaseMode from './BaseMode';
 import Projectile from '../objects/Projectile';
 import MeleeAttack from '../objects/MeleeAttack';
+import { getCornerMargins } from '../uiZones';
 
 export default class PlatformerMode extends BaseMode {
   init() {
@@ -22,10 +23,14 @@ export default class PlatformerMode extends BaseMode {
     this.movingLeft = false;
     this.movingRight = false;
     
-    // Multitouch: track which pointer is pressing each button
-    this.leftPointerId = null;
-    this.rightPointerId = null;
-    
+    // Airborne/grounded edge detection, for landing feedback. `lastVy` is the
+    // previous frame's vertical velocity: a grounded edge only counts as a
+    // landing when the player was actually FALLING — `touching.down` can
+    // flicker on a resting body and must never spawn dust or a squash.
+    this.wasGrounded = true;
+    this.lastVy = 0;
+    this.lastLandingAt = 0;
+
     this.platforms = null;
     this.enemies = null;
     this.projectiles = null;
@@ -37,10 +42,6 @@ export default class PlatformerMode extends BaseMode {
     // Melee cooldown: prevent spamming (ms)
     this.meleeCooldown = 0;
     this.MELEE_COOLDOWN_MS = 400;
-    
-    // Mobile controls container
-    this.mobileControls = [];
-    this.uiContainer = null;
   }
 
   create() {
@@ -95,12 +96,15 @@ export default class PlatformerMode extends BaseMode {
     this.scene.physics.add.collider(this.enemies, this.platforms);
     this.scene.physics.add.collider(this.enemies, this.scene.floor);
     this.scene.physics.add.collider(this.projectiles, this.platforms, (proj) => {
+      this.scene.fx?.projectileImpact(proj.x, proj.y);
       if (proj.deactivate) proj.deactivate();
     });
 
     this.scene.physics.add.overlap(this.scene.player, this.collectibles, (player, collectible) => {
       if (!collectible || !collectible.active) return;
-      this.awardScore(this.scene.gameConfig.coinValue ?? 25);
+      const value = this.scene.gameConfig.coinValue ?? 25;
+      this.scene.fx?.pickup(collectible.x, collectible.y, value);
+      this.awardScore(value);
       collectible.destroy();
     });
     
@@ -109,6 +113,7 @@ export default class PlatformerMode extends BaseMode {
 
     // Projectile hits enemy -> Kill Enemy
     this.scene.physics.add.overlap(this.projectiles, this.enemies, (proj, enemy) => {
+      this.scene.fx?.projectileImpact(proj.x, proj.y);
       if (proj.deactivate) proj.deactivate();
       this.damageEnemy(enemy);
     });
@@ -160,12 +165,7 @@ export default class PlatformerMode extends BaseMode {
     if (!this.scene || !this.scene.cameras || !this.scene.cameras.main) return;
     const safeWidth = Math.max(1, gameSize.width);
     const safeHeight = Math.max(1, gameSize.height);
-    const camera = this.scene.cameras.main;
-    const viewWidth = camera.width || safeWidth;
-    const viewHeight = camera.height || safeHeight;
-    this.updateMobileControlSizing(viewWidth, viewHeight);
-    this.repositionMobileControls(viewWidth, viewHeight);
-    
+
     if (this.scene.cameraManager) {
       this.scene.cameraManager.handleResize({ width: safeWidth, height: safeHeight });
     } else {
@@ -175,10 +175,14 @@ export default class PlatformerMode extends BaseMode {
 
   updateCameraBounds(gameSize) {
     if (!this.scene || !this.scene.cameras || !this.scene.cameras.main) return;
-    
-    // The camera bounds must be at least as tall as the screen, otherwise the camera breaks
-    const minHeight = this.scene.LOGICAL_FLOOR_Y + 100;
-    const boundsHeight = Math.max(minHeight, gameSize.height);
+
+    // Bounds must be at least as tall as the screen or the camera breaks; the
+    // extra gutter keeps ground-level gameplay clear of the touch controls.
+    // Routed through the camera manager so this third copy of the formula can't
+    // drift from the two inside MultiCameraManager.
+    const boundsHeight = this.scene.cameraManager
+      ? this.scene.cameraManager.followBoundsHeight(gameSize.height)
+      : Math.max(this.scene.LOGICAL_FLOOR_Y + 100, gameSize.height);
     
     this.scene.cameras.main.setBounds(0, 0, this.worldWidth, boundsHeight);
     
@@ -196,6 +200,12 @@ export default class PlatformerMode extends BaseMode {
     // Very simple hand-placed static map
     const theme = this.scene.activeTheme || {};
     const isSmallWorld = (theme.worldWidth || 4000) < 2000;
+    // The first small-world platform (x:180, scaleX:5 → spans x≈20-340) sits in
+    // the level-start bottom-left corner, under the d-pad. It is left alone on
+    // purpose: it is only 20px above the floor, so the mobile ground-line gutter
+    // (MultiCameraManager) already lifts it clear of the buttons, and nudging
+    // these hand-tuned positions risks re-ordering or overrunning small worlds
+    // for no gain.
     const layout = this.scene.gameConfig.layoutArray || (isSmallWorld ? [
       { x: 180, y: floorY - 20, scaleX: 5, hasEnemy: false },
       { x: 350, y: floorY - 35, scaleX: 5, hasEnemy: true },
@@ -287,6 +297,8 @@ export default class PlatformerMode extends BaseMode {
     const touchingDown = this.scene.player.body.touching.down || this.scene.player.body.blocked.down;
     if (touchingDown) {
       this.scene.player.setVelocityY(-this.jumpForce);
+      this.scene.fx?.pulse(this.scene.player, 0.86, 1.18, 80); // stretch on takeoff
+      this.wasGrounded = false;
     }
   }
 
@@ -367,7 +379,25 @@ export default class PlatformerMode extends BaseMode {
 
     // Animation Logic
     const touchingDown = player.body.touching.down || player.body.blocked.down;
-    
+
+    if (touchingDown && !this.wasGrounded && this.lastVy > 140 && time - this.lastLandingAt > 120) {
+      // Touchdown after a real fall: squash + dust, so a landing has weight
+      // instead of just stopping. Velocity-gated + rate-limited (see init).
+      this.lastLandingAt = time;
+      this.scene.fx?.landing(player.x, player.body.bottom);
+      this.scene.fx?.pulse(player, 1.16, 0.84, 90);
+    }
+    this.wasGrounded = touchingDown;
+    this.lastVy = player.body.velocity.y;
+
+    // Playback rate follows real speed: the run cycle is authored at a single
+    // frame rate, so at walking-out-of-drag speeds the feet visibly skate.
+    if (player.anims) {
+      player.anims.timeScale = touchingDown && isMoving
+        ? Phaser.Math.Clamp(Math.abs(player.body.velocity.x) / (this.moveSpeed || 1), 0.6, 1.5)
+        : 1;
+    }
+
     if (touchingDown) {
       if (isMoving) {
         this.scene.playPlayerAnim('run');
@@ -376,34 +406,6 @@ export default class PlatformerMode extends BaseMode {
       }
     } else {
       this.scene.playPlayerAnim('jump');
-    }
-  }
-
-  cleanupStaleTouchPointers() {
-    if (this.leftPointerId != null) {
-      const ptr = this.scene.input.manager.pointers.find(p => p.id === this.leftPointerId);
-      if (!ptr || !ptr.isDown) {
-        this.movingLeft = false;
-        this.leftPointerId = null;
-        if (this.btnLeft) this.btnLeft.setAlpha(0.65);
-      }
-    }
-    if (this.rightPointerId != null) {
-      const ptr = this.scene.input.manager.pointers.find(p => p.id === this.rightPointerId);
-      if (!ptr || !ptr.isDown) {
-        this.movingRight = false;
-        this.rightPointerId = null;
-        if (this.btnRight) this.btnRight.setAlpha(0.65);
-      }
-    }
-  }
-
-  jump() {
-    if (this.scene.isGameOver) return;
-
-    const touchingDown = this.scene.player.body.touching.down || this.scene.player.body.blocked.down;
-    if (touchingDown) {
-      this.scene.player.setVelocityY(-this.jumpForce);
     }
   }
 
@@ -470,17 +472,10 @@ export default class PlatformerMode extends BaseMode {
         enemy.body.enable = false;
       }
 
-      // Death particles
-      for (let i = 0; i < 8; i++) {
-        const bit = this.scene.add.rectangle(enemy.x, enemy.y, 6, 6, 0xff4444);
-        this.scene.physics.add.existing(bit);
-        bit.body.setVelocity(
-          Phaser.Math.Between(-120, 120),
-          Phaser.Math.Between(-250, -50)
-        );
-        bit.body.setAllowGravity(true);
-        this.scene.time.delayedCall(600, () => bit.destroy());
-      }
+      // Death burst + score pop. Was eight add.rectangle() objects each given
+      // their own arcade body — a real emitter is cheaper and reads better.
+      this.scene.fx?.enemyKilled(enemy, 100);
+      this.scene.fx?.hitstop(60);
 
       // Fade-out + shrink before removal
       this.scene.tweens.add({
@@ -499,15 +494,14 @@ export default class PlatformerMode extends BaseMode {
 
       this.awardScore(100);
     } else {
-      // Damage flash
+      // Damage flash. The tween this replaces listed no tweened property at all
+      // (targets/duration/yoyo only), so it animated nothing and merely served
+      // as a 60ms timer — the hit had no visible response whatsoever.
+      this.scene.fx?.enemyHit(enemy);
       enemy.setTintFill(0xffffff);
-      this.scene.tweens.add({
-        targets: enemy,
-        duration: 60,
-        yoyo: true,
-        onComplete: () => {
-          if (enemy.active) enemy.setTint(0xff0000);
-        }
+      this.scene.time.delayedCall(70, () => {
+        // Red is the persistent "damaged" marker, not part of the flash.
+        if (enemy.active) enemy.setTint(0xff0000);
       });
     }
   }
@@ -562,12 +556,24 @@ export default class PlatformerMode extends BaseMode {
       else fallbackSpots.push(block);
     });
 
+    // The camera clamps at world x=0 and at worldWidth-viewportWidth, so the
+    // level's first and last screens put their bottom corners at fixed pixels —
+    // right under the touch controls. Those two are the only places a static
+    // world position maps to a predictable screen position, so they are the only
+    // places a spawn rule can help; everywhere else the camera moves and the
+    // ground-line gutter is what does the work.
+    const corner = getCornerMargins(this.scene.scale?.width || 0);
+
     const spawnOnBlock = (block) => {
       if (!block || enemiesCreated >= maxEnemies) return;
       
       // Safety guard: do not spawn enemies on top of or too close to the player starting spawn point
       const spawnX = theme?.spawnX || 150;
       if (block.x < spawnX + 120) return;
+      // Under the left cluster on the level's first screen…
+      if (corner.left && block.rightEdge < corner.left) return;
+      // …or under the right cluster on its last.
+      if (corner.right && block.leftEdge > this.worldWidth - corner.right) return;
 
       const enemy = this.enemies.create(block.x, block.y - 40, enemyTexture);
       enemy.health = 3;

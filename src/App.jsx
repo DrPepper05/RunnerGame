@@ -14,6 +14,48 @@ import { interpretEditPrompt, resolveAssetTargets } from './game/gameEditor';
 import GameOverOverlay from './components/GameOverOverlay';
 import RegenOverlay from './components/RegenOverlay';
 import MobileControls from './components/MobileControls';
+import * as metrics from './game/metrics';
+
+// Capture mode (2026-08-20): a chrome-free view for recording demos and
+// marketing footage. Driven by the URL so a recording setup is reproducible and
+// survives the gameKey remounts that restyles and share-link restores trigger.
+//   ?capture=1      — hide all chrome, keep the touch controls faintly visible
+//   ?capture=clean  — also hide the touch controls (desktop/keyboard capture)
+const readCaptureMode = () => {
+  try {
+    const value = new URLSearchParams(window.location.search).get('capture');
+    if (!value || value === '0' || value === 'false') return null;
+    return value === 'clean' ? 'clean' : 'on';
+  } catch {
+    return null;
+  }
+};
+
+// The Fullscreen API is still vendor-prefixed on Safari, and the previous code
+// only ever called the unprefixed form — which is why fullscreen silently did
+// nothing there.
+const requestFullscreenOn = (el) => {
+  if (!el) return Promise.resolve();
+  const fn = el.requestFullscreen || el.webkitRequestFullscreen || el.webkitRequestFullScreen || el.msRequestFullscreen;
+  try {
+    return Promise.resolve(fn ? fn.call(el) : undefined);
+  } catch {
+    return Promise.resolve();
+  }
+};
+
+const exitFullscreenNow = () => {
+  const fn = document.exitFullscreen || document.webkitExitFullscreen || document.msExitFullscreen;
+  try {
+    if (fullscreenElement()) return Promise.resolve(fn ? fn.call(document) : undefined);
+  } catch {
+    /* ignore — leaving fullscreen must never throw into the app */
+  }
+  return Promise.resolve();
+};
+
+const fullscreenElement = () =>
+  document.fullscreenElement || document.webkitFullscreenElement || document.msFullscreenElement || null;
 
 const getInitialState = () => {
   if (typeof window !== 'undefined') {
@@ -65,6 +107,30 @@ function App() {
   const [gameOverData, setGameOverData] = useState(null);
   const [gameKey, setGameKey] = useState(0);
   const [activeError, setActiveError] = useState(null);
+  const [captureMode, setCaptureMode] = useState(readCaptureMode);
+
+  // Timing telemetry (src/game/metrics.js). Two jobs, both of which have to be
+  // set up before Phaser's first boot can land:
+  //   1. A shared link's run starts at NAVIGATION, not at any click — that is
+  //      what the "5-7s on mobile" figure actually measures.
+  //   2. `phaser-load-complete` is the only signal that the scene is up. It
+  //      fires once per boot, and a share link boots twice by design (theme art,
+  //      then a remount onto cached art), so both are recorded on one run.
+  useEffect(() => {
+    if (initialConfig.isImported) {
+      metrics.beginRun('sharelink', {
+        gameId: initialConfig.pendingRestoreId || null,
+        gameType: initialConfig.liveParams?.gameType || null
+      });
+      // The restore lookup below may trigger a second boot; hold the record open
+      // until it resolves so a slow server fetch isn't filed as "no cached art".
+      if (initialConfig.pendingRestoreId) metrics.holdRun();
+    }
+    const handlePlayable = () => metrics.notePlayable();
+    window.addEventListener('phaser-load-complete', handlePlayable);
+    return () => window.removeEventListener('phaser-load-complete', handlePlayable);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     const handlePlaymintError = (e) => {
@@ -87,7 +153,13 @@ function App() {
     if (!id) return;
     let stale = false;
     getGameById(id).then((cached) => {
-      if (!cached || stale) return;
+      if (stale) return;
+      if (!cached) {
+        // No cached art anywhere: the static boot already on screen IS the final
+        // state, so the run can close on the boot it already recorded.
+        metrics.releaseRun();
+        return;
+      }
       setLiveParams(prev => ({
         ...prev, // the link's config wins (it may carry post-generation tweaks)
         dynamicAssetUrls: true,
@@ -96,7 +168,10 @@ function App() {
         assetMeta: cached.assetMeta
       }));
       setGameKey(k => k + 1);
-    });
+      // Released after the remount is queued: the record now closes on the
+      // boot that shows the real art, not the theme-art placeholder.
+      metrics.releaseRun();
+    }).catch(() => metrics.releaseRun());
     return () => { stale = true; };
   }, [initialConfig]);
 
@@ -158,6 +233,34 @@ function App() {
     };
   }, []);
 
+  // Capture mode: one class on <body> drives every "hide this" rule in the CSS,
+  // so no component needs to know the mode exists. Esc always gets you out —
+  // browsers also fire it to leave fullscreen, which is the same intent.
+  useEffect(() => {
+    const body = document.body;
+    body.classList.toggle('pm-capture', !!captureMode);
+    body.classList.toggle('pm-capture--clean', captureMode === 'clean');
+    if (!captureMode) return undefined;
+
+    const onKey = (e) => {
+      if (e.key === 'Escape') exitCaptureMode();
+    };
+    // Fullscreen cannot be requested without a user gesture, so arm the first
+    // tap/click to enter it. Once only — after that the page is already clean.
+    const onFirstGesture = () => {
+      if (!fullscreenElement() && fullscreenContainerRef.current) {
+        requestFullscreenOn(fullscreenContainerRef.current);
+      }
+      window.removeEventListener('pointerdown', onFirstGesture);
+    };
+    window.addEventListener('keydown', onKey);
+    window.addEventListener('pointerdown', onFirstGesture);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('pointerdown', onFirstGesture);
+    };
+  }, [captureMode]);
+
   // Fullscreen API detection & listener
   useEffect(() => {
     const isSupported = document.fullscreenEnabled || 
@@ -167,10 +270,14 @@ function App() {
     setIsFullscreenSupported(!!isSupported);
 
     const onFullscreenChange = () => {
-      setIsFullscreen(!!document.fullscreenElement);
+      setIsFullscreen(!!fullscreenElement());
     };
     document.addEventListener('fullscreenchange', onFullscreenChange);
-    return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
+    document.addEventListener('webkitfullscreenchange', onFullscreenChange);
+    return () => {
+      document.removeEventListener('fullscreenchange', onFullscreenChange);
+      document.removeEventListener('webkitfullscreenchange', onFullscreenChange);
+    };
   }, []);
 
   // Score listener from Phaser
@@ -221,28 +328,11 @@ function App() {
     window.__GAME_LIVE_CONFIG = liveParams;
   }
 
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
-    const root = document.documentElement;
-    const computeInsets = () => {
-      const styles = getComputedStyle(root);
-      const bottom = parseFloat(styles.getPropertyValue('--pm-safe-area-bottom')) || 0;
-      const left = parseFloat(styles.getPropertyValue('--pm-safe-area-left')) || 0;
-      const right = parseFloat(styles.getPropertyValue('--pm-safe-area-right')) || 0;
-      const top = parseFloat(styles.getPropertyValue('--pm-safe-area-top')) || 0;
-      window.__pmSafeAreaBottom = bottom;
-      window.__pmSafeAreaLeft = left;
-      window.__pmSafeAreaRight = right;
-      window.__pmSafeAreaTop = top;
-    };
-    computeInsets();
-    window.addEventListener('resize', computeInsets);
-    window.addEventListener('orientationchange', computeInsets);
-    return () => {
-      window.removeEventListener('resize', computeInsets);
-      window.removeEventListener('orientationchange', computeInsets);
-    };
-  }, []);
+  // (Removed 2026-08-20) An effect here used to mirror the --pm-safe-area-*
+  // CSS vars onto window.__pmSafeArea{Top,Right,Bottom,Left}. Nothing ever read
+  // them. The real need — telling the game layer how much screen the touch
+  // controls occupy — is now served by src/game/uiZones.js, which MobileControls
+  // populates from measured DOM rects.
 
   useEffect(() => {
     window.dispatchEvent(new CustomEvent('update-game-config', { detail: liveParams }));
@@ -251,18 +341,26 @@ function App() {
   // --- Handlers ---
 
   const handleFullscreen = () => {
-    if (fullscreenContainerRef.current && !document.fullscreenElement) {
-      if (fullscreenContainerRef.current.requestFullscreen) {
-        fullscreenContainerRef.current.requestFullscreen().catch(err => {
-          console.error(`Error attempting to enable fullscreen: ${err.message}`);
-        });
-      }
+    if (fullscreenContainerRef.current && !fullscreenElement()) {
+      requestFullscreenOn(fullscreenContainerRef.current);
     }
   };
 
   const handleExitFullscreen = () => {
-    if (document.fullscreenElement) {
-      document.exitFullscreen();
+    exitFullscreenNow();
+  };
+
+  // Leaving capture mode: drop the flag AND the URL param, so a reload does not
+  // silently drop the user back into a chrome-free screen with no way out.
+  const exitCaptureMode = () => {
+    setCaptureMode(null);
+    exitFullscreenNow();
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.delete('capture');
+      window.history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`);
+    } catch {
+      /* URL quirks must never trap the user in capture mode */
     }
   };
 
@@ -381,12 +479,15 @@ function App() {
         });
         try {
           const restyleT0 = performance.now();
+          metrics.beginRun('restyle', { tier: 'restyle', gameId: liveParams.gameId || null, slots });
           const { preloadedImages: newImages, meta: newMeta, cost: restyleCost } = await regenerateAssetSlots({
             config: liveParams,
             instruction: raw,
             slots,
             onProgress: (logText, progressVal) => pushProgress(logText, progressVal)
           });
+          metrics.mark('assets-generated');
+          metrics.annotate({ estUsd: restyleCost?.estUsd || 0 });
           pushProgress('[ENGINE] Artwork updated! Restarting world...', 100);
           const keptOld = Object.entries(newMeta)
             .filter(([slot, m]) => m.dropped && liveParams.preloadedImages[slot])
@@ -440,6 +541,9 @@ function App() {
           return { applied: true, summary };
         } catch (err) {
           console.error('[App.jsx] Restyle failed:', err);
+          // No remount follows a failed restyle, so nothing would ever close this
+          // run — drop it rather than let an unrelated later boot adopt it.
+          metrics.cancelRun();
           return { applied: false, summary: err.message };
         } finally {
           setRegenState(null);
@@ -450,6 +554,7 @@ function App() {
 
     setIsMenuOpen(false);
     setRegenState({ progress: 3, logs: [`[EDITOR] New world required for "${raw}" — regenerating...`] });
+    metrics.beginRun('generate', { via: 'creator-panel', promptChars: raw.length });
 
     try {
       console.log('[App.jsx] Calling generateGameConfig...');
@@ -459,6 +564,8 @@ function App() {
         pushProgress(logText, Math.min(progressVal ?? 0, 70));
       });
       const updatedConfig = result.config;
+      metrics.mark('config');
+      metrics.annotate({ gameType: updatedConfig.gameType });
 
       const gen = await generateOrRestoreAssets({
         config: updatedConfig,
@@ -478,6 +585,7 @@ function App() {
       setLiveParams({ ...gen.config, preloadedImages: gen.preloadedImages, assetMeta: gen.assetMeta });
     } catch (err) {
       console.error('[App.jsx] Prompt generation failed:', err);
+      metrics.cancelRun(); // no boot follows a failed regeneration
       const message = err.cacheOnlyMiss
         ? 'Cache only is ON and nothing cached matches this prompt. Turn the toggle off on the generator screen (top right) to create new art.'
         : err.message;
@@ -525,6 +633,17 @@ function App() {
               onLogoClick={handleReopenPrompt}
             />
 
+            {captureMode && (
+              <button
+                className="pm-capture-exit"
+                onClick={exitCaptureMode}
+                title="Leave capture mode (Esc)"
+                aria-label="Leave capture mode"
+              >
+                ✕ exit capture
+              </button>
+            )}
+
             <CreatorPanel
               isOpen={isMenuOpen}
               onClose={() => {
@@ -553,7 +672,7 @@ function App() {
             )}
 
             {!isTouchDevice && liveParams.gameType === 'runner' && (
-              <div style={{ position: 'fixed', bottom: '30px', width: '100%', textAlign: 'center', zIndex: 10, pointerEvents: 'none' }}>
+              <div className="pm-keyboard-hint" style={{ position: 'fixed', bottom: '30px', width: '100%', textAlign: 'center', zIndex: 10, pointerEvents: 'none' }}>
                 <p style={{ margin: 0, color: 'var(--pm-text-secondary)', fontSize: '14px', background: 'var(--pm-bg-panel)', padding: '8px 16px', display: 'inline-block', borderRadius: '20px', border: '1px solid var(--pm-border)', boxShadow: 'var(--pm-shadow-panel)' }}>
                   Press <span style={{ background: 'var(--pm-bg-input)', padding: '2px 8px', borderRadius: '4px', color: 'var(--pm-accent-teal)', fontFamily: 'monospace', fontWeight: 'bold' }}>SPACE</span> to jump
                 </p>
@@ -561,7 +680,7 @@ function App() {
             )}
 
             {!isTouchDevice && liveParams.gameType === 'platformer' && (
-              <div style={{ position: 'fixed', bottom: '30px', width: '100%', textAlign: 'center', zIndex: 10, pointerEvents: 'none' }}>
+              <div className="pm-keyboard-hint" style={{ position: 'fixed', bottom: '30px', width: '100%', textAlign: 'center', zIndex: 10, pointerEvents: 'none' }}>
                 <p style={{ margin: 0, color: 'var(--pm-text-secondary)', fontSize: '14px', background: 'var(--pm-bg-panel)', padding: '8px 16px', display: 'inline-block', borderRadius: '20px', border: '1px solid var(--pm-border)', boxShadow: 'var(--pm-shadow-panel)' }}>
                   <span style={{ background: 'var(--pm-bg-input)', padding: '2px 8px', borderRadius: '4px', color: 'var(--pm-accent-teal)', fontFamily: 'monospace', fontWeight: 'bold' }}>WASD / Arrows</span> Move · <span style={{ background: 'var(--pm-bg-input)', padding: '2px 8px', borderRadius: '4px', color: 'var(--pm-accent-teal)', fontFamily: 'monospace', fontWeight: 'bold' }}>SPACE</span> Jump · <span style={{ background: 'var(--pm-bg-input)', padding: '2px 8px', borderRadius: '4px', color: 'var(--pm-accent-purple)', fontFamily: 'monospace', fontWeight: 'bold' }}>E</span> Melee{liveParams.actionProjectileEnabled ? <> · <span style={{ background: 'var(--pm-bg-input)', padding: '2px 8px', borderRadius: '4px', color: 'var(--pm-accent-orange)', fontFamily: 'monospace', fontWeight: 'bold' }}>F</span> Shoot</> : ''}
                 </p>

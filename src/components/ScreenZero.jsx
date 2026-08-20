@@ -4,6 +4,7 @@ import { generateTitle } from '../game/promptUtils';
 import { generateGameConfig } from '../game/geminiService';
 import { isGeminiConfigured, createCancelToken } from '../game/assetPipeline';
 import { generateOrRestoreAssets, makePromptKey, makePresetKey } from '../game/assetCache';
+import * as metrics from '../game/metrics';
 import { THEMES } from '../game/themes';
 
 const BANNED_WORDS = ['fuck', 'shit', 'bitch', 'cunt', 'ass', 'dick', 'pussy', 'cock', 'nigger', 'faggot'];
@@ -310,6 +311,13 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
       // ('compiling' is the phase the progress UI actually renders — the old
       // 'expanding' phase rendered nothing, which read as "Generate does nothing").
       const token = beginRun();
+      // The timing clock starts at the click, not inside the cache module: the
+      // number the client quotes is what THEY wait, prompt parsing included.
+      metrics.beginRun('generate', {
+        via: 'overlay',
+        gameType: newConfig.gameType,
+        promptChars: (promptText || '').length
+      });
       setIsGenerating(true);
       setTransitionPhase('compiling');
       setPhaserLoaded(false);
@@ -325,11 +333,19 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
           onProgress: assetProgressHandler,
           cancelToken: token
         });
-        if (token.cancelled) return; // stale run — the user moved on
+        if (token.cancelled) {
+          metrics.cancelRun();
+          return; // stale run — the user moved on
+        }
+        metrics.mark('assets-ready');
         setTransitionPhase('done');
         onGenerate('custom', { ...presetBootConfig(newConfig, gen), preloadedImages: gen.preloadedImages, assetMeta: gen.assetMeta });
       } catch (err) {
-        if (token.cancelled || err.cancelled) return; // cancelled ≠ failed — no static boot
+        if (token.cancelled || err.cancelled) {
+          metrics.cancelRun();
+          return; // cancelled ≠ failed — no static boot
+        }
+        metrics.mark('assets-failed');
         console.error('[Compilation Error] Overlay generation failed, using static theme:', err);
         setTransitionPhase('done');
         onGenerate('custom', toStaticThemeConfig(newConfig));
@@ -339,6 +355,11 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
       return;
     }
 
+    metrics.beginRun('generate', {
+      via: promptText ? 'prompt' : 'preset',
+      gameType: newConfig.gameType,
+      promptChars: (promptText || '').length
+    });
     setIsGenerating(true);
     setTransitionPhase('compiling');
     setPhaserLoaded(false);
@@ -377,9 +398,11 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
         cancelToken: beginRun() // defensive symmetry with the overlay paths
       });
 
+      metrics.mark('assets-ready');
       setTerminalLogs(prev => [...prev, '[ENGINE] Booting game scene and registering WebGL textures...']);
       onStartTransition({ ...presetBootConfig(newConfig, gen), preloadedImages: gen.preloadedImages, assetMeta: gen.assetMeta });
     } catch (err) {
+      metrics.mark('assets-failed');
       // Stay in the 'compiling' phase: the static boot fires phaser-load-complete,
       // which drives the normal 100% → fade sequence.
       console.error('[Compilation Error] Preset asset generation failed, using static theme:', err);
@@ -410,6 +433,7 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
       // terminal, config generation INSIDE the try, stale-run guards, and a
       // finally that releases the isGenerating latch no matter what.
       const token = beginRun();
+      metrics.beginRun('generate', { via: 'overlay-prompt', promptChars: text.length });
       setIsGenerating(true);
       setTransitionPhase('compiling');
       setPhaserLoaded(false);
@@ -425,6 +449,8 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
           setProgress(p => Math.max(p, Math.min(progressVal, 70)));
         });
         overlayConfig = result.config;
+        metrics.mark('config');
+        metrics.annotate({ gameType: result.config.gameType });
         setProgress(75);
         const gen = await generateOrRestoreAssets({
           config: result.config,
@@ -433,17 +459,28 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
           onProgress: assetProgressHandler,
           cancelToken: token
         });
-        if (token.cancelled) return; // stale run — the user moved on
+        if (token.cancelled) {
+          metrics.cancelRun();
+          return; // stale run — the user moved on
+        }
+        metrics.mark('assets-ready');
         setTransitionPhase('done');
         onGenerate('custom', { ...gen.config, preloadedImages: gen.preloadedImages, assetMeta: gen.assetMeta });
       } catch (err) {
-        if (token.cancelled || err.cancelled) return; // cancelled ≠ failed — no static boot
+        if (token.cancelled || err.cancelled) {
+          metrics.cancelRun();
+          return; // cancelled ≠ failed — no static boot
+        }
+        metrics.mark('assets-failed');
         console.error('[Compilation Error] Overlay generation failed, using static theme:', err);
         if (overlayConfig) {
           setTransitionPhase('done');
           onGenerate('custom', toStaticThemeConfig(overlayConfig));
         } else {
-          // Config generation itself failed (local, near-infallible) — plain reset
+          // Config generation itself failed (local, near-infallible) — plain reset.
+          // Nothing boots after this, so the run would otherwise stay open and be
+          // adopted by whatever mounts next.
+          metrics.cancelRun();
           setTransitionPhase('idle');
           setProgress(0);
         }
@@ -454,6 +491,7 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
     }
 
     console.log('[ScreenZero] Starting processPrompt compilation with prompt:', text);
+    metrics.beginRun('generate', { via: 'prompt', promptChars: text.length });
     setIsGenerating(true);
     setTransitionPhase('compiling');
     setTerminalLogs([]);
@@ -469,6 +507,10 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
         setProgress(Math.min(progressVal, 70));
       });
       generatedConfig = result.config;
+      // Prompt parsing used to sit entirely OUTSIDE the measurement — the old
+      // clock started inside generateOrRestoreAssets, after this line.
+      metrics.mark('config');
+      metrics.annotate({ gameType: result.config.gameType });
 
       setTerminalLogs(prev => [...prev, `[ENGINE] Starting asset generation via ${isGeminiConfigured() ? 'Gemini AI' : 'built-in theme artwork (no API key)'}...`]);
       setProgress(75);
@@ -481,9 +523,11 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
         cancelToken: beginRun() // defensive symmetry with the overlay paths
       });
 
+      metrics.mark('assets-ready');
       setTerminalLogs(prev => [...prev, '[ENGINE] Booting game scene and registering WebGL textures...']);
       onStartTransition({ ...gen.config, preloadedImages: gen.preloadedImages, assetMeta: gen.assetMeta });
     } catch (err) {
+      metrics.mark('assets-failed');
       console.error('[Compilation Error] Game generation or preloading failed:', err);
       if (generatedConfig) {
         // Asset generation died — launch on built-in theme art instead of dead-ending.
@@ -494,6 +538,7 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
         onStartTransition(toStaticThemeConfig(generatedConfig));
       } else {
         // Config generation itself failed (local, near-infallible) — plain reset
+        metrics.cancelRun();
         setIsGenerating(false);
         setTransitionPhase('idle');
         setProgress(0);

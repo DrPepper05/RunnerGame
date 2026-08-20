@@ -145,9 +145,29 @@ function addToSessionSpend(kind, estUsd) {
 
 // A call that terminally failed still matters for observability: a broken QA path
 // must show up as "N failed", not as a quiet zero that looks like "QA off".
-function recordFailure(kind) {
+//
+// It also has to show up in the TIME columns. A failed call burns real wall clock
+// (a 45s image timeout is the single slowest thing that can happen in a run), and
+// until 2026-08-20 it pushed no calls[] entry at all — so every timeout silently
+// contributed 0ms and made slow runs look inexplicably slow. Failures now log a
+// zero-cost, elapsed-bearing entry flagged `failed`: include it in duration math,
+// never in cost math.
+function recordFailure(kind, extra = {}) {
   if (!usageTally) return;
   if (kind === 'image') usageTally.imageFailures++; else usageTally.visionFailures++;
+  usageTally.calls.push({
+    at: new Date().toISOString(),
+    kind,
+    failed: true,
+    ...(extra.label ? { label: extra.label } : {}),
+    ...(extra.model ? { model: extra.model } : {}),
+    ...(extra.reason ? { reason: extra.reason } : {}),
+    promptTokens: 0,
+    outputTokens: 0,
+    thoughtsTokens: 0,
+    ...(extra.elapsedMs != null ? { elapsedMs: extra.elapsedMs } : {}),
+    estUsd: 0
+  });
 }
 
 function recordUsage(kind, model, usage, extra = {}) {
@@ -286,7 +306,7 @@ export async function generateImage({
         strippedOptional = false;
         continue;
       }
-      recordFailure('image');
+      recordFailure('image', { label, model: activeModel, reason: err?.message?.slice(0, 120), elapsedMs: Math.round(performance.now() - t0) });
       throw toProviderError(err);
     }
   }
@@ -294,8 +314,8 @@ export async function generateImage({
   const candidate = response?.candidates?.[0];
   const imagePart = candidate?.content?.parts?.find(p => p.inlineData?.data);
   if (!imagePart) {
-    recordFailure('image');
     const finishReason = candidate?.finishReason || 'unknown';
+    recordFailure('image', { label, model: activeModel, reason: `no-image:${finishReason}`, elapsedMs: Math.round(performance.now() - t0) });
     const kind = /safety/i.test(finishReason) ? 'safety' : 'no-image';
     throw new ProviderError(`Gemini returned no image (finishReason: ${finishReason}).`, kind);
   }
@@ -372,7 +392,7 @@ export async function generateJson({ prompt, responseSchema, imageDataUrl = null
         failedWithThinking = true;
         continue;
       }
-      recordFailure('vision');
+      recordFailure('vision', { label, model: GEMINI_TEXT_MODEL, reason: err?.message?.slice(0, 120), elapsedMs: Math.round(performance.now() - t0) });
       throw toProviderError(err);
     }
   }
@@ -381,7 +401,7 @@ export async function generateJson({ prompt, responseSchema, imageDataUrl = null
   try {
     return JSON.parse(response.text);
   } catch {
-    recordFailure('vision');
+    recordFailure('vision', { label, model: GEMINI_TEXT_MODEL, reason: 'unparseable-json', elapsedMs: Math.round(performance.now() - t0) });
     throw new ProviderError('Gemini structured call returned unparseable JSON.', 'no-image');
   }
 }

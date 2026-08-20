@@ -109,8 +109,14 @@ export function generateProceduralLayout(promptText, mode, worldWidth = 4000, di
   }
 
   const platforms = [];
-  const startX = 400;
-  const finishBlockX = worldWidth - 400;
+  // Keeps generated levels clear of the two bottom corners that are FIXED screen
+  // regions — the camera clamps at world x=0 on the opening screen and at
+  // worldWidth-viewportWidth on the closing one, which is exactly where the
+  // mobile touch controls sit. Comfortably wider than any button cluster; the
+  // mobile ground-line gutter (MultiCameraManager) is the actual guarantee.
+  const EDGE_MARGIN = 400;
+  const startX = EDGE_MARGIN;
+  const finishBlockX = worldWidth - EDGE_MARGIN;
 
   // Decide platform density settings
   let spacing = 400;

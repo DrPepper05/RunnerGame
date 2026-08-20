@@ -1,4 +1,5 @@
 import React from 'react';
+import { setControlZones } from '../game/uiZones';
 
 const THEME_ACCENTS = {
   lava: { primary: '#FF6B3D', semi: 'rgba(255, 107, 61, 0.25)' },
@@ -11,6 +12,37 @@ const THEME_ACCENTS = {
 
 const MobileControls = ({ gameType, themeKey, projectilesEnabled }) => {
   const accent = THEME_ACCENTS[themeKey] || THEME_ACCENTS.default;
+  const overlayRef = React.useRef(null);
+  const dpadRef = React.useRef(null);
+  const actionsRef = React.useRef(null);
+
+  // Publish the real footprint of the buttons so the camera can keep the ground
+  // line above them (src/game/uiZones.js). Measured rather than hardcoded: the
+  // sizes are clamp()-based and change with viewport and orientation.
+  // useLayoutEffect so the numbers exist before Phaser's first frame.
+  React.useLayoutEffect(() => {
+    const publish = () => {
+      if (!overlayRef.current) return;
+      setControlZones({
+        base: overlayRef.current.getBoundingClientRect(),
+        left: dpadRef.current?.getBoundingClientRect(),
+        right: actionsRef.current?.getBoundingClientRect()
+      });
+    };
+    publish();
+    // Fonts/layout can settle a frame late on first paint; one rAF re-measure
+    // costs nothing and avoids publishing a half-laid-out rect.
+    const raf = requestAnimationFrame(publish);
+    window.addEventListener('resize', publish);
+    window.addEventListener('orientationchange', publish);
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener('resize', publish);
+      window.removeEventListener('orientationchange', publish);
+      // Deliberately NOT cleared: the controls unmount on game over, and
+      // dropping the inset there would snap the camera mid-death.
+    };
+  }, [gameType, projectilesEnabled]);
 
   const triggerInput = (action, state) => {
     // Dispatch a native browser custom event that the active Phaser game mode listens to
@@ -55,10 +87,10 @@ const MobileControls = ({ gameType, themeKey, projectilesEnabled }) => {
   };
 
   return (
-    <div className="pm-mobile-overlay" style={cssVariables}>
+    <div className="pm-mobile-overlay" style={cssVariables} ref={overlayRef}>
       {/* 1. Left D-Pad Cluster (only active in platformer mode) */}
       {gameType === 'platformer' ? (
-        <div className="pm-mobile-dpad" onPointerDown={(e) => e.stopPropagation()} onPointerUp={(e) => e.stopPropagation()}>
+        <div className="pm-mobile-dpad" ref={dpadRef} onPointerDown={(e) => e.stopPropagation()} onPointerUp={(e) => e.stopPropagation()}>
           <button
             className="pm-touch-btn"
             onTouchStart={(e) => handleTouchStart('left', e)}
@@ -90,11 +122,11 @@ const MobileControls = ({ gameType, themeKey, projectilesEnabled }) => {
           </button>
         </div>
       ) : (
-        <div /> /* Empty placeholder so flex-end works properly */
+        <div ref={dpadRef} /> /* Empty placeholder so flex-end works properly */
       )}
 
       {/* 2. Right Actions Cluster (Jump and Combat actions) */}
-      <div className="pm-mobile-actions" onPointerDown={(e) => e.stopPropagation()} onPointerUp={(e) => e.stopPropagation()}>
+      <div className="pm-mobile-actions" ref={actionsRef} onPointerDown={(e) => e.stopPropagation()} onPointerUp={(e) => e.stopPropagation()}>
         {gameType === 'platformer' ? (
           <div className="pm-mobile-actions-stack">
             {/* Top row for attack actions */}
