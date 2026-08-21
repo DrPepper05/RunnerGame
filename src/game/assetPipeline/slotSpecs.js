@@ -42,7 +42,9 @@ export const BG_CLAUSE = (chroma) => {
   return `The entire background is one perfectly uniform flat field of ${c.label}, ` +
     `EXACT hex ${c.hex} (RGB ${c.rgb}), covering every pixel that is not the subject — ` +
     `NO gradients, NO noise, NO texture, NO shadows, NO vignette, and absolutely no ` +
-    `${c.ban} anywhere on the subject itself`;
+    `${c.ban} anywhere on the subject itself. The ${c.label} touches the subject's ` +
+    `outline directly on every side: NO card, panel, frame, box, label or white ` +
+    `rectangle behind or around the subject`;
 };
 // Character-slot addition to BG_CLAUSE: models routinely paint the ENCLOSED gaps
 // (between an arm and the torso, between the legs) white instead of the backdrop

@@ -9,7 +9,7 @@
  * (ScreenZero's toStaticThemeConfig; App surfaces it in the regen overlay).
  */
 import { SLOT_SPECS, BASELINE_SLOTS, GENERATED_SLOTS, GEMINI_PRO_SHEET_MODEL, PROPS_GRID_SPEC, BG_CLAUSE, GAPS_CLAUSE } from './slotSpecs';
-import { postProcessAsset, mirrorImage, drawToCanvas, alphaFraction, borderResidueFraction, topBandOpaqueFraction, brightResidueFraction, contentBoundsOf, processSheet, finalizeSheetFrames, loadImage, keyCellWithQuality, cleanKeyedEdges, alignFrames, maskIoU, composeFilmstrip, lockPalette, sliceRawGrid, removeEnclosedPockets, chromaResidueFraction } from './postprocess';
+import { postProcessAsset, mirrorImage, drawToCanvas, alphaFraction, borderResidueFraction, topBandOpaqueFraction, brightResidueFraction, contentBoundsOf, processSheet, finalizeSheetFrames, loadImage, keyCellWithQuality, cleanKeyedEdges, alignFrames, maskIoU, composeFilmstrip, lockPalette, sliceRawGrid, removeEnclosedPockets, chromaResidueFraction, isBoxedSprite } from './postprocess';
 import { reviewSprite } from './qa';
 import * as gemini from './providers/geminiImage';
 import { designAssetPrompts, buildFinalPrompt, buildPropsGridPrompt, chromaFromPrompt } from './promptDesigner';
@@ -791,7 +791,7 @@ export async function generateAssets({
           scoringCells = [...cells.slice(0, idleSlot), ...cells.slice(idleSlot + 1)];
           const ib = contentBoundsOf(idleCell);
           if (!ib || (ib.maxY - ib.minY + 1) < idleCell.height * 0.3 ||
-              chromaResidueFraction(idleCell, chroma) > 0.08) {
+              chromaResidueFraction(idleCell, chroma) > 0.08 || idleCell.pmBoxed) {
             idleCell = null;
           }
         }
@@ -806,8 +806,19 @@ export async function generateAssets({
         const residues = scoringCells.map((c) => chromaResidueFraction(c, chroma));
         const stained = residues.map((r, i) => (r > 0.08 ? i : -1)).filter((i) => i >= 0);
         if (stained.length) dbg.stainedCells = stained.map((i) => ({ i, residue: +residues[i].toFixed(3) }));
+        // A cell that is still a filled rectangle after keying + the card pass is a
+        // frame sitting on its backdrop (live defect 2026-08-21: white box behind
+        // every frame, inherited from a boxed static reference). Never ship it —
+        // pre-flag like a stain so it culls for free; too many → the attempt fails
+        // and the ladder re-rolls.
+        const boxed = scoringCells.map((c, i) => (c.pmBoxed || isBoxedSprite(c) ? i : -1)).filter((i) => i >= 0);
+        if (boxed.length) {
+          dbg.boxedCells = boxed;
+          report(`[ASSETS] Sheet: ${boxed.length} frame(s) still boxed on their backdrop — culling`);
+        }
+        const preBad = [...new Set([...stained, ...boxed])];
         // gridMeta null → ALWAYS rebuild a 1×N strip.
-        let verdict = evaluateAndCullCells(scoringCells, null, attemptSpec.frames.runFrameCount, { preBadIndices: stained });
+        let verdict = evaluateAndCullCells(scoringCells, null, attemptSpec.frames.runFrameCount, { preBadIndices: preBad });
         if (verdict.issue) {
           // Repair rung: a handful of scorer-flagged frames get individually
           // redrawn — but ONLY on the LAST attempt (2026-08-16): while a cheaper
@@ -1105,6 +1116,32 @@ export async function generateAssets({
           : null);
 
       let result = await attemptOnce(seed, prompt);
+      // Character sprites that are still a filled rectangle after keying + the
+      // card pass are sitting on their backdrop (2026-08-21). One re-roll with an
+      // explicit card ban — even in cost mode, because the sheet is an EDIT of
+      // this sprite and would copy the box into every frame. If the second roll
+      // is boxed too, ship it with a visible log rather than failing the run to
+      // static theme art.
+      const isBoxed = (res) => {
+        if (!spec.qa?.facing || !spec.post?.keying) return false;
+        const image = res.finalImg;
+        if (image.pmBoxed) return true; // judged before the edge chain, inside postProcessAsset
+        const canvas = drawToCanvas(image, { width: image.naturalWidth, height: image.naturalHeight, fit: 'stretch' });
+        return isBoxedSprite(canvas);
+      };
+      if (isBoxed(result)) {
+        report(`[ASSETS] ${slot} is still boxed on its backdrop after keying — re-rolling once...`);
+        const noCardPrompt = prompt + '. The backdrop color touches the subject\'s outline directly on every side: ' +
+          'there is NO card, panel, frame, box, label or white rectangle behind or around the subject';
+        try {
+          const retry = await attemptOnce(seed + 11, noCardPrompt);
+          if (!isBoxed(retry)) result = retry;
+          else report(`[ASSETS] ${slot} re-roll is boxed too — keeping it (check the backdrop prompt)`);
+        } catch (err) {
+          if (err.cancelled) throw err;
+          console.warn(`[AssetPipeline] boxed re-roll failed for "${slot}", keeping first:`, err.message);
+        }
+      }
       let qualityIssue = layerIssue(result);
       if (qualityIssue && spec.optional) {
         report(`[ASSETS] Retrying ${slot} (${qualityIssue})...`);

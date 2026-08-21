@@ -152,6 +152,260 @@ export function borderResidueFraction(canvas, { band = 0.12, threshold = 228, ch
  * each ≤ maxAreaFrac of the opaque area, and the whole pass reverts when it
  * would remove >30% of the sprite.
  */
+/**
+ * Backdrop "card" handling (2026-08-21). Live failure: the model drew the character
+ * on a WHITE CARD/PANEL sitting on the requested chroma screen (or on a white field
+ * inside a dark frame). The border flood keys the screen and stops dead at the
+ * card's edge; every downstream gate measures the cell's OUTER band, which is clean
+ * by then; removeEnclosedPockets is chroma-only; vision QA's "dirty background" can
+ * only trigger a looser re-key, which still cannot cross from green into white. So
+ * the card shipped — a white rectangle hugging the sprite — and because the sprite
+ * sheet is an image-EDIT of that static sprite, every animation frame inherited it.
+ *
+ * A card candidate is: an opaque near-white connected component within 2px of the
+ * transparent (keyed) region or the canvas edge, whose outline is rectangle-like
+ * (its bbox perimeter is mostly covered by the component itself), and which
+ * encloses most of the content's bbox. The 2px reach matters: downscaling and the
+ * model's own anti-aliasing leave a 1px rim of white/screen blend around a card,
+ * so its interior never touches the void DIRECTLY. A white-bodied character (the
+ * mummy lesson of 2026-08-16) fails the rectangle test, and is usually sealed
+ * from the backdrop by its outline anyway.
+ */
+const PALE = (r, g, b) => {
+  const mn = Math.min(r, g, b), mx = Math.max(r, g, b);
+  return mn >= 200 && mx - mn <= 52;
+};
+
+function findCardCandidates(d, w, h) {
+  const n = w * h;
+  const opaque = (i) => d[i * 4 + 3] >= 128;
+  let cx0 = Infinity, cy0 = Infinity, cx1 = -1, cy1 = -1;
+  for (let i = 0; i < n; i++) {
+    if (!opaque(i)) continue;
+    const x = i % w, y = (i / w) | 0;
+    if (x < cx0) cx0 = x; if (x > cx1) cx1 = x; if (y < cy0) cy0 = y; if (y > cy1) cy1 = y;
+  }
+  if (cx1 < 0) return [];
+  const contentW = cx1 - cx0 + 1, contentH = cy1 - cy0 + 1;
+
+  const touchesVoid = (i) => {
+    const x = i % w, y = (i / w) | 0;
+    if (x <= 1 || y <= 1 || x >= w - 2 || y >= h - 2) return true;
+    for (let dy = -2; dy <= 2; dy++) {
+      for (let dx = -2; dx <= 2; dx++) {
+        if ((dx || dy) && !opaque(i + dy * w + dx)) return true;
+      }
+    }
+    return false;
+  };
+  const visited = new Uint8Array(n);
+  const queue = new Int32Array(n);
+  const candidates = [];
+  for (let s0 = 0; s0 < n; s0++) {
+    if (visited[s0] || !opaque(s0) || !PALE(d[s0 * 4], d[s0 * 4 + 1], d[s0 * 4 + 2]) || !touchesVoid(s0)) continue;
+    let head = 0, tail = 0;
+    visited[s0] = 1; queue[tail++] = s0;
+    let bx0 = Infinity, by0 = Infinity, bx1 = -1, by1 = -1;
+    const members = [];
+    while (head < tail) {
+      const i = queue[head++];
+      members.push(i);
+      const x = i % w, y = (i / w) | 0;
+      if (x < bx0) bx0 = x; if (x > bx1) bx1 = x; if (y < by0) by0 = y; if (y > by1) by1 = y;
+      const nb = [];
+      if (x > 0) nb.push(i - 1);
+      if (x < w - 1) nb.push(i + 1);
+      if (y > 0) nb.push(i - w);
+      if (y < h - 1) nb.push(i + w);
+      for (const j of nb) {
+        if (visited[j]) continue;
+        if (opaque(j) && PALE(d[j * 4], d[j * 4 + 1], d[j * 4 + 2])) { visited[j] = 1; queue[tail++] = j; }
+      }
+    }
+    const bw = bx1 - bx0 + 1, bh = by1 - by0 + 1;
+    if (bw < 8 || bh < 8) continue;
+    // Rectangle-likeness: how much of the component's bbox perimeter is pale —
+    // by ANY pale pixel, not just this component's: a limb crossing the card's
+    // edge splits a sliver off into its own component, and counting only the main
+    // body's pixels made that edge read as missing. A card's straight edges are
+    // fully present (a limb may cross one edge); a humanoid/blob white shape
+    // covers little of its bbox perimeter either way.
+    const edgeCov = (pts) => pts.reduce((a, i) => a + (opaque(i) && PALE(d[i * 4], d[i * 4 + 1], d[i * 4 + 2]) ? 1 : 0), 0) / pts.length;
+    const top = [], bottom = [], left = [], right = [];
+    for (let x = bx0; x <= bx1; x++) { top.push(by0 * w + x); bottom.push(by1 * w + x); }
+    for (let y = by0; y <= by1; y++) { left.push(y * w + bx0); right.push(y * w + bx1); }
+    const covs = [edgeCov(top), edgeCov(bottom), edgeCov(left), edgeCov(right)].sort((a, b) => b - a);
+    const rectangular = covs[0] >= 0.85 && covs[1] >= 0.85 && covs[2] >= 0.7 && covs[3] >= 0.35;
+    // Enclosure: the card sits behind most of the content.
+    const encloses = bw >= contentW * 0.6 && bh >= contentH * 0.6;
+    if (rectangular && encloses) candidates.push({ members, bx0, by0, bx1, by1 });
+  }
+  return candidates;
+}
+
+/** True when a rectangle-like pale panel still sits behind the content. */
+export function hasBackdropCard(canvas) {
+  const w = canvas.width, h = canvas.height;
+  const d = canvas.getContext('2d').getImageData(0, 0, w, h).data;
+  return findCardCandidates(d, w, h).length > 0;
+}
+
+/**
+ * Strip backdrop cards. Only runs when the prompt asked for a CHROMA screen (white
+ * is then never a legitimate backdrop). Each removal must leave a character that
+ * sits ON the card — and not be the body OF a white character: geometric test, the
+ * card extends beyond the surviving content on at least 3 of 4 sides (a leg may
+ * cross the bottom edge); a white robot body has its head above, legs below and
+ * arms beyond it, and a white crate's surviving outline surrounds its interior —
+ * both fail and are reverted. Plus a minimum: the survivor must be a real sprite
+ * (≥1% of the canvas, ≥20% of its height), not a pair of eyes. Returns true when a
+ * card was removed.
+ */
+export function removeBackdropCard(canvas, { chroma = null } = {}) {
+  if (!chroma) return false;
+  const w = canvas.width, h = canvas.height;
+  const ctx = canvas.getContext('2d');
+  const imgData = ctx.getImageData(0, 0, w, h);
+  const d = imgData.data;
+  const n = w * h;
+  const opaque = (i) => d[i * 4 + 3] >= 128;
+  const candidates = findCardCandidates(d, w, h);
+  if (!candidates.length) return false;
+
+  // Outside void BEFORE any card goes: the rim test must distinguish "next to the
+  // hole AND next to the outside" (the card's anti-aliased rim) from "next to the
+  // hole only" (the character's own edge where it met the card).
+  // The canvas border counts as outside too (a card touching the cell's edge has
+  // its rim ON that edge, with no transparent pixel beyond it).
+  const nearOutside = new Uint8Array(n);
+  for (let i = 0; i < n; i++) {
+    const x = i % w, y = (i / w) | 0;
+    if (x <= 1 || y <= 1 || x >= w - 2 || y >= h - 2) nearOutside[i] = 1;
+    if (opaque(i)) continue;
+    for (let dy = -2; dy <= 2; dy++) {
+      for (let dx = -2; dx <= 2; dx++) {
+        const X = x + dx, Y = y + dy;
+        if (X >= 0 && Y >= 0 && X < w && Y < h) nearOutside[Y * w + X] = 1;
+      }
+    }
+  }
+  const clearRimAround = (members) => {
+    // The card's anti-aliased rim — white blended with the screen (or with a dark
+    // frame), which the flood could not key and which is NOT pale — survives as a
+    // 1-2px frame around the hole. Clear it: within 2px of the removed pixels,
+    // within 2px of the original outside void, and not dark (a dark outline that
+    // happens to cross the card edge is kept). Without this its bbox wraps the
+    // card on all four sides and the survival test would see "content beyond".
+    for (const i of members) {
+      const x = i % w, y = (i / w) | 0;
+      for (let dy = -2; dy <= 2; dy++) {
+        for (let dx = -2; dx <= 2; dx++) {
+          const X = x + dx, Y = y + dy;
+          if (X < 0 || Y < 0 || X >= w || Y >= h) continue;
+          const j = Y * w + X;
+          if (d[j * 4 + 3] < 128 || !nearOutside[j]) continue;
+          const r = d[j * 4], g = d[j * 4 + 1], b = d[j * 4 + 2];
+          const luma = 0.299 * r + 0.587 * g + 0.114 * b;
+          if (luma >= 90 || isChromaResidue(r, g, b, chroma)) d[j * 4 + 3] = 0;
+        }
+      }
+    }
+  };
+
+  let removedAny = false;
+  for (const card of candidates) {
+    const { members, bx0, by0, bx1, by1 } = card;
+    if (!members.every(opaque)) continue; // consumed by an earlier removal
+    const backup = new Uint8ClampedArray(d);
+    for (const i of members) d[i * 4 + 3] = 0;
+    clearRimAround(members);
+    let left2 = 0, lx0 = Infinity, ly0 = Infinity, lx1 = -1, ly1 = -1;
+    for (let i = 0; i < n; i++) {
+      if (!opaque(i)) continue;
+      left2++;
+      const x = i % w, y = (i / w) | 0;
+      if (x < lx0) lx0 = x; if (x > lx1) lx1 = x; if (y < ly0) ly0 = y; if (y > ly1) ly1 = y;
+    }
+    const survivedArea = left2 >= Math.max(64, n * 0.01);
+    const survivedSize = lx1 >= 0 && (ly1 - ly0 + 1) >= h * 0.2;
+    const margin = 3;
+    const sidesBeyond = lx1 < 0 ? 0 :
+      (lx0 - bx0 >= margin) + (bx1 - lx1 >= margin) + (ly0 - by0 >= margin) + (by1 - ly1 >= margin);
+    if (!survivedArea || !survivedSize || sidesBeyond < 3) {
+      d.set(backup);
+      continue;
+    }
+    removedAny = true;
+
+    // Remnants: small pale pieces of the SAME card cut off by limbs (the strip
+    // between two legs where they cross the card's bottom edge). Pale, inside the
+    // card's footprint, touching the void, and small — a white shirt patch is
+    // sealed inside the body and never touches the void; a white body is large.
+    const cardArea = (bx1 - bx0 + 1) * (by1 - by0 + 1);
+    const seen = new Uint8Array(n);
+    const q = new Int32Array(n);
+    for (let s0 = 0; s0 < n; s0++) {
+      const x = s0 % w, y = (s0 / w) | 0;
+      if (x < bx0 || x > bx1 || y < by0 || y > by1) continue;
+      if (seen[s0] || !opaque(s0) || !PALE(d[s0 * 4], d[s0 * 4 + 1], d[s0 * 4 + 2])) continue;
+      let head = 0, tail = 0, touches = false;
+      seen[s0] = 1; q[tail++] = s0;
+      const comp = [];
+      while (head < tail) {
+        const i = q[head++];
+        comp.push(i);
+        const xi = i % w, yi = (i / w) | 0;
+        const nb = [];
+        if (xi > 0) nb.push(i - 1);
+        if (xi < w - 1) nb.push(i + 1);
+        if (yi > 0) nb.push(i - w);
+        if (yi < h - 1) nb.push(i + w);
+        for (const j of nb) {
+          if (!opaque(j)) { touches = true; continue; }
+          if (!seen[j] && PALE(d[j * 4], d[j * 4 + 1], d[j * 4 + 2])) { seen[j] = 1; q[tail++] = j; }
+        }
+      }
+      if (touches && comp.length <= cardArea * 0.05) {
+        for (const i of comp) d[i * 4 + 3] = 0;
+        clearRimAround(comp);
+      }
+    }
+  }
+  if (removedAny) ctx.putImageData(imgData, 0, 0);
+  return removedAny;
+}
+
+/**
+ * "Boxed sprite" detector (2026-08-21): a keyed character whose opaque pixels fill
+ * its own bounding box almost completely, with the bbox perimeter itself almost
+ * fully opaque, is not a silhouette — it is a sprite still sitting on its backdrop.
+ * Real characters fill ~35-70% of their bbox. Also flags a sprite that still has a
+ * rectangle-like pale panel behind it (hasBackdropCard) — a limb protruding past
+ * the panel breaks the fill test but not that one. Deterministic, no vision model;
+ * used as a "do not ship this" gate for player/enemy and per sheet cell (NOT for
+ * obstacles/platforms, which can legitimately be solid rectangles).
+ */
+export function isBoxedSprite(canvas, { fillMin = 0.86, edgeMin = 0.85 } = {}) {
+  const w = canvas.width, h = canvas.height;
+  const d = canvas.getContext('2d').getImageData(0, 0, w, h).data;
+  const opaque = (x, y) => d[(y * w + x) * 4 + 3] >= 128;
+  let x0 = Infinity, y0 = Infinity, x1 = -1, y1 = -1, count = 0;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    if (!opaque(x, y)) continue;
+    count++;
+    if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+  }
+  if (x1 < 0) return false;
+  const bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+  if (bw < 12 || bh < 12) return false;
+  const fill = count / (bw * bh);
+  let edgeHits = 0, edgeTotal = 0;
+  for (let x = x0; x <= x1; x++) { edgeTotal += 2; edgeHits += opaque(x, y0) + opaque(x, y1); }
+  for (let y = y0 + 1; y < y1; y++) { edgeTotal += 2; edgeHits += opaque(x0, y) + opaque(x1, y); }
+  if (fill >= fillMin && edgeHits / edgeTotal >= edgeMin) return true;
+  return findCardCandidates(d, w, h).length > 0;
+}
+
 export function removeEnclosedPockets(canvas, { chroma = null, maxAreaFrac = 0.25 } = {}) {
   const w = canvas.width, h = canvas.height;
   const ctx = canvas.getContext('2d');
@@ -1106,12 +1360,20 @@ export async function processSheet(rawSrc, spec, { inset = 3, chroma = null } = 
       rawCells.push(cell);
     }
   }
+  const boxedFlags = [];
   const cells = rawCells
     // Strip layouts (rows 1) have only VERTICAL gutters/dividers to discard —
     // a full 3px vertical inset was shaving the top of every head flat (a
     // full-body character fills the 128px cell). 1px still drops edge artifacts.
     .map((cell) => insetCanvas(cell, inset, rows > 1 ? inset : 1))
     .map((cell) => keyCellWithQuality(cell, { chroma }))
+    // White card/panel behind the character (inherited from a boxed static
+    // reference, or drawn fresh) — strip it per cell before pocket/edge work.
+    .map((cell) => { if (chroma && spec.post.pocketClean) removeBackdropCard(cell, { chroma }); return cell; })
+    // Remember which cells STILL carry a card (judged before the edge chain —
+    // outline/bleed blur the geometry); re-attached to the final cells below so
+    // the pipeline can cull them without re-deriving it from softened pixels.
+    .map((cell, i) => { boxedFlags[i] = !!(chroma && spec.post.pocketClean && hasBackdropCard(cell)); return cell; })
     .map((cell) => (spec.post.pocketClean ? removeEnclosedPockets(cell, { chroma }) : cell))
     // Chroma-residue rescue: when the border-flood failed a cell (content sliced
     // across the boundary → wrong seed color) a swath of screen color survives.
@@ -1132,6 +1394,7 @@ export async function processSheet(rawSrc, spec, { inset = 3, chroma = null } = 
     // like any other edge. Uniform across cells; the union crop trims it back off.
     .map((cell) => padCanvasTop(cell, 4))
     .map((cell) => cleanKeyedEdges(cell, { erode: 1, outline: !!spec.post.outline, despill: chroma }));
+  cells.forEach((cell, i) => { cell.pmBoxed = !!boxedFlags[i]; });
   const preview = assembleSheet(cells, { cols, rows });
   const previewImg = await loadImage(preview.canvas.toDataURL('image/png'), { crossOrigin: null });
   return { previewImg, cells, layout: { cols, rows } };
@@ -1463,6 +1726,16 @@ export async function postProcessAsset(rawSrc, spec, opts = {}) {
     canvas = drawToCanvas(img, { ...spec.canvas, fit: spec.post.fit });
   }
   canvas = applyKeying(canvas, spec.post.keying, opts.keyOverrides, spec.post, opts.whiteOverrides || null);
+  // Character slots on a chroma screen: strip a white card/panel the model put
+  // behind the subject (the flood stops at its edge) — see removeBackdropCard.
+  let boxed = false;
+  if (spec.post.keying && spec.post.pocketClean && opts.chroma) {
+    removeBackdropCard(canvas, { chroma: opts.chroma });
+    // Judged HERE, before outline/bleed soften the geometry: a card the remover
+    // could not safely strip (e.g. a limb protruding past it) must still be
+    // reported, so the caller can re-roll instead of shipping a boxed sprite.
+    boxed = hasBackdropCard(canvas);
+  }
   // Enclosed-gap pockets (arm/torso gaps painted backdrop-color) BEFORE the edge
   // chain, so the cleared gaps get the same outline treatment as real edges.
   if (spec.post.keying && spec.post.pocketClean) {
@@ -1482,5 +1755,7 @@ export async function postProcessAsset(rawSrc, spec, opts = {}) {
   // visible shape and the hitbox drift apart.
   if (spec.post.fillAfterCrop) canvas = drawToCanvas(canvas, { ...spec.canvas, fit: 'stretch' });
   if (spec.post.solidify) solidifyColumns(canvas);
-  return loadImage(canvas.toDataURL('image/png'), { crossOrigin: null });
+  const out = await loadImage(canvas.toDataURL('image/png'), { crossOrigin: null });
+  out.pmBoxed = boxed; // read by the pipeline's boxed-sprite gate
+  return out;
 }
