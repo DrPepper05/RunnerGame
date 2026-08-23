@@ -827,35 +827,6 @@ export default class GameManagerScene extends Phaser.Scene {
     }, 150);
   }
 
-  // Fallback motion for a generated player that never got a sprite sheet: the
-  // character must never look frozen. Softened 2026-08-20 — the original
-  // ±3°/110ms read as a conspicuous tilt-wobble (the top complaint about
-  // cache-matched games) rather than as running. Slower and shallower still
-  // reads as alive without drawing attention to itself.
-  //
-  // Angle, not position: these sprites are anchored bottom-centre by
-  // SpriteAlignmentManager, so bobbing y would lift the feet off the ground.
-  startPlayerBob() {
-    if (this.playerBobTween && this.playerBobTween.isPlaying()) return;
-    this.stopPlayerBob();
-    this.playerBobTween = this.tweens.add({
-      targets: this.player,
-      angle: { from: -1.5, to: 1.5 },
-      duration: 170,
-      yoyo: true,
-      repeat: -1,
-      ease: 'Sine.easeInOut'
-    });
-  }
-
-  stopPlayerBob() {
-    if (this.playerBobTween) {
-      this.playerBobTween.stop();
-      this.playerBobTween = null;
-    }
-    if (this.player) this.player.setAngle(0);
-  }
-
   playPlayerAnim(animName) {
     if (this.useDynPlayer) {
       if (!this.player || !this.player.anims) return;
@@ -875,11 +846,14 @@ export default class GameManagerScene extends Phaser.Scene {
           this.player.setFrame(frames?.jumpFrameIndex ?? 1);
         }
       } else {
-        // Static generated sprite (free path / sheet gates rejected) — a subtle
-        // procedural rocking tween so the runner doesn't look frozen mid-air
+        // Static generated sprite: no sheet passed the gates AND every rescue
+        // rung failed (or Gemini was down). Deliberately NO procedural motion —
+        // the old tilt-bob ("a subtle rocking tween so the runner doesn't look
+        // frozen") was removed 2026-08-23 at the client's direction: it read as
+        // a wobbling statue and hid the failure instead of fixing it. The fix
+        // lives in the pipeline's rescue ladder; this branch should be rare and
+        // is logged loudly there (meta.player.animationFailed).
         this.player.anims.stop();
-        if (animName === 'run') this.startPlayerBob();
-        else this.stopPlayerBob();
       }
       return;
     }
@@ -953,7 +927,6 @@ export default class GameManagerScene extends Phaser.Scene {
 
     this.physics.pause();
     this.player.anims.stop();
-    this.stopPlayerBob();
 
     // Play the impact BEFORE handing the screen to the React overlay. physics
     // is paused but tweens and the scene clock keep running, so the flash,
@@ -973,7 +946,6 @@ export default class GameManagerScene extends Phaser.Scene {
 
     this.physics.pause();
     this.player.anims.stop();
-    this.stopPlayerBob();
 
     this.fx?.flash(90, 230, 140, 220);
     this.fx?.burst(this.player.x, this.player.body?.center?.y ?? this.player.y, {

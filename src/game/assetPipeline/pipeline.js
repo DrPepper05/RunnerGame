@@ -8,7 +8,7 @@
  * every caller handles it by downgrading to the built-in static theme asset set
  * (ScreenZero's toStaticThemeConfig; App surfaces it in the regen overlay).
  */
-import { SLOT_SPECS, BASELINE_SLOTS, GENERATED_SLOTS, GEMINI_PRO_SHEET_MODEL, PROPS_GRID_SPEC, BG_CLAUSE, GAPS_CLAUSE } from './slotSpecs';
+import { SLOT_SPECS, BASELINE_SLOTS, GENERATED_SLOTS, GEMINI_SHEET_MODEL, GEMINI_PRO_SHEET_MODEL, PROPS_GRID_SPEC, BG_CLAUSE, GAPS_CLAUSE } from './slotSpecs';
 import { postProcessAsset, mirrorImage, drawToCanvas, alphaFraction, borderResidueFraction, topBandOpaqueFraction, brightResidueFraction, contentBoundsOf, processSheet, finalizeSheetFrames, loadImage, keyCellWithQuality, cleanKeyedEdges, alignFrames, maskIoU, composeFilmstrip, lockPalette, sliceRawGrid, removeEnclosedPockets, chromaResidueFraction, isBoxedSprite } from './postprocess';
 import { reviewSprite } from './qa';
 import * as gemini from './providers/geminiImage';
@@ -340,13 +340,17 @@ export async function generateAssets({
   // - qualityMode restores the expensive rescue rungs (pro sheet, per-frame
   //   escalation, QA regenerations, 2K sheet) that are OFF in the cost defaults.
   // - maxImageCalls is a hard backstop: once a run has spent this many Gemini
-  //   image calls, remaining attempts go straight to the free fallback. Normal
-  //   runs never reach it.
+  //   image calls, remaining attempts fail and optional slots drop. Raised 12 →
+  //   22 on 2026-08-23: a fresh run spends ≈7-8 calls, and at 12 the animated-
+  //   player rescue rungs (flash attempt + up to 10 per-frame edits) starved
+  //   silently — and when the combined props call is skipped the coin and a
+  //   parallax layer were being DROPPED for budget. Worst case ≈ $1 at flat
+  //   lite prices; normal runs are nowhere near it. PM_MAX_GEMINI_CALLS overrides.
   const runState = {
     skipGemini: false,
     qualityMode: localStorage.getItem('PM_QUALITY_MODE') === '1',
     imageCalls: 0,
-    maxImageCalls: parseInt(localStorage.getItem('PM_MAX_GEMINI_CALLS'), 10) || 12,
+    maxImageCalls: parseInt(localStorage.getItem('PM_MAX_GEMINI_CALLS'), 10) || 22,
     // Probe/experiment knobs (A/B protocol): override the image model for the
     // static player / the sheet without touching slotSpecs. Normal runs leave
     // them unset; a passed probe flips the slotSpecs default instead.
@@ -725,28 +729,33 @@ export async function generateAssets({
       let perFrame = false;
       let repairUsed = false;
       let lastIssue = 'unknown';
-      // Attempt 3 is the premium rescue: ONE gemini-3-pro-image sheet before the
-      // 10-call per-frame escalation. QUALITY MODE ONLY — the cost defaults stop
-      // at the static player instead of paying for rescues.
+      // Rescue ladder (2026-08-23, "the player is animated in EVERY path"):
+      //   1-2  spec tier (lite; PM_MODEL_SHEET override respected) — the cost
+      //        defaults, unchanged ("not go to flash" on normal runs)
+      //   3    GEMINI_SHEET_MODEL (3.1-flash) — ALWAYS, fires only when both lite
+      //        rolls failed (~+$0.10 then, $0 otherwise)
+      //   4    GEMINI_PRO_SHEET_MODEL — quality mode only (the old pro rescue)
+      //   then per-frame reference edits (below), then — ONLY if Gemini is dead
+      //        or the call budget is gone — the static base, logged as a FAILURE.
+      // Before this the cost defaults stopped at the static player by design and
+      // papered over it with a tilt-bob; both are gone.
+      const tiers = [activeSpec.gen.model, activeSpec.gen.model];
+      if (gemini.isGeminiConfigured() && activeSpec.gen.model !== GEMINI_SHEET_MODEL) tiers.push(GEMINI_SHEET_MODEL);
       const proRescue = !!(runState.qualityMode && gemini.isGeminiConfigured() &&
         activeSpec.gen.model && activeSpec.gen.model !== GEMINI_PRO_SHEET_MODEL);
-      const maxSheetAttempts = proRescue ? 3 : 2;
+      if (proRescue) tiers.push(GEMINI_PRO_SHEET_MODEL);
+      const maxSheetAttempts = tiers.length;
       for (let attempt = 1; attempt <= maxSheetAttempts && !sheet; attempt++) {
         if (runState.cancelToken?.cancelled) throw cancelledError();
-        if (attempt === 3 && runState.skipGemini) break;
-        // Cost ladder (2026-08-18, client direction "not go to flash"): BOTH
-        // normal attempts run the spec/default lite tier — a lite re-roll costs
-        // ~half the old 3.1-flash escalation, and the stain-cull + pale-chroma
-        // rescue changes are what make lite rolls survivable. PM_MODEL_SHEET
-        // still overrides the tier per run; attempt 3 (quality mode only)
-        // remains the pro rescue.
+        if (attempt > 2 && runState.skipGemini) break;
+        const tier = tiers[attempt - 1];
         if (attempt > 1) {
-          report(attempt === 3
-            ? `[ASSETS] Sheet ${lastIssue} — trying the premium image model...`
+          report(attempt > 2
+            ? `[ASSETS] Sheet ${lastIssue} — escalating to ${tier}...`
             : `[ASSETS] Sheet ${lastIssue}, regenerating...`);
         }
-        const attemptSpec = attempt === 3
-          ? { ...activeSpec, gen: { ...activeSpec.gen, model: GEMINI_PRO_SHEET_MODEL } }
+        const attemptSpec = tier !== activeSpec.gen.model
+          ? { ...activeSpec, gen: { ...activeSpec.gen, model: tier } }
           : activeSpec;
         // The sheet is an image-editing call anchored to the static base; the
         // prompt preamble tells the model the attachment IS the character.
@@ -1014,8 +1023,9 @@ export async function generateAssets({
         report('[ASSETS] Escalation did not improve the sheet — shipping the earlier animated version.');
       }
 
-      // Per-frame escalation: quality mode only, and only within the call budget.
-      if (!sheet && baseSrc && runState.qualityMode && gemini.isGeminiConfigured() &&
+      // Per-frame escalation — the last animation rung, for EVERY run since
+      // 2026-08-23 (was quality mode only): Gemini alive + call budget left.
+      if (!sheet && baseSrc && gemini.isGeminiConfigured() &&
           !runState.skipGemini && runState.imageCalls < runState.maxImageCalls) {
         const escalated = await generatePerFrameSheet();
         if (escalated) {
@@ -1044,10 +1054,14 @@ export async function generateAssets({
       report(`[ASSETS] Upgraded: animated ${outKey} via ${provider}${perFrame ? ' (per-frame)' : ''}`);
     } catch (err) {
       if (err.cancelled) throw err; // cancellation rejects the run, never "keep static"
-      // The static base is already generated, keyed and registered — keep it.
+      // The static base is already generated, keyed and registered — keep it,
+      // but this is a FAILURE of the always-animated contract, not a fallback:
+      // say so loudly and stamp the reason on the player meta so the cost report
+      // shows it (the old tilt-bob used to hide exactly this).
       console.warn(`[AssetPipeline] Sprite sheet failed (${err.message}) — keeping the static "${spec.fallbackSlot}" sprite.`);
-      report(`[ASSETS] Animated player unavailable, keeping static sprite.`);
+      report(`[ASSETS] ⚠ Animated player FAILED after every rescue rung (${err.message}) — static sprite shipped.`);
       recordSheetAttempt({ outcome: 'static-fallback', reason: err.message });
+      if (meta[spec.fallbackSlot]) meta[spec.fallbackSlot].animationFailed = err.message;
       delete slotFraction[slot];
     }
   };
@@ -1313,11 +1327,15 @@ const DESIGN_SOURCE_LABELS = {
 // individual path by construction. Returns the grid plan or null (kill switch,
 // quality mode, too few slots, or the chroma pick collided to white).
 function planPropsGrid(slots, design, namedBySlot, onProgress) {
-  if (localStorage.getItem('PM_GRID_PROPS') === '0') return null;
+  // The outcome rides on `design` into assetMeta.propsGrid so the COST REPORT
+  // can explain a run that cost ~4 extra calls (2026-08-23: a skipped grid was
+  // only visible in the live terminal and got lost with the tab).
+  const skip = (why) => { design.propsGridStatus = `skipped: ${why}`; return null; };
+  if (localStorage.getItem('PM_GRID_PROPS') === '0') return skip('PM_GRID_PROPS kill switch');
   // Quality mode pays for individual calls + rescue rungs — never gridded.
-  if (localStorage.getItem('PM_QUALITY_MODE') === '1') return null;
+  if (localStorage.getItem('PM_QUALITY_MODE') === '1') return skip('quality mode');
   const gridSlots = PROPS_GRID_SPEC.cellOrder.filter((s) => slots.includes(s));
-  if (gridSlots.length < 3) return null;
+  if (gridSlots.length < 3) return skip(`only ${gridSlots.length} grid-able slot(s) in this run`);
   const plan = buildPropsGridPrompt(gridSlots, design.subjects, design.styleGuide, namedBySlot);
   // Every skip is VISIBLE — a silent bail made "why didn't the price drop"
   // undiagnosable from the terminal.
@@ -1325,6 +1343,8 @@ function planPropsGrid(slots, design, namedBySlot, onProgress) {
     ? `[ASSETS] Combined props call: ${gridSlots.join(', ')} in one image.`
     : `[ASSETS] Combined props call skipped (green+magenta subject collision) — individual calls.`,
   null);
+  if (!plan) return skip('green+magenta subject chroma collision');
+  design.propsGridStatus = `combined: ${gridSlots.join(', ')}`;
   return plan;
 }
 
@@ -1413,6 +1433,7 @@ export async function generateGameAssets({ config, userPrompt = '', onProgress =
     view: 'side',
     slots: meta,
     ...(design.taxonomy?.tags?.length ? { tags: design.taxonomy.tags } : {}),
+    ...(design.propsGridStatus ? { propsGrid: design.propsGridStatus } : {}),
     ...(cost ? { cost } : {})
   };
   return { preloadedImages, meta, promptSet: finalPrompts, design, assetMeta };

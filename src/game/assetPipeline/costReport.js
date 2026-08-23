@@ -38,6 +38,7 @@ export function buildCostReport(liveParams) {
   lines.push(`Game:       ${liveParams?.gameName || 'Untitled'}`);
   lines.push(`Mode:       ${liveParams?.gameType || 'unknown'}`);
   lines.push(`Design via: ${meta.designSource || 'n/a'}`);
+  if (meta.propsGrid) lines.push(`Props call: ${meta.propsGrid}`);
   lines.push(`Downloaded: ${new Date().toISOString()}`);
   lines.push('');
 
@@ -140,6 +141,7 @@ export function buildCostReport(liveParams) {
       lines.push(`- ${slot} [${origin}]: ${m.provider || 'cache'}${m.model ? ` (${m.model})` : ''}` +
         `${m.attempts ? `, ${m.attempts} attempt(s)` : ''}` +
         `${m.sheet ? `, animated${m.perFrame ? ' per-frame' : ''}` : ''}` +
+        `${m.animationFailed ? `, ⚠ ANIMATION FAILED: ${m.animationFailed}` : ''}` +
         `${m.mirrored ? ', mirrored' : ''}${costBit}`);
     });
     // Non-slot calls: shared combined calls get their member list; the rest

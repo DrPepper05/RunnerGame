@@ -10,9 +10,10 @@
  * Design rules this module follows:
  *  · Readable over spectacular. Shake stays small enough to keep a phone screen
  *    playable — the brief is "clean and readable", not "screen goes berserk".
- *  · Never touch the player's `angle`. The static-sprite fallback runs a
- *    permanent angle tween (GameManagerScene.startPlayerBob) and fighting it
- *    leaves the sprite tilted. Scale, tint and position only.
+ *  · Never tween the player's `angle`. Pixel-art characters read as broken when
+ *    rotated (the old tilt-bob fallback proved it — removed 2026-08-23), and
+ *    SpriteAlignmentManager owns the player's transform. Scale, tint and
+ *    position only.
  *  · Scale effects are relative and yoyo back, so they land exactly on the
  *    sprite's configured scale (dynamic players are scaled to 64/frameHeight,
  *    static ones by playerScale — an absolute tween would break one of them).
