@@ -9,7 +9,7 @@ import { GoogleGenAI } from '@google/genai';
 import { GEMINI_IMAGE_FALLBACK_MODEL, GEMINI_TEXT_MODEL } from '../slotSpecs';
 
 export class ProviderError extends Error {
-  /** @param {'no-key'|'auth'|'quota'|'safety'|'no-image'|'network'|'timeout'} kind */
+  /** @param {'no-key'|'auth'|'invalid-request'|'quota'|'safety'|'no-image'|'network'|'timeout'} kind */
   constructor(message, kind = 'network', retryDelayMs = null) {
     super(message);
     this.name = 'ProviderError';
@@ -52,8 +52,19 @@ function toProviderError(err) {
     const retryDelayMs = delayMatch ? Math.ceil(parseFloat(delayMatch[1]) * 1000) : null;
     return new ProviderError(`Gemini quota exceeded: ${message}`, 'quota', retryDelayMs);
   }
-  if (status === 400 || status === 401 || status === 403) {
+  if (status === 401 || status === 403) {
     return new ProviderError(`Gemini rejected the request: ${message}`, 'auth');
+  }
+  if (status === 400) {
+    // Most 400s are per-call INVALID_ARGUMENT rejections (a param/prompt this
+    // specific request can't use) — retrying or continuing the run is fine, only
+    // THIS call is doomed. A truly bad/unauthorized key carries Google's own
+    // API_KEY_INVALID / PERMISSION_DENIED wording; that's the only 400 that should
+    // disable the rest of the run the way a real 401/403 does.
+    if (/api[_\s]?key|permission[_\s]?denied|unauthorized|invalid authentication/i.test(message)) {
+      return new ProviderError(`Gemini rejected the request: ${message}`, 'auth');
+    }
+    return new ProviderError(`Gemini rejected the request: ${message}`, 'invalid-request');
   }
   return new ProviderError(`Gemini request failed: ${message}`, 'network');
 }
@@ -95,6 +106,7 @@ const isFieldRejectionError = (err, field) => {
   const message = (err?.message || '').toLowerCase();
   if (field === 'thinkingConfig') return /think/.test(message);
   if (field === 'imageSize') return /image_?size|resolution/.test(message);
+  if (field === 'aspectRatio') return /aspect\s*ratio/.test(message);
   return false;
 };
 
@@ -265,6 +277,10 @@ export async function generateImage({
     // Thinking is billed by default on 3.x models — ask for none. Models that
     // can't disable it (e.g. pro) reject once, then the field is dropped.
     const thinkActive = !strippedOptional && activeModel.startsWith('gemini-3') && !fieldRejected(activeModel, 'thinkingConfig');
+    // Not every model honors every aspect ratio (e.g. the 2.5 fallback hard-rejects
+    // an 8:1 sheet strip instead of silently ignoring it) — drop it and let the
+    // model serve its default; callers that slice a grid already tolerate that.
+    const aspectActive = !strippedOptional && aspectRatio && !fieldRejected(activeModel, 'aspectRatio');
     try {
       response = await withTimeout(
         ai.models.generateContent({
@@ -272,7 +288,7 @@ export async function generateImage({
           contents,
           config: {
             responseModalities: ['IMAGE'],
-            imageConfig: { aspectRatio, ...(sizeActive ? { imageSize } : {}) },
+            imageConfig: { ...(aspectActive ? { aspectRatio } : {}), ...(sizeActive ? { imageSize } : {}) },
             ...(thinkActive ? { thinkingConfig: { thinkingBudget: 0 } } : {})
           }
         }),
@@ -281,9 +297,11 @@ export async function generateImage({
       );
       if (strippedOptional) {
         // The bare retry worked, so the optional fields were the problem. Caching
-        // both over-caches at worst (loses suppression/sizing, never a generation).
+        // all three over-caches at worst (loses suppression/sizing/ratio, never a
+        // generation).
         rememberRejectedField(activeModel, 'thinkingConfig');
         rememberRejectedField(activeModel, 'imageSize');
+        rememberRejectedField(activeModel, 'aspectRatio');
       }
       break;
     } catch (err) {
@@ -295,7 +313,11 @@ export async function generateImage({
         rememberRejectedField(activeModel, 'imageSize');
         continue;
       }
-      if ((err?.status ?? err?.code) === 400 && (thinkActive || sizeActive)) {
+      if (aspectActive && isFieldRejectionError(err, 'aspectRatio')) {
+        rememberRejectedField(activeModel, 'aspectRatio');
+        continue;
+      }
+      if ((err?.status ?? err?.code) === 400 && (thinkActive || sizeActive || aspectActive)) {
         strippedOptional = true;
         continue;
       }

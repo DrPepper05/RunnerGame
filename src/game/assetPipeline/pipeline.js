@@ -128,6 +128,10 @@ async function generateSlotImage(slot, prompt, seed, onProgress, maxAttemptsPerP
         if (err.kind !== 'safety') runState.skipGemini = true;
         break;
       }
+      // A rejected param/prompt won't succeed on retry either, but it's scoped to
+      // THIS slot's request — unlike auth/quota, it says nothing about whether
+      // Gemini can serve the REST of the run, so skipGemini must stay untouched.
+      if (err.kind === 'invalid-request') break;
       if (err.kind === 'quota') {
         // A long/absent retry window means daily or zero quota — dead for this run
         if (!err.retryDelayMs || err.retryDelayMs > 10000) {
