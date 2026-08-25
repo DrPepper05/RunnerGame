@@ -61,6 +61,28 @@ registerLayerReplayDeps({
 });
 
 /**
+ * Resolve the gen spec (model + imageSize) a slot actually calls Gemini with.
+ * Precedence: an explicit PM_MODEL_PLAYER/PM_MODEL_SHEET probe override always
+ * wins (A/B testing must work even in demo mode) > demo mode forces the pro-tier
+ * model (and bumps imageSize to '2K' only for slots that already declare a size
+ * hint — forcing one onto a slot that never asked for it just triggers a noisy,
+ * pointless field-rejection retry) > the spec's own default.
+ */
+function resolveGenSpec(spec, slot, runState) {
+  const override = runState.modelOverrides?.[slot];
+  if (override) return { ...spec, gen: { ...spec.gen, model: override } };
+  if (!runState.demoMode) return spec;
+  return {
+    ...spec,
+    gen: {
+      ...spec.gen,
+      model: GEMINI_PRO_SHEET_MODEL,
+      imageSize: spec.gen.imageSize ? '2K' : spec.gen.imageSize
+    }
+  };
+}
+
+/**
  * Generate one slot's raw image on Gemini (the only image provider).
  * `runState.skipGemini` is shared across a run: once one slot hits a hard failure
  * (dead quota, bad key), the remaining slots fail fast instead of each burning
@@ -346,14 +368,25 @@ export async function generateAssets({
   //   silently — and when the combined props call is skipped the coin and a
   //   parallax layer were being DROPPED for budget. Worst case ≈ $1 at flat
   //   lite prices; normal runs are nowhere near it. PM_MAX_GEMINI_CALLS overrides.
+  // - demoMode (PM_DEMO_MODE, UI-exposed in ScreenZero as "🎬 Demo mode") is the
+  //   inverse of the cost defaults: force the priciest model tier on EVERY slot
+  //   (resolveGenSpec above) instead of the cheapest, targeting ≈$1+/game per the
+  //   worst-case math above (a normal ~7-8 call run at pro pricing alone already
+  //   lands there). It implies qualityMode (same rescue ladder, and — critically —
+  //   the props-grid batch call turns off so every prop gets its own full-quality
+  //   call) and raises the default budget so THAT extra call volume, now on more
+  //   expensive calls, doesn't re-trigger the same starvation the 12→22 bump fixed.
+  const demoMode = localStorage.getItem('PM_DEMO_MODE') === '1';
   const runState = {
     skipGemini: false,
-    qualityMode: localStorage.getItem('PM_QUALITY_MODE') === '1',
+    demoMode,
+    qualityMode: demoMode || localStorage.getItem('PM_QUALITY_MODE') === '1',
     imageCalls: 0,
-    maxImageCalls: parseInt(localStorage.getItem('PM_MAX_GEMINI_CALLS'), 10) || 22,
+    maxImageCalls: parseInt(localStorage.getItem('PM_MAX_GEMINI_CALLS'), 10) || (demoMode ? 32 : 22),
     // Probe/experiment knobs (A/B protocol): override the image model for the
     // static player / the sheet without touching slotSpecs. Normal runs leave
-    // them unset; a passed probe flips the slotSpecs default instead.
+    // them unset; a passed probe flips the slotSpecs default instead. Wins over
+    // demoMode too — a probe should behave the same whether demo mode is on.
     modelOverrides: {
       player: localStorage.getItem('PM_MODEL_PLAYER') || null,
       player_sheet: localStorage.getItem('PM_MODEL_SHEET') || null
@@ -514,13 +547,12 @@ export async function generateAssets({
     await runSlot(spec.fallbackSlot);
     const baseSrc = preloadedImages[spec.fallbackSlot]?.src || null;
 
-    let activeSpec = spec;
+    // Probe override / demo mode (pro model + 2K) > quality mode's 2K-only bump > spec default.
+    let activeSpec = resolveGenSpec(spec, slot, runState);
     // Quality mode pays for the 2K supersampled sheet; the default is the spec's 1K.
+    // (No-op when resolveGenSpec already bumped it to 2K under demo mode.)
     if (runState.qualityMode && activeSpec.gen?.imageSize) {
       activeSpec = { ...activeSpec, gen: { ...activeSpec.gen, imageSize: '2K' } };
-    }
-    if (runState.modelOverrides?.player_sheet) {
-      activeSpec = { ...activeSpec, gen: { ...activeSpec.gen, model: runState.modelOverrides.player_sheet } };
     }
 
     report(`[ASSETS] Generating animated ${spec.outputKey || slot}...`);
@@ -1072,10 +1104,12 @@ export async function generateAssets({
     if (!prompt) throw new Error(`No prompt provided for asset slot "${slot}".`);
     const spec = SLOT_SPECS[slot];
     if (spec.frames) return runSheetSlot(slot, spec, prompt);
-    // Probe override (PM_MODEL_PLAYER): swap the generation model for this slot
-    // only — post-processing/QA read the unchanged contract fields.
-    const override = runState.modelOverrides?.[slot];
-    const genSpec = override ? { ...spec, gen: { ...spec.gen, model: override } } : null;
+    // Probe override (PM_MODEL_PLAYER) / demo mode (pro tier on every slot): swap
+    // the generation model+size for this slot only — post-processing/QA read the
+    // unchanged contract fields. resolveGenSpec returns `spec` itself when neither
+    // applies, so genSpec stays null and generateSlotImage falls back to SLOT_SPECS.
+    const resolved = resolveGenSpec(spec, slot, runState);
+    const genSpec = resolved !== spec ? resolved : null;
     report(`[ASSETS] Generating ${slot}...`);
     const onAttempt = attemptTicker(slot);
     try {
@@ -1332,8 +1366,9 @@ function planPropsGrid(slots, design, namedBySlot, onProgress) {
   // only visible in the live terminal and got lost with the tab).
   const skip = (why) => { design.propsGridStatus = `skipped: ${why}`; return null; };
   if (localStorage.getItem('PM_GRID_PROPS') === '0') return skip('PM_GRID_PROPS kill switch');
-  // Quality mode pays for individual calls + rescue rungs — never gridded.
-  if (localStorage.getItem('PM_QUALITY_MODE') === '1') return skip('quality mode');
+  // Quality mode (and demo mode, which implies it) pays for individual calls +
+  // rescue rungs, each on its own full-quality call — never gridded.
+  if (localStorage.getItem('PM_QUALITY_MODE') === '1' || localStorage.getItem('PM_DEMO_MODE') === '1') return skip('quality mode');
   const gridSlots = PROPS_GRID_SPEC.cellOrder.filter((s) => slots.includes(s));
   if (gridSlots.length < 3) return skip(`only ${gridSlots.length} grid-able slot(s) in this run`);
   const plan = buildPropsGridPrompt(gridSlots, design.subjects, design.styleGuide, namedBySlot);

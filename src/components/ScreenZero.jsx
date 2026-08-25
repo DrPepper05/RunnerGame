@@ -142,13 +142,60 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
   const [cacheOnly, setCacheOnly] = useState(() => {
     try { return localStorage.getItem('PM_FORCE_CACHE') === '1'; } catch { return false; }
   });
+  // "Force fresh" (persisted): the opposite knob — skip the cache lookup AND the
+  // matcher and generate brand-new art. Mutually exclusive with Cache only.
+  const [forceFresh, setForceFresh] = useState(() => {
+    try { return localStorage.getItem('PM_FORCE_FRESH') === '1'; } catch { return false; }
+  });
   const toggleCacheOnly = () => {
     setCacheOnly((prev) => {
       const next = !prev;
       try {
-        if (next) localStorage.setItem('PM_FORCE_CACHE', '1');
+        if (next) { localStorage.setItem('PM_FORCE_CACHE', '1'); localStorage.removeItem('PM_FORCE_FRESH'); localStorage.removeItem('PM_DEMO_MODE'); }
         else localStorage.removeItem('PM_FORCE_CACHE');
       } catch { /* private mode — session-only toggle */ }
+      if (next) { setForceFresh(false); setDemoMode(false); }
+      return next;
+    });
+  };
+  const toggleForceFresh = () => {
+    setForceFresh((prev) => {
+      const next = !prev;
+      try {
+        if (next) { localStorage.setItem('PM_FORCE_FRESH', '1'); localStorage.removeItem('PM_FORCE_CACHE'); }
+        else localStorage.removeItem('PM_FORCE_FRESH');
+      } catch { /* private mode — session-only toggle */ }
+      if (next) setCacheOnly(false);
+      return next;
+    });
+  };
+  // "Demo mode" (persisted): developer switch for showcase asset generation —
+  // forces the top-tier Gemini model on every slot (pipeline.js's
+  // runState.demoMode), targeting ≈$1+/game instead of the ~$0.33 cost default.
+  // Implies Force fresh (a demo run must always generate new art, never reuse a
+  // cheap-tier cache hit) and clears Cache only (spending and refusing to spend
+  // are contradictory). Gated behind a confirm on the ON transition only — it's
+  // real, non-trivial money per click.
+  const [demoMode, setDemoMode] = useState(() => {
+    try { return localStorage.getItem('PM_DEMO_MODE') === '1'; } catch { return false; }
+  });
+  const toggleDemoMode = () => {
+    if (!demoMode) {
+      const ok = window.confirm('Demo mode generates every asset on the top-tier Gemini model — expect roughly $1+ per game. Continue?');
+      if (!ok) return;
+    }
+    setDemoMode((prev) => {
+      const next = !prev;
+      try {
+        if (next) localStorage.setItem('PM_DEMO_MODE', '1');
+        else localStorage.removeItem('PM_DEMO_MODE');
+      } catch { /* private mode — session-only toggle */ }
+      if (next) {
+        setCacheOnly(false);
+        try { localStorage.removeItem('PM_FORCE_CACHE'); } catch { /* private mode */ }
+        setForceFresh(true);
+        try { localStorage.setItem('PM_FORCE_FRESH', '1'); } catch { /* private mode */ }
+      }
       return next;
     });
   };
@@ -689,6 +736,38 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
           }}
         >
           💾 Cache only{cacheOnly ? ' ✓' : ''}
+        </button>
+        <button
+          onClick={toggleForceFresh}
+          disabled={isGenerating}
+          title={'Force fresh: skip the cache and the matcher and generate brand-new art for this prompt (full cost). The result is still cached afterwards.'}
+          style={{
+            height: '32px', padding: '0 10px', borderRadius: '8px',
+            fontSize: '12px', fontWeight: 700, cursor: 'pointer',
+            display: 'flex', alignItems: 'center', gap: '5px',
+            backdropFilter: 'blur(8px)',
+            ...(forceFresh
+              ? { background: 'rgba(255, 170, 60, 0.15)', border: '1px solid var(--pm-accent-orange, #ffaa3c)', color: 'var(--pm-accent-orange, #ffaa3c)' }
+              : { background: 'rgba(255,255,255,0.08)', border: '1px solid rgba(255,255,255,0.15)', color: 'rgba(255,255,255,0.6)' })
+          }}
+        >
+          ✨ Force fresh{forceFresh ? ' ✓' : ''}
+        </button>
+        <button
+          onClick={toggleDemoMode}
+          disabled={isGenerating}
+          title={'Demo mode: generate every asset on the top-tier Gemini model for showcase-quality art. Expect ≈$1+ per game. Forces fresh generation.'}
+          style={{
+            height: '32px', padding: '0 10px', borderRadius: '8px',
+            fontSize: '12px', fontWeight: 700, cursor: 'pointer',
+            display: 'flex', alignItems: 'center', gap: '5px',
+            backdropFilter: 'blur(8px)',
+            ...(demoMode
+              ? { background: 'rgba(255, 60, 180, 0.15)', border: '1px solid var(--pm-accent-pink, #ff3cb4)', color: 'var(--pm-accent-pink, #ff3cb4)' }
+              : { background: 'rgba(255,255,255,0.08)', border: '1px solid rgba(255,255,255,0.15)', color: 'rgba(255,255,255,0.6)' })
+          }}
+        >
+          🎬 Demo mode{demoMode ? ' ✓' : ''}
         </button>
         {HAS_ENV_GEMINI_KEY ? (
               <button

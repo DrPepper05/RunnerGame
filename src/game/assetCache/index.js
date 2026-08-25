@@ -29,6 +29,32 @@ const readQualityMode = () => {
   }
 };
 
+// "Demo mode" toggle (ScreenZero top-right, persisted): forces the top-tier
+// Gemini model on every slot for showcase-quality art (~$1+/game, see
+// pipeline.js's runState.demoMode). Implies quality mode's rescue ladder.
+const readDemoMode = () => {
+  try {
+    return localStorage.getItem('PM_DEMO_MODE') === '1';
+  } catch {
+    return false;
+  }
+};
+
+// Cache-key quality tier: demo-tier art must never be silently handed to a
+// normal or quality-mode lookup (it costs far more to produce), and vice versa.
+const qualityTier = () => (readDemoMode() ? 'q2' : readQualityMode() ? 'q1' : 'q0');
+
+// "Force fresh" toggle (ScreenZero top-right, persisted): skip the exact-match
+// AND matcher tiers and generate new art. The result is still persisted, so the
+// same prompt later exact-hits as usual. Demo mode forces this on too.
+const readForceFresh = () => {
+  try {
+    return localStorage.getItem('PM_FORCE_FRESH') === '1';
+  } catch {
+    return false;
+  }
+};
+
 // "Cache only" toggle (ScreenZero top-right, persisted): hard no-image-spend
 // mode — matched cache art or built-in theme art, never a fresh image run.
 const readCacheOnly = () => {
@@ -39,16 +65,17 @@ const readCacheOnly = () => {
   }
 };
 
-// Exact-match identity of a generatable game. Quality mode is part of the key
-// on purpose: a quality-mode run must never silently reuse cheap-mode art.
+// Exact-match identity of a generatable game. The quality tier is part of the
+// key on purpose: a quality-mode or demo-mode run must never silently reuse
+// cheap-mode art (or the reverse — a cheap run reusing $1 demo art unasked).
 export const makePromptKey = (prompt, gameType) =>
-  `v1|${gameType || 'standard'}|${readQualityMode() ? 'q1' : 'q0'}|` +
+  `v1|${gameType || 'standard'}|${qualityTier()}|` +
   String(prompt || '').trim().toLowerCase().replace(/\s+/g, ' ');
 
 // Presets key on the mode only — difficulty is re-randomized on every hit
 // (only the art is reused), so it must not fragment the key.
 export const makePresetKey = (mode) =>
-  `v1|preset:${mode}|${readQualityMode() ? 'q1' : 'q0'}|`;
+  `v1|preset:${mode}|${qualityTier()}|`;
 
 const cancelledError = () =>
   Object.assign(new Error('generation cancelled'), { cancelled: true });
@@ -381,6 +408,15 @@ async function tryMatchedReuse({ config, userPrompt, promptKey, onProgress, canc
 export async function generateOrRestoreAssets({ config, userPrompt = '', promptKey = null, onProgress, cancelToken }) {
   const t0 = performance.now();
   const cacheOnly = readCacheOnly();
+
+  // Force fresh (or demo mode, which forces it too — showcase art must never be a
+  // silent cache reuse): straight to generation, no lookup, no matcher. Persists
+  // normally, so an identical demo-mode prompt later exact-hits its own q2 entry.
+  if (!cacheOnly && (readForceFresh() || readDemoMode())) {
+    onProgress?.('[CACHE] Force fresh is ON — skipping cache lookup and matching; generating new art for this prompt.', null);
+    timeAnnotate({ forcedFresh: true });
+    return generateAndCache({ config, userPrompt, promptKey, onProgress, cancelToken, t0 });
+  }
 
   // Tier 1 — exact prompt match: instant whole-set restore, exactly $0.
   if (promptKey) {
