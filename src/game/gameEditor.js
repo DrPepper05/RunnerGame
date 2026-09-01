@@ -36,7 +36,14 @@ const EDITABLE_FIELDS = {
   actionProjectileEnabled: { bool: true, label: 'platformer ranged attack on/off' },
   worldWidth: { min: 2000, max: 12000, int: true, label: 'platformer level length (px)' },
   coinValue: { min: 0, max: 500, int: true, label: 'points per collected coin' },
-  gameName: { str: true, maxLen: 60, label: 'display title' }
+  gameName: { str: true, maxLen: 60, label: 'display title' },
+  shooterMoveSpeed: { min: 100, max: 500, label: 'shooter player move speed (px/s)' },
+  shooterFireRate: { min: 150, max: 1500, int: true, label: 'shooter ms between auto-fired shots (lower = faster)' },
+  shooterProjectileSpeed: { min: 200, max: 900, label: 'shooter projectile speed' },
+  shooterFireRange: { min: 150, max: 800, label: 'shooter auto-fire range (px)' },
+  shooterEnemySpeed: { min: 40, max: 400, label: 'shooter enemy chase speed' },
+  shooterWaveCount: { min: 1, max: 20, int: true, label: 'shooter number of waves' },
+  shooterEnemiesPerWave: { min: 1, max: 20, int: true, label: 'shooter enemies per wave' }
 };
 
 // Friendly element name → pipeline slot list. 'player' maps to the sheet slot —
@@ -57,8 +64,9 @@ const ASSET_TARGET_SLOTS = {
 /** Map restyle target names to a deduped pipeline slot list for this config. */
 export function resolveAssetTargets(targets, config) {
   const isPlatformer = config?.gameType === 'platformer';
+  const isShooter = config?.gameType === 'shooter';
   const allSlots = GENERATED_SLOTS.map(s => (s === 'player' ? 'player_sheet' : s));
-  if (isPlatformer) allSlots.push('projectile');
+  if (isPlatformer || isShooter) allSlots.push('projectile');
   allSlots.push('collectible');
   const slots = new Set();
   for (const target of targets || []) {
@@ -67,7 +75,7 @@ export function resolveAssetTargets(targets, config) {
       continue;
     }
     for (const slot of ASSET_TARGET_SLOTS[target] || []) {
-      if (slot === 'projectile' && !isPlatformer) continue; // runners never shoot
+      if (slot === 'projectile' && !isPlatformer && !isShooter) continue; // runners never shoot
       slots.add(slot);
     }
   }
@@ -103,7 +111,14 @@ const EDITOR_RESPONSE_SCHEMA = {
         actionProjectileEnabled: { type: 'BOOLEAN' },
         worldWidth: { type: 'NUMBER' },
         coinValue: { type: 'NUMBER' },
-        gameName: { type: 'STRING' }
+        gameName: { type: 'STRING' },
+        shooterMoveSpeed: { type: 'NUMBER' },
+        shooterFireRate: { type: 'NUMBER' },
+        shooterProjectileSpeed: { type: 'NUMBER' },
+        shooterFireRange: { type: 'NUMBER' },
+        shooterEnemySpeed: { type: 'NUMBER' },
+        shooterWaveCount: { type: 'NUMBER' },
+        shooterEnemiesPerWave: { type: 'NUMBER' }
       }
     }
   },
@@ -158,7 +173,7 @@ async function geminiInterpret(config, instruction) {
     'Decide the intent: "tweak" (only the variables below change), "restyle" (some or all',
     'artwork of the CURRENT game is redrawn), or "regenerate" (a completely different game).',
     '',
-    `Current game type: ${config?.gameType || 'runner'} (runner fields only matter for runner, action* fields only for platformer).`,
+    `Current game type: ${config?.gameType || 'runner'} (runner fields only matter for runner, action* fields only for platformer, shooter* fields only for the shooter arena).`,
     `Current values: ${JSON.stringify(currentValues(config))}`,
     '',
     'Editable variables:',
@@ -170,7 +185,7 @@ async function geminiInterpret(config, instruction) {
     '- Art requests naming specific elements ("change the foreground", "make the enemy a robot") are "restyle" with assetTargets listing ONLY the affected elements.',
     '- Re-theming the whole look ("turn this into a lava world", "make it spooky") is "restyle" with assetTargets ["all"]; if the theme suggests a new title, also set gameName in changes.',
     '- Only a completely different game concept or new gameplay rules is "regenerate".',
-    '- The game mode CANNOT be changed here. For mode-switch requests ("make this a runner", "turn it into a platformer") return "tweak" with NO changes and a summary explaining the mode can only be chosen when starting a new game.',
+    '- The game mode CANNOT be changed here. For mode-switch requests ("make this a runner", "turn it into a platformer", "turn it into a shooter arena") return "tweak" with NO changes and a summary explaining the mode can only be chosen when starting a new game.',
     '- For tweak, put ONLY the changed fields in `changes` with their new absolute values.',
     '',
     `Player instruction: "${instruction}"`
@@ -207,9 +222,10 @@ function localInterpret(config, instruction) {
   // politely instead of falling through to a full regeneration. Tight match:
   // "make the player run faster" must NOT trip this ("runner"/"platformer" only),
   // and asking for the mode the game already is in is a no-op, not a switch.
-  const modeMatch = text.match(/\b(?:switch|change|turn|convert|make|swap)\b[^.!?]*\b(runner|platformer|action\s*quest)\b/);
+  const modeMatch = text.match(/\b(?:switch|change|turn|convert|make|swap)\b[^.!?]*\b(runner|platformer|action\s*quest|shooter(?:\s*arena)?)\b/);
   if (modeMatch) {
-    const requested = modeMatch[1] === 'runner' ? 'runner' : 'platformer';
+    const MODE_NAME_TO_GAME_TYPE = { runner: 'runner', platformer: 'platformer', 'action quest': 'platformer' };
+    const requested = MODE_NAME_TO_GAME_TYPE[modeMatch[1].replace(/\s+/g, ' ')] || 'shooter';
     if (requested !== (config?.gameType || 'runner')) {
       return {
         intent: 'tweak',

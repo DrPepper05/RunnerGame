@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48">
+  <!-- Top-down placeholder player for Shooter Arena's static/keyless path.
+       Authored FACING RIGHT: ShooterMode sets sprite.rotation to the travel/fire
+       angle, where 0 rad points along +x. -->
+  <polygon points="46,24 8,6 17,24 8,42" fill="#2dd4bf" stroke="#0f766e" stroke-width="3" stroke-linejoin="round"/>
+  <circle cx="23" cy="24" r="5.5" fill="#ecfeff" stroke="#0f766e" stroke-width="2"/>
+</svg>

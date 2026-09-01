@@ -71,6 +71,8 @@ const MobileControls = ({ gameType, themeKey, projectilesEnabled }) => {
       if (e.touches.length === 0) {
         triggerInput('left', 'up');
         triggerInput('right', 'up');
+        triggerInput('up', 'up');
+        triggerInput('down', 'up');
       }
     };
     window.addEventListener('touchend', handleGlobalTouchEnd);
@@ -88,7 +90,7 @@ const MobileControls = ({ gameType, themeKey, projectilesEnabled }) => {
 
   return (
     <div className="pm-mobile-overlay" style={cssVariables} ref={overlayRef}>
-      {/* 1. Left D-Pad Cluster (only active in platformer mode) */}
+      {/* 1. Left D-Pad Cluster (platformer: left/right; shooter: 4-direction cross) */}
       {gameType === 'platformer' ? (
         <div className="pm-mobile-dpad" ref={dpadRef} onPointerDown={(e) => e.stopPropagation()} onPointerUp={(e) => e.stopPropagation()}>
           <button
@@ -105,7 +107,7 @@ const MobileControls = ({ gameType, themeKey, projectilesEnabled }) => {
               <path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/>
             </svg>
           </button>
-          
+
           <button
             className="pm-touch-btn"
             onTouchStart={(e) => handleTouchStart('right', e)}
@@ -119,6 +121,57 @@ const MobileControls = ({ gameType, themeKey, projectilesEnabled }) => {
             <svg viewBox="0 0 24 24">
               <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/>
             </svg>
+          </button>
+        </div>
+      ) : gameType === 'shooter' ? (
+        <div className="pm-mobile-dpad-cross" ref={dpadRef} onPointerDown={(e) => e.stopPropagation()} onPointerUp={(e) => e.stopPropagation()}>
+          <button
+            className="pm-touch-btn pm-touch-btn--up"
+            onTouchStart={(e) => handleTouchStart('up', e)}
+            onTouchEnd={(e) => handleTouchEnd('up', e)}
+            onTouchCancel={(e) => handleTouchEnd('up', e)}
+            onMouseDown={() => triggerInput('up', 'down')}
+            onMouseUp={() => triggerInput('up', 'up')}
+            onMouseLeave={() => triggerInput('up', 'up')}
+            aria-label="Move Up"
+          >
+            <svg viewBox="0 0 24 24"><path d="M4 12l1.41 1.41L11 7.83V20h2V7.83l5.58 5.59L20 12l-8-8-8 8z"/></svg>
+          </button>
+          <button
+            className="pm-touch-btn pm-touch-btn--left"
+            onTouchStart={(e) => handleTouchStart('left', e)}
+            onTouchEnd={(e) => handleTouchEnd('left', e)}
+            onTouchCancel={(e) => handleTouchEnd('left', e)}
+            onMouseDown={() => triggerInput('left', 'down')}
+            onMouseUp={() => triggerInput('left', 'up')}
+            onMouseLeave={() => triggerInput('left', 'up')}
+            aria-label="Move Left"
+          >
+            <svg viewBox="0 0 24 24"><path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>
+          </button>
+          <button
+            className="pm-touch-btn pm-touch-btn--right"
+            onTouchStart={(e) => handleTouchStart('right', e)}
+            onTouchEnd={(e) => handleTouchEnd('right', e)}
+            onTouchCancel={(e) => handleTouchEnd('right', e)}
+            onMouseDown={() => triggerInput('right', 'down')}
+            onMouseUp={() => triggerInput('right', 'up')}
+            onMouseLeave={() => triggerInput('right', 'up')}
+            aria-label="Move Right"
+          >
+            <svg viewBox="0 0 24 24"><path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg>
+          </button>
+          <button
+            className="pm-touch-btn pm-touch-btn--down"
+            onTouchStart={(e) => handleTouchStart('down', e)}
+            onTouchEnd={(e) => handleTouchEnd('down', e)}
+            onTouchCancel={(e) => handleTouchEnd('down', e)}
+            onMouseDown={() => triggerInput('down', 'down')}
+            onMouseUp={() => triggerInput('down', 'up')}
+            onMouseLeave={() => triggerInput('down', 'up')}
+            aria-label="Move Down"
+          >
+            <svg viewBox="0 0 24 24"><path d="M20 12l-1.41-1.41L13 16.17V4h-2v12.17l-5.58-5.59L4 12l8 8 8-8z"/></svg>
           </button>
         </div>
       ) : (
@@ -173,6 +226,20 @@ const MobileControls = ({ gameType, themeKey, projectilesEnabled }) => {
               </svg>
             </button>
           </div>
+        ) : gameType === 'shooter' ? (
+          <button
+            className="pm-touch-btn pm-touch-btn--jump"
+            onTouchStart={(e) => handleTouchStart('shoot', e)}
+            onTouchEnd={(e) => handleTouchEnd('shoot', e)}
+            onMouseDown={() => triggerInput('shoot', 'down')}
+            aria-label="Fire"
+          >
+            <svg viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="2" fill="none"/>
+              <circle cx="12" cy="12" r="3" fill="currentColor"/>
+              <path d="M12 2v4M12 18v4M2 12h4M18 12h4" stroke="currentColor" strokeWidth="2"/>
+            </svg>
+          </button>
         ) : (
           /* Runner Mode action cluster: simple jump button */
           <button

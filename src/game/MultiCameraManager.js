@@ -119,10 +119,13 @@ export default class MultiCameraManager {
       camera.centerOn(worldWidth / 2, worldHeight / 2);
     }
 
-    // Set scale zoom factor to fully fit the action screen space on smaller displays
+    // COVER zoom (max of the two ratios), never fit: a fit zoom displays a
+    // region wider/taller than the arena, and Phaser's bounds clamp then shows
+    // raw background beyond the world edge. The 0.5 floor keeps huge arenas
+    // readable on small screens (the camera follows the player instead).
     const zoomX = width / worldWidth;
     const zoomY = height / worldHeight;
-    const zoomRatio = Math.max(0.5, Math.min(zoomX, zoomY, 1.25));
+    const zoomRatio = Math.max(zoomX, zoomY, 0.5);
     camera.setZoom(zoomRatio);
   }
 
@@ -156,11 +159,12 @@ export default class MultiCameraManager {
       const worldHeight = this.scene.gameConfig.worldHeight || 1500;
       camera.setBounds(0, 0, worldWidth, worldHeight);
       
+      // Cover zoom — must match configureFixedArena (see comment there).
       const zoomX = width / worldWidth;
       const zoomY = height / worldHeight;
-      const zoomRatio = Math.max(0.5, Math.min(zoomX, zoomY, 1.25));
+      const zoomRatio = Math.max(zoomX, zoomY, 0.5);
       camera.setZoom(zoomRatio);
-      
+
       if (this.target) {
         camera.centerOn(this.target.x, this.target.y);
       } else {

@@ -473,6 +473,22 @@ canvas {
   align-items: center;
 }
 
+/* Shooter Arena's 4-direction movement cross — up/down/left/right around an
+   empty center cell, reusing .pm-touch-btn styling for visual consistency
+   with the other modes' buttons. */
+.pm-mobile-dpad-cross {
+  pointer-events: auto;
+  display: grid;
+  grid-template-columns: repeat(3, var(--pm-btn));
+  grid-template-rows: repeat(3, var(--pm-btn));
+  gap: calc(var(--pm-btn-gap) * 0.5);
+}
+
+.pm-mobile-dpad-cross .pm-touch-btn--up { grid-column: 2; grid-row: 1; }
+.pm-mobile-dpad-cross .pm-touch-btn--left { grid-column: 1; grid-row: 2; }
+.pm-mobile-dpad-cross .pm-touch-btn--right { grid-column: 3; grid-row: 2; }
+.pm-mobile-dpad-cross .pm-touch-btn--down { grid-column: 2; grid-row: 3; }
+
 /* Glassmorphic touch buttons, sized from the custom properties above. */
 .pm-touch-btn {
   -webkit-tap-highlight-color: transparent;

@@ -21,6 +21,7 @@ const THEMES = {
     platforms: 'ice platform block, frozen ledge, crystalline structure',
     playerPlatformer: 'arctic warrior with fur coat, ice sword, blue armor',
     playerRunner: 'winter athlete runner, cold weather gear, athletic build',
+    playerShooter: 'arctic tactical operative, frost-plated suit, ice rifle',
     enemy: 'ice golem monster, frozen yeti creature, frost elemental',
     hazards: 'ice spikes, frozen stalactites, sharp icicles',
     collectibles: 'gold coin with a frosty blue rim',
@@ -34,6 +35,7 @@ const THEMES = {
     platforms: 'volcanic rock platform, obsidian ledge, basalt block',
     playerPlatformer: 'fire knight with flaming sword, heat-resistant armor',
     playerRunner: 'heat runner with protective suit, athletic stance',
+    playerShooter: 'fireproof tactical operative, molten-plated gear, heat rifle',
     enemy: 'lava golem, fire demon, magma elemental creature',
     hazards: 'lava pit, fire geyser, molten rock spike',
     collectibles: 'gold coin with a molten ember glow',
@@ -47,6 +49,7 @@ const THEMES = {
     platforms: 'wooden log platform, tree branch, moss-covered stone',
     playerPlatformer: 'forest ranger with bow and arrow, green cloak',
     playerRunner: 'nature runner, athletic explorer, green outfit',
+    playerShooter: 'forest scout operative, camouflage gear, dart rifle',
     enemy: 'forest wolf, giant spider, evil tree creature',
     hazards: 'thorn bush, poison plant, falling branch',
     collectibles: 'gold coin wreathed in tiny green leaves',
@@ -60,6 +63,7 @@ const THEMES = {
     platforms: 'metal scaffold, concrete ledge, building rooftop',
     playerPlatformer: 'urban ninja with tech gear, cyberpunk outfit',
     playerRunner: 'parkour runner, urban athlete, street clothes',
+    playerShooter: 'urban tactical operative, armored vest, SMG',
     enemy: 'security robot, street thug, drone enemy',
     hazards: 'electrical barrier, steam vent, construction hazard',
     collectibles: 'holographic gold credit coin',
@@ -73,6 +77,7 @@ const THEMES = {
     platforms: 'floating space platform, asteroid chunk, metal beam',
     playerPlatformer: 'space marine with laser rifle, powered armor',
     playerRunner: 'astronaut runner, space suit, jetpack',
+    playerShooter: 'space marine operative, powered exosuit, plasma rifle',
     enemy: 'alien creature, space pirate, robot sentinel',
     hazards: 'laser barrier, meteor, energy field',
     collectibles: 'glowing golden energy coin',
@@ -151,7 +156,9 @@ function customDirectionsFromPrompt(promptText, gameType) {
     .slice(0, 140) || promptText.trim().slice(0, 140);
   const player = gameType === 'platformer'
     ? `the armed hero character of "${subject}"`
-    : `the athletic running hero of "${subject}"`;
+    : gameType === 'shooter'
+      ? `the tactical top-down hero of "${subject}"`
+      : `the athletic running hero of "${subject}"`;
   // User-named entities become the HEAD of the subject phrase: image models
   // weight the head noun, so "a menacing skeleton enemy, styled to match …" wins
   // where the old phrasing (head noun "enemy creature", the player's word buried
@@ -200,7 +207,9 @@ export function generateAssetDirections(theme, secondaryTheme, promptText, gameT
     return custom;
   }
   const themeData = THEMES[theme] || THEMES.forest;
-  const player = gameType === 'platformer' ? themeData.playerPlatformer : themeData.playerRunner;
+  const player = gameType === 'platformer' ? themeData.playerPlatformer
+    : gameType === 'shooter' ? themeData.playerShooter
+    : themeData.playerRunner;
 
   const finalData = { ...themeData, player };
   if (secondaryTheme && secondaryTheme !== theme && THEMES[secondaryTheme]) {
@@ -280,7 +289,9 @@ const DESIGNER_RESPONSE_SCHEMA = {
 function buildDesignerPrompt(userPrompt, gameType, entities = {}) {
   const modeDesc = gameType === 'platformer'
     ? 'a 2D side-scrolling action platformer'
-    : 'a 2D side-scrolling endless runner';
+    : gameType === 'shooter'
+      ? 'a 2D top-down twin-stick-style arena shooter'
+      : 'a 2D side-scrolling endless runner';
   const must = (entity, article = 'a') =>
     entity ? ` — the player explicitly asked for: ${entity}. It MUST be ${article} ${entity}` : '';
   const anyNamed = !!(entities.enemy || entities.hazard || entities.collectible);
@@ -439,7 +450,7 @@ function localTaxonomy({ gameType, themeKey, entities = {} }) {
   if (entities.enemy) ents.enemy = normNoun(entities.enemy);
   if (entities.hazard) ents.obstacle = normNoun(entities.hazard);
   if (entities.collectible) ents.collectible = normNoun(entities.collectible);
-  const tags = [gameType === 'platformer' ? 'platformer' : 'runner'];
+  const tags = [gameType === 'platformer' ? 'platformer' : gameType === 'shooter' ? 'shooter' : 'runner'];
   if (themeKey) tags.push(themeKey);
   return { entities: ents, tags };
 }
@@ -581,14 +592,14 @@ const styleBase = (styleGuide) =>
   `${styleGuide.styleSummary}, rendered as a SNES-era 16-bit video game sprite: ` +
   `limited color palette, hard pixel edges, no anti-aliasing, flat shading, bold readable shapes`;
 
-export function buildFinalPrompt(slotKey, subjects, styleGuide, { userNamed = false } = {}) {
+export function buildFinalPrompt(slotKey, subjects, styleGuide, { userNamed = false, gameType = null } = {}) {
   const spec = SLOT_SPECS[slotKey];
   const subject = subjects[slotKey] ?? (spec.subjectKey ? subjects[spec.subjectKey] : undefined);
   const style = `${styleBase(styleGuide)}, ${slotStyleClauses(slotKey, styleGuide, { userNamed })}`;
   const chroma = KEYED_SPRITE_SLOTS.has(slotKey)
     ? pickChromaColor(`${subject || ''} ${style}`)
     : null;
-  return spec.scaffold(subject, style, { chroma });
+  return spec.scaffold(subject, style, { chroma, gameType });
 }
 
 /**

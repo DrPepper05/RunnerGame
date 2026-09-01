@@ -21,6 +21,17 @@ import { mark as timeMark, annotate as timeAnnotate } from '../metrics.js';
 
 const SCHEMA_VERSION = 1;
 
+// Redraw economics for the matcher's partial-reuse verdicts (tryMatchedReuse).
+// Weights ≈ image calls the individual redraw path spends per slot: a player
+// redraw rides the full static-base + animated-sheet ladder (~3 calls), every
+// other slot is one call. A fresh set is ~8 calls, so redraws are accepted while
+// they stay under ~60% of that. WORLD_SLOTS guard the semantic (not economic)
+// boundary: a match whose backdrop largely clashes is a different world — fresh
+// generation gives better coherence than restyling the scenery around a match.
+const WORLD_SLOTS = ['background_far', 'background_mid', 'background_near', 'floor'];
+const PLAYER_REDRAW_WEIGHT = 3;
+const MAX_REDRAW_WEIGHT = 5;
+
 const readQualityMode = () => {
   try {
     return localStorage.getItem('PM_QUALITY_MODE') === '1';
@@ -44,9 +55,11 @@ const readDemoMode = () => {
 // normal or quality-mode lookup (it costs far more to produce), and vice versa.
 const qualityTier = () => (readDemoMode() ? 'q2' : readQualityMode() ? 'q1' : 'q0');
 
-// "Force fresh" toggle (ScreenZero top-right, persisted): skip the exact-match
-// AND matcher tiers and generate new art. The result is still persisted, so the
-// same prompt later exact-hits as usual. Demo mode forces this on too.
+// "Force fresh" toggle (ScreenZero top-right, persisted; added 2026-08-23 at the
+// client's direction after the matcher kept reusing cached sets for test prompts):
+// skip the exact-match AND matcher tiers and generate new art. The result is still
+// persisted, so the same prompt later exact-hits as usual. "Cache only" wins when
+// both are somehow set — it is the no-spend guard. Demo mode forces this on too.
 const readForceFresh = () => {
   try {
     return localStorage.getItem('PM_FORCE_FRESH') === '1';
@@ -232,6 +245,9 @@ const restoredMeta = (entry) => {
 // reuse it whole or redraw only the clashing slots. Returns a full result object
 // or null (fall through the ladder). Never generates a full set.
 async function tryMatchedReuse({ config, userPrompt, promptKey, onProgress, cancelToken, cacheOnly, t0, box }) {
+  // Shooter Arena is top-down; every other mode is side-view. Reuse never
+  // crosses views — a profile sprite is unusable from above and vice versa.
+  const view = config?.gameType === 'shooter' ? 'topdown' : 'side';
   // Candidates = this browser's cache ∪ the shared server population (cards are
   // entry-shaped, so the matcher consumes both interchangeably; local wins dedup).
   let candidates = [];
@@ -249,14 +265,16 @@ async function tryMatchedReuse({ config, userPrompt, promptKey, onProgress, canc
 
   let verdict = null;
   let matcherCost = null;
+  let llmFailed = false;
   if (isGeminiConfigured()) {
     // Snapshot the matcher call's cost NOW — the pipeline's own resetUsageTally
     // (full gen or partial redraw) would otherwise wipe it from run attribution.
     resetUsageTally();
     try {
-      verdict = await matchCachedGame({ userPrompt, candidates });
+      verdict = await matchCachedGame({ userPrompt, candidates, view });
     } catch {
       verdict = null; // matcher failure → deterministic fallback below
+      llmFailed = true;
     }
     matcherCost = getUsageTally();
     if (box) box.matcherCost = matcherCost; // no-match → the fresh run still owns this spend
@@ -264,18 +282,36 @@ async function tryMatchedReuse({ config, userPrompt, promptKey, onProgress, canc
   // Which matcher actually decided: on the keyless path localMatch leaves no
   // call record anywhere, so without this "ran locally in 2ms" and "never ran"
   // look identical in the numbers.
-  const matcherMode = verdict ? 'llm' : (isGeminiConfigured() ? 'llm-failed-local' : 'local');
-  if (!verdict) verdict = localMatch({ userPrompt, candidates });
+  // (A null LLM verdict is usually an honest "no match", not a failure — the two
+  // were conflated until 2026-08-23 and every fresh run read as a matcher error.)
+  const matcherMode = verdict ? 'llm'
+    : !isGeminiConfigured() ? 'local'
+    : llmFailed ? 'llm-failed-local' : 'llm-no-match-local';
+  if (!verdict) verdict = localMatch({ userPrompt, candidates, view });
   timeMark('matcher');
   timeAnnotate({ matcherMode });
   if (cancelToken?.cancelled) throw cancelledError();
   if (!verdict?.matchId) return null;
 
   // Cache-only never spends: reuse the whole set as-is even when the matcher
-  // suggested redraws. >3 clashing slots = mostly a different world — a full
-  // fresh generation gives better coherence than stitching.
+  // suggested redraws.
   let slots = cacheOnly ? [] : (verdict.replaceSlots || []);
-  if (slots.length > 3) return null;
+  // Cost-aware acceptance (2026-08-28, replacing the flat >3-slot cap that sent
+  // world-fitting matches to a ~$0.49 fresh run): weigh the redraw in image
+  // calls and accept while it stays well under a fresh set. Two rejections
+  // remain, both annotated so the telemetry can tell "no candidate fit" apart
+  // from "a match fit but was rejected here": the world itself clashing (2+
+  // backdrop slots) and a redraw approaching fresh-run cost.
+  const worldClashes = slots.filter((s) => WORLD_SLOTS.includes(s)).length;
+  const redrawWeight = slots.reduce(
+    (sum, s) => sum + (s === 'player' || s === 'player_sheet' ? PLAYER_REDRAW_WEIGHT : 1), 0
+  );
+  if (worldClashes >= 2 || redrawWeight > MAX_REDRAW_WEIGHT) {
+    const matchRejected = worldClashes >= 2 ? 'world-clash' : 'redraw-too-expensive';
+    timeAnnotate({ matchRejected, rejectedReplaceSlots: slots.length });
+    onProgress?.(`[CACHE] Best cached match rejected (${matchRejected}: ${slots.join(', ')}) — generating a fresh set.`, null);
+    return null;
+  }
 
   // Load the matched entry: local first, else the server population (write the
   // server copy back locally so the next use of this game is instant).
@@ -308,8 +344,8 @@ async function tryMatchedReuse({ config, userPrompt, promptKey, onProgress, canc
   // complaint 2026-08-16). The completed set persists, so later hits get the
   // animated player at $0.
   // Cache-only/keyless skip this; the scene's theme-player fallback covers them.
-  // (Deliberately AFTER the ≤3 threshold — completing a player never disqualifies
-  // an otherwise-good match.)
+  // (Deliberately AFTER the redraw-cost cap — completing a player never
+  // disqualifies an otherwise-good match.)
   if (!cacheOnly && !baseImages.player && !slots.includes('player') && !slots.includes('player_sheet') && isGeminiConfigured()) {
     slots = [...slots, 'player_sheet'];
   }

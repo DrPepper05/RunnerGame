@@ -1,4 +1,4 @@
-import { parsePromptKeywords, generateTitle, generateProceduralLayout } from './promptUtils';
+import { parsePromptKeywords, generateTitle, generateProceduralLayout, generateWaveConfig } from './promptUtils';
 import { generateAssetDirections } from './assetPipeline/promptDesigner';
 import { isGeminiConfigured } from './assetPipeline/providers/geminiImage';
 
@@ -24,7 +24,9 @@ export async function generateGameConfig(promptText, onProgress = () => {}) {
     onProgress('[SYSTEM] Analyzing prompt keywords and modifiers...', 20);
 
     // Determine game mode
-    const gameType = parsed.mode === 'action_quest' ? 'platformer' : 'runner';
+    const gameType = parsed.mode === 'action_quest' ? 'platformer'
+      : parsed.mode === 'shooter_arena' ? 'shooter'
+      : 'runner';
 
     // Theme may be null: prompts matching none of the predefined themes get their
     // art direction and title derived from the prompt text itself (no more
@@ -57,6 +59,16 @@ export async function generateGameConfig(promptText, onProgress = () => {}) {
     // happened to contain a combat keyword. Runner mode ignores this flag.
     let actionProjectileEnabled = true;
     let worldWidth = 4000;
+
+    // Shooter Arena defaults — no gravity/jump concept, so no tuning-table
+    // overrides exist for these yet; difficulty scales wave/enemy count.
+    let shooterMoveSpeed = 260;
+    let shooterFireRate = 500;
+    let shooterProjectileSpeed = 500;
+    let shooterFireRange = 400;
+    let shooterEnemySpeed = 100;
+    let shooterWorldWidth = 2000;
+    let shooterWorldHeight = 1500;
 
     // Apply tuning parameters from table
     if (parsed.tuningParams.runSpeed) runSpeed = parsed.tuningParams.runSpeed;
@@ -92,6 +104,11 @@ export async function generateGameConfig(promptText, onProgress = () => {}) {
       actionEnemyCount = Math.min(actionEnemyCount * 2, 15);
     }
 
+    // Wave/enemy-count scaling for Shooter Arena — analogous to the procedural
+    // layout generators below, but shooter waves are computed at runtime by
+    // ShooterMode, so this just seeds the starting counts.
+    const shooterWaves = generateWaveConfig(difficulty);
+
     onProgress('[SYSTEM] Configured physics and gameplay parameters...', 40);
 
     // Generate procedural layout for platformer mode
@@ -99,6 +116,9 @@ export async function generateGameConfig(promptText, onProgress = () => {}) {
     if (gameType === 'platformer') {
       layoutArray = generateProceduralLayout(promptText, 'action_quest', worldWidth, difficulty);
       onProgress('[SYSTEM] Generated procedural level layout...', 50);
+    } else if (gameType === 'shooter') {
+      // Waves are generated at runtime in ShooterMode — no precomputed layout.
+      layoutArray = null;
     } else {
       // For runner mode, create a simple layout
       layoutArray = [
@@ -134,6 +154,15 @@ export async function generateGameConfig(promptText, onProgress = () => {}) {
       actionGravity,
       actionEnemyCount,
       actionProjectileEnabled,
+      shooterMoveSpeed,
+      shooterFireRate,
+      shooterProjectileSpeed,
+      shooterFireRange,
+      shooterEnemySpeed,
+      shooterWaveCount: shooterWaves.waveCount,
+      shooterEnemiesPerWave: shooterWaves.enemiesPerWave,
+      worldWidth: gameType === 'shooter' ? shooterWorldWidth : worldWidth,
+      worldHeight: gameType === 'shooter' ? shooterWorldHeight : 1500,
       layoutArray,
       assetDesignDirections,
       // The originating prompt rides the config from here on: the asset cache

@@ -358,7 +358,10 @@ export async function generateAssets({
   // keyed slots delivered by ONE image call, with per-cell fallback to the normal
   // individual path. Quality mode ignores it (the paid rescue rungs assume
   // individual calls).
-  gridPlan = null
+  gridPlan = null,
+  // 'shooter' disables the side-view facing-QA mirror correction below — a
+  // top-down sprite has no left/right facing for that heuristic to fix.
+  gameType = null
 }) {
   const preloadedImages = {};
   const meta = {};
@@ -395,7 +398,8 @@ export async function generateAssets({
       player: localStorage.getItem('PM_MODEL_PLAYER') || null,
       player_sheet: localStorage.getItem('PM_MODEL_SHEET') || null
     },
-    cancelToken
+    cancelToken,
+    gameType
   };
   let doneCount = 0;
   // A required slot that dies rejects the whole run — stop idle workers from
@@ -528,7 +532,9 @@ export async function generateAssets({
         }
       }
     }
-    if (review && spec.qa.facing && !review.facingRight) {
+    // Shooter's player/enemy are top-down and rotated at render time — no
+    // left/right facing exists for this heuristic to correct.
+    if (review && spec.qa.facing && !review.facingRight && runState.gameType !== 'shooter') {
       report(`[ASSETS] QA: mirroring ${slot} to face right...`);
       img = await mirrorImage(img);
       outcome.mirrored = true;
@@ -1364,7 +1370,7 @@ const DESIGN_SOURCE_LABELS = {
 // slots in this run — a restyle or partial redraw of 1-2 props stays on the
 // individual path by construction. Returns the grid plan or null (kill switch,
 // quality mode, too few slots, or the chroma pick collided to white).
-function planPropsGrid(slots, design, namedBySlot, onProgress) {
+function planPropsGrid(slots, design, namedBySlot, onProgress, gameType) {
   // The outcome rides on `design` into assetMeta.propsGrid so the COST REPORT
   // can explain a run that cost ~4 extra calls (2026-08-23: a skipped grid was
   // only visible in the live terminal and got lost with the tab).
@@ -1373,6 +1379,11 @@ function planPropsGrid(slots, design, namedBySlot, onProgress) {
   // Quality mode (and demo mode, which implies it) pays for individual calls +
   // rescue rungs, each on its own full-quality call — never gridded.
   if (localStorage.getItem('PM_QUALITY_MODE') === '1' || localStorage.getItem('PM_DEMO_MODE') === '1') return skip('quality mode');
+  // Shooter skips platform/obstacle, so its remaining grid-able slots (enemy,
+  // collectible, projectile) can still hit the >=3 threshold — but cellEssence
+  // prompts are side-view text with no top-down branch, unlike the per-slot
+  // scaffolds. Individual calls stay correct; the combined grid would not.
+  if (gameType === 'shooter') return skip('shooter uses top-down scaffolds, not grid-able');
   const gridSlots = PROPS_GRID_SPEC.cellOrder.filter((s) => slots.includes(s));
   if (gridSlots.length < 3) return skip(`only ${gridSlots.length} grid-able slot(s) in this run`);
   const plan = buildPropsGridPrompt(gridSlots, design.subjects, design.styleGuide, namedBySlot);
@@ -1427,8 +1438,15 @@ export async function generateGameAssets({ config, userPrompt = '', onProgress =
   const finalPrompts = {};
   for (const slot of [...GENERATED_SLOTS, 'player_sheet', 'projectile', 'collectible']) {
     finalPrompts[slot] = buildFinalPrompt(slot, design.subjects, design.styleGuide,
-      { userNamed: !!namedBySlot[slot] });
+      { userNamed: !!namedBySlot[slot], gameType: config.gameType });
   }
+
+  // Shooter Arena (v1 scope, see CLAUDE.md): a fixed top-down camera has no
+  // parallax to hide, and cover/obstacle props aren't generated yet — skip
+  // those slots regardless of what the caller passed.
+  const effectiveSkipSlots = config.gameType === 'shooter'
+    ? [...new Set([...skipSlots, 'background_mid', 'background_near', 'platform', 'obstacle'])]
+    : skipSlots;
 
   // The player is always attempted as an animated sprite sheet (stored under the
   // 'player' key), falling back to the static player sprite when the gates reject.
@@ -1438,17 +1456,21 @@ export async function generateGameAssets({ config, userPrompt = '', onProgress =
   // skipSlots (bulk population): 'player' in the list means NO player art at all
   // (neither sheet nor static — the scene falls back to the theme player); other
   // slot names are simply filtered out of the run.
-  let slots = GENERATED_SLOTS.map(s => (s === 'player' && !skipSlots.includes('player') ? 'player_sheet' : s));
-  // Platformer games shoot — generate their projectile too (optional slot: on failure
-  // the game keeps its static SVG bolt). Runners never fire, skip the cost.
-  if (config.gameType === 'platformer') slots.push('projectile');
+  // Shooter never substitutes player_sheet — its player is a single static
+  // top-down sprite rotated at render time, not a run-cycle animation.
+  let slots = GENERATED_SLOTS.map(s =>
+    (s === 'player' && !effectiveSkipSlots.includes('player') && config.gameType !== 'shooter') ? 'player_sheet' : s);
+  // Platformer and Shooter games shoot — generate their projectile too (optional
+  // slot: on failure the game keeps its static SVG bolt). Runners never fire, skip
+  // the cost.
+  if (config.gameType === 'platformer' || config.gameType === 'shooter') slots.push('projectile');
   // Both modes spawn score pickups (optional slot: on failure the game keeps the
   // static coin.svg). Last in the FIFO so required slots always come first.
   slots.push('collectible');
-  slots = slots.filter(s => !skipSlots.includes(s));
+  slots = slots.filter(s => !effectiveSkipSlots.includes(s));
 
-  const gridPlan = planPropsGrid(slots, design, namedBySlot, onProgress);
-  const { preloadedImages, meta } = await generateAssets({ finalPrompts, slots, onProgress, cancelToken, gridPlan });
+  const gridPlan = planPropsGrid(slots, design, namedBySlot, onProgress, config.gameType);
+  const { preloadedImages, meta } = await generateAssets({ finalPrompts, slots, onProgress, cancelToken, gridPlan, gameType: config.gameType });
 
   const generated = Object.values(meta).filter(m => !m.dropped).length;
   onProgress(
@@ -1466,10 +1488,10 @@ export async function generateGameAssets({ config, userPrompt = '', onProgress =
   }
   const assetMeta = {
     designSource: design.source,
-    // Perspective the art was drawn for. Everything today is side-view; future
-    // top-down modes (shooter/RPG) stamp 'topdown' and the cache matcher refuses
-    // to reuse across views (a profile sprite is unusable from above).
-    view: 'side',
+    // Perspective the art was drawn for. Shooter Arena stamps 'topdown'; every
+    // other mode is side-view. The cache matcher refuses to reuse across views
+    // (a profile sprite is unusable from above).
+    view: config.gameType === 'shooter' ? 'topdown' : 'side',
     slots: meta,
     ...(design.taxonomy?.tags?.length ? { tags: design.taxonomy.tags } : {}),
     ...(design.propsGridStatus ? { propsGrid: design.propsGridStatus } : {}),
@@ -1526,17 +1548,18 @@ export async function regenerateAssetSlots({ config, instruction = '', slots, on
   const finalPrompts = {};
   for (const slot of slots) {
     finalPrompts[slot] = buildFinalPrompt(slot, design.subjects, design.styleGuide,
-      { userNamed: !!namedBySlot[slot] });
+      { userNamed: !!namedBySlot[slot], gameType: config.gameType });
     // Sheet slots fall back to their static slot on gate failure — that fallback
     // run needs its own prompt present.
     const fallbackSlot = SLOT_SPECS[slot].fallbackSlot;
     if (fallbackSlot && !finalPrompts[fallbackSlot]) {
-      finalPrompts[fallbackSlot] = buildFinalPrompt(fallbackSlot, design.subjects, design.styleGuide);
+      finalPrompts[fallbackSlot] = buildFinalPrompt(fallbackSlot, design.subjects, design.styleGuide,
+        { gameType: config.gameType });
     }
   }
 
-  const gridPlan = planPropsGrid(slots, design, namedBySlot, onProgress);
-  const { preloadedImages, meta } = await generateAssets({ finalPrompts, slots, onProgress, cancelToken, gridPlan });
+  const gridPlan = planPropsGrid(slots, design, namedBySlot, onProgress, config.gameType);
+  const { preloadedImages, meta } = await generateAssets({ finalPrompts, slots, onProgress, cancelToken, gridPlan, gameType: config.gameType });
 
   const updated = Object.values(meta).filter(m => !m.dropped).length;
   onProgress(

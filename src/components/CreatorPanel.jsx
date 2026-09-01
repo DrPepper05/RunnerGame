@@ -72,6 +72,60 @@ const PlatformerControls = ({ liveParams, onSliderChange }) => (
   </>
 );
 
+const ShooterControls = ({ liveParams, onSliderChange }) => (
+  <>
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
+        <label className="pm-label" style={{ margin: 0 }}>Move Speed</label>
+        <span style={{ fontSize: '13px', color: 'var(--pm-accent-teal)', fontWeight: '600' }}>{Math.round(liveParams.shooterMoveSpeed || 260)}</span>
+      </div>
+      <input type="range" className="pm-slider" name="shooterMoveSpeed" min="100" max="500" step="10" value={liveParams.shooterMoveSpeed || 260} onChange={onSliderChange} />
+    </div>
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
+        <label className="pm-label" style={{ margin: 0 }}>Fire Rate (ms)</label>
+        <span style={{ fontSize: '13px', color: 'var(--pm-accent-teal)', fontWeight: '600' }}>{Math.round(liveParams.shooterFireRate || 500)}</span>
+      </div>
+      <input type="range" className="pm-slider" name="shooterFireRate" min="150" max="1500" step="25" value={liveParams.shooterFireRate || 500} onChange={onSliderChange} />
+    </div>
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
+        <label className="pm-label" style={{ margin: 0 }}>Projectile Speed</label>
+        <span style={{ fontSize: '13px', color: 'var(--pm-accent-teal)', fontWeight: '600' }}>{Math.round(liveParams.shooterProjectileSpeed || 500)}</span>
+      </div>
+      <input type="range" className="pm-slider" name="shooterProjectileSpeed" min="200" max="900" step="10" value={liveParams.shooterProjectileSpeed || 500} onChange={onSliderChange} />
+    </div>
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
+        <label className="pm-label" style={{ margin: 0 }}>Fire Range</label>
+        <span style={{ fontSize: '13px', color: 'var(--pm-accent-teal)', fontWeight: '600' }}>{Math.round(liveParams.shooterFireRange || 400)}</span>
+      </div>
+      <input type="range" className="pm-slider" name="shooterFireRange" min="150" max="800" step="10" value={liveParams.shooterFireRange || 400} onChange={onSliderChange} />
+    </div>
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
+        <label className="pm-label" style={{ margin: 0 }}>Enemy Speed</label>
+        <span style={{ fontSize: '13px', color: 'var(--pm-accent-teal)', fontWeight: '600' }}>{Math.round(liveParams.shooterEnemySpeed || 100)}</span>
+      </div>
+      <input type="range" className="pm-slider" name="shooterEnemySpeed" min="40" max="400" step="10" value={liveParams.shooterEnemySpeed || 100} onChange={onSliderChange} />
+    </div>
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
+        <label className="pm-label" style={{ margin: 0 }}>Wave Count</label>
+        <span style={{ fontSize: '13px', color: 'var(--pm-accent-teal)', fontWeight: '600' }}>{Math.round(liveParams.shooterWaveCount || 5)}</span>
+      </div>
+      <input type="range" className="pm-slider" name="shooterWaveCount" min="1" max="20" step="1" value={liveParams.shooterWaveCount || 5} onChange={onSliderChange} />
+    </div>
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
+        <label className="pm-label" style={{ margin: 0 }}>Enemies Per Wave</label>
+        <span style={{ fontSize: '13px', color: 'var(--pm-accent-teal)', fontWeight: '600' }}>{Math.round(liveParams.shooterEnemiesPerWave || 4)}</span>
+      </div>
+      <input type="range" className="pm-slider" name="shooterEnemiesPerWave" min="1" max="20" step="1" value={liveParams.shooterEnemiesPerWave || 4} onChange={onSliderChange} />
+    </div>
+  </>
+);
+
 const ConfigActions = ({ liveParams, setLiveParams, setPresetKey, onHomeClick }) => {
   const [exportStatus, setExportStatus] = useState('idle');
   const [isImporting, setIsImporting] = useState(false);
@@ -242,6 +296,10 @@ const CreatorPanel = ({
       } else if (mode === 'platformer') {
         config.actionEnemyCount = Math.floor(diff * 1.5);
         config.actionJumpHeight = 400 + (diff * 30);
+      } else if (mode === 'shooter') {
+        config.shooterEnemiesPerWave = 2 + Math.round(diff * 0.6);
+        config.shooterEnemySpeed = 70 + diff * 12;
+        config.shooterFireRate = Math.max(200, 700 - diff * 40);
       }
       return config;
     });
@@ -445,6 +503,8 @@ const CreatorPanel = ({
               <RunnerControls liveParams={liveParams} onSliderChange={onSliderChange} />
             ) : liveParams.gameType === 'platformer' ? (
               <PlatformerControls liveParams={liveParams} onSliderChange={onSliderChange} />
+            ) : liveParams.gameType === 'shooter' ? (
+              <ShooterControls liveParams={liveParams} onSliderChange={onSliderChange} />
             ) : (
               <div style={{ color: 'var(--pm-text-tertiary)', fontSize: '13px', fontStyle: 'italic', textAlign: 'center' }}>
                 No physics parameters available.

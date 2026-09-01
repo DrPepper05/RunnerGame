@@ -12,6 +12,7 @@ const BANNED_WORDS = ['fuck', 'shit', 'bitch', 'cunt', 'ass', 'dick', 'pussy', '
 const AVAILABLE_MODES = [
   { key: 'standard', label: 'Runner', desc: 'Fast-paced infinite progression runner. Avoid obstacles, collect coins.' },
   { key: 'action_quest', label: 'Action Quest', desc: 'Classic 2D platformer with melee slashing, projectile combat, and patrolling enemies.' },
+  { key: 'shooter_arena', label: 'Shooter Arena', desc: 'Top-down arena survival. Move with WASD, auto-fire at nearby enemies, clear the waves.' },
 ];
 
 const COMING_SOON_MODES = [
@@ -19,7 +20,6 @@ const COMING_SOON_MODES = [
   { key: 'empire', label: 'Empire Builder', desc: 'Construct towers, gather crystals, and build your pixel galactic civilization.' },
   { key: 'fighting', label: 'Fighting Arena', desc: 'Snappy retro dueling. Deliver perfect parries, sword sweeps, and final hits.' },
   { key: 'racing', label: 'Racing Rush', desc: 'Speed through scrolling highways, drift around turns, and top the leaderboards.' },
-  { key: 'shooter', label: 'Shooter Arena', desc: 'Dodge bullet hell waves, fire plasma bursts, and survive boss arenas.' },
   { key: 'survival', label: 'Survival Mode', desc: 'Scavenge supplies in dark woods, build campfires, and outlast the night waves.' },
   { key: 'simulator', label: 'Simulator World', desc: 'Design, manage, and optimize complex simulated environments and ecosystems.' }
 ];
@@ -44,7 +44,9 @@ const API_KEY_TICK_STYLE = {
 };
 
 const getRandomMode = (selectedMode) => {
-  return selectedMode || (Math.random() > 0.5 ? 'action_quest' : 'standard');
+  if (selectedMode) return selectedMode;
+  const modes = ['action_quest', 'standard', 'shooter_arena'];
+  return modes[Math.floor(Math.random() * modes.length)];
 };
 
 const getRandomDifficulty = () => {
@@ -129,7 +131,7 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
   const [prompt, setPrompt] = useState('');
   const [isGenerating, setIsGenerating] = useState(false);
   const [transitionPhase, setTransitionPhase] = useState('idle'); // idle | compiling | fading | done
-  const [selectedMode, setSelectedMode] = useState(null); // null | 'standard' | 'action_quest'
+  const [selectedMode, setSelectedMode] = useState(null); // null | 'standard' | 'action_quest' | 'shooter_arena'
   const [showInfoModal, setShowInfoModal] = useState(false);
   const [terminalLogs, setTerminalLogs] = useState([]);
   const [progress, setProgress] = useState(0);
@@ -416,22 +418,29 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
 
     const displayPrompt = promptText ? `"${promptText.substring(0, 32)}"` : "Quick Start Preset";
     const themeName = (newConfig.themeKey || 'default').toUpperCase();
-    const modeName = newConfig.gameType === 'platformer' ? 'ACTION QUEST' : 'RUNNER';
+    const modeName = newConfig.gameType === 'platformer' ? 'ACTION QUEST'
+      : newConfig.gameType === 'shooter' ? 'SHOOTER ARENA'
+      : 'RUNNER';
     const difficulty = newConfig.difficulty || 5;
 
-    const gravity = newConfig.gameType === 'platformer' 
-      ? (newConfig.actionGravity || 1400) 
-      : (newConfig.gravity || 1600);
-
-    const speed = newConfig.gameType === 'platformer'
-      ? `Jump: ${newConfig.actionJumpHeight || 550}px`
-      : `Speed: ${newConfig.runSpeed || 400}px/s`;
+    // Shooter has no gravity/jump concept — report move speed + wave count instead.
+    const physicsLine = newConfig.gameType === 'shooter'
+      ? `Move: ${newConfig.shooterMoveSpeed || 260}px/s · Waves: ${newConfig.shooterWaveCount || 5} · Diff: ${difficulty}/10`
+      : (() => {
+          const gravity = newConfig.gameType === 'platformer'
+            ? (newConfig.actionGravity || 1400)
+            : (newConfig.gravity || 1600);
+          const speed = newConfig.gameType === 'platformer'
+            ? `Jump: ${newConfig.actionJumpHeight || 550}px`
+            : `Speed: ${newConfig.runSpeed || 400}px/s`;
+          return `Gravity: ${gravity}m/s² · ${speed} · Diff: ${difficulty}/10`;
+        })();
 
     setTerminalLogs([
       "[SYSTEM] Booting PlayMint Generative Engine v2.0...",
       `[PROMPT] Input -> ${displayPrompt}`,
       `[THEME]  Mapping assets -> [${themeName} THEME, ${modeName}]`,
-      `[PHYSIC] Gravity: ${gravity}m/s² · ${speed} · Diff: ${difficulty}/10`,
+      `[PHYSIC] ${physicsLine}`,
       "[ENGINE] Synchronizing WebGL canvas & establishing world gate...",
       `[ASSETS] Starting asset generation via ${isGeminiConfigured() ? 'Gemini AI' : 'built-in theme artwork (no API key)'}...`
     ]);
@@ -619,6 +628,10 @@ const ScreenZero = ({ onGenerate, onClose, isOverlay, onStartTransition, onCompl
     } else if (mode === 'action_quest') {
       config.actionEnemyCount = Math.floor(diff * 1.5); // 1 to 15
       config.actionJumpHeight = 400 + (diff * 30);
+    } else if (mode === 'shooter_arena') {
+      config.shooterEnemiesPerWave = 2 + Math.round(diff * 0.6); // 3 to 8
+      config.shooterEnemySpeed = 70 + diff * 12; // 82 to 190
+      config.shooterFireRate = Math.max(200, 700 - diff * 40); // 660 to 300
     }
   };
 

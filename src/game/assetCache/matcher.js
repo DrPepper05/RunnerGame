@@ -69,7 +69,11 @@ const buildMatchPrompt = (userPrompt, payload) => (
   `- replaceSlots: ONLY slots whose SUBJECT clashes with the new request (e.g. the player asked ` +
   `for skeleton enemies but the set's enemy is a wolf). Allowed names: ${SLOT_VOCAB.join(', ')}.\n` +
   `- Palette or style nuance alone is NOT a clash.\n` +
-  `- Nothing fits → matchId is an empty string.`
+  `- Redrawing a few slots costs ~10x less than generating a whole new set: when a set's WORLD ` +
+  `(setting, backdrop, mood) fits, return that match with its clashing subject slots listed — ` +
+  `never reject it merely because several gameplay subjects differ.\n` +
+  `- Nothing fits → matchId is an empty string. That means: no set's WORLD fits (a set whose ` +
+  `backgrounds/floor would need redrawing is a wrong world, not a partial match).`
 );
 
 export async function matchCachedGame({ userPrompt, candidates, view = 'side' }) {

@@ -3,7 +3,7 @@ import { GAME_PRESETS } from '../gameConfig';
 
 const COMING_SOON_MODES = [
   'RPG Adventure', 'Empire Builder', 'Fighting Arena',
-  'Racing Rush', 'Shooter Arena', 'Survival Mode', 'Simulator World'
+  'Racing Rush', 'Survival Mode', 'Simulator World'
 ];
 
 const GameSelectorModal = ({ isOpen, presetKey, onSelectPreset, onClose }) => {
@@ -263,12 +263,21 @@ const GameSelectorModal = ({ isOpen, presetKey, onSelectPreset, onClose }) => {
           </div>
 
           {/* Action Quest */}
-          <div 
+          <div
             className="pm-card gsm-playable-card"
             onClick={() => handleSelect('action_quest')}
             style={{ border: presetKey === 'action_quest' ? '2px solid var(--pm-accent-teal)' : '2px solid transparent', background: 'radial-gradient(circle at bottom right, rgba(212, 157, 51, 0.15), var(--pm-bg-panel-light) 70%)' }}
           >
             <h4 className="pm-heading" style={{ margin: '0', fontSize: '20px' }}>Action Quest</h4>
+          </div>
+
+          {/* Shooter Arena */}
+          <div
+            className="pm-card gsm-playable-card"
+            onClick={() => handleSelect('shooter_arena')}
+            style={{ border: presetKey === 'shooter_arena' ? '2px solid var(--pm-accent-teal)' : '2px solid transparent', background: 'radial-gradient(circle at top right, rgba(139, 92, 246, 0.15), var(--pm-bg-panel-light) 70%)' }}
+          >
+            <h4 className="pm-heading" style={{ margin: '0', fontSize: '20px' }}>Shooter Arena</h4>
           </div>
         </div>
 

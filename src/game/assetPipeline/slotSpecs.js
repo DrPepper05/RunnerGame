@@ -194,10 +194,15 @@ export const SLOT_SPECS = {
     canvas: { width: 128, height: 128 },
     gen: { aspectRatio: '1:1', model: GEMINI_SLOT_MODEL },
     post: { fit: 'stretch', keying: null, trimBorder: true, crop: false },
-    scaffold: (subject, style) =>
-      `Create a seamless horizontally tileable ground texture: ${subject}, seen from ` +
-      `the side as a game terrain block. The left and right edges match perfectly, and ` +
-      `the texture fills the whole frame edge to edge — no border, no vignette. ${style}`,
+    scaffold: (subject, style, { gameType } = {}) =>
+      gameType === 'shooter'
+        ? `Create a seamless tileable ground texture, viewed from directly above ` +
+          `(top-down bird's-eye view): ${subject}. All four edges match perfectly for ` +
+          `tiling in every direction, and the texture fills the whole frame edge to ` +
+          `edge — no border, no vignette, no shadow. ${style}`
+        : `Create a seamless horizontally tileable ground texture: ${subject}, seen from ` +
+          `the side as a game terrain block. The left and right edges match perfectly, and ` +
+          `the texture fills the whole frame edge to edge — no border, no vignette. ${style}`,
     fallbackSubject: (d) => d?.levelElements
   },
   platform: {
@@ -232,10 +237,15 @@ export const SLOT_SPECS = {
     gen: { aspectRatio: '1:1', model: GEMINI_SLOT_MODEL },
     post: { fit: 'stretch', keying: 'flood', trimBorder: false, crop: true, outline: true },
     optional: true,
-    scaffold: (subject, style, { chroma } = {}) =>
-      `Draw a single small projectile sprite for a 2d video game: ${subject}, flying ` +
-      `to the right as an elongated horizontal shape, side view, centered in the frame. ` +
-      `${BG_CLAUSE(chroma)}. No shadow, no motion trail, no text. ${style}`,
+    scaffold: (subject, style, { chroma, gameType } = {}) =>
+      gameType === 'shooter'
+        ? `Draw a single small projectile sprite for a 2d video game, viewed from ` +
+          `directly above: ${subject}, a radially-symmetric bolt or orb shape with no ` +
+          `directional cues (it will be rotated to face any direction), centered in ` +
+          `the frame. ${BG_CLAUSE(chroma)}. No shadow, no motion trail, no text. ${style}`
+        : `Draw a single small projectile sprite for a 2d video game: ${subject}, flying ` +
+          `to the right as an elongated horizontal shape, side view, centered in the frame. ` +
+          `${BG_CLAUSE(chroma)}. No shadow, no motion trail, no text. ${style}`,
     cellEssence: (subject, style) =>
       `a single small projectile sprite: ${subject}, flying to the right as an ` +
       `elongated horizontal shape, side view, centered in its cell, no shadow, ` +
@@ -275,12 +285,18 @@ export const SLOT_SPECS = {
     qa: { facing: true },
     // Front-loaded pose language ("mid-run stride") avoids stiff standing poses;
     // "no ground, no motion lines" suppresses baked-in floor streaks under runners.
-    scaffold: (subject, style, { chroma } = {}) =>
-      `Draw a 2d video game hero sprite: ${subject}. The character is caught mid-run ` +
-      `in a dynamic stride, full body in crisp side profile facing right, a single ` +
-      `character filling most of the frame with a sharp clean outline. ` +
-      `${BG_CLAUSE(chroma)}. ${GAPS_CLAUSE}. No shadow, no ground, no motion lines, ` +
-      `no text. ${style}`,
+    scaffold: (subject, style, { chroma, gameType } = {}) =>
+      gameType === 'shooter'
+        ? `Draw a 2d video game hero sprite, viewed from directly above (top-down ` +
+          `bird's-eye view): ${subject}. The character faces upward toward the top of ` +
+          `the frame, full body visible from above with a sharp clean outline, ` +
+          `centered in the frame. ${BG_CLAUSE(chroma)}. ${GAPS_CLAUSE}. No shadow, ` +
+          `no ground, no motion lines, no text. ${style}`
+        : `Draw a 2d video game hero sprite: ${subject}. The character is caught mid-run ` +
+          `in a dynamic stride, full body in crisp side profile facing right, a single ` +
+          `character filling most of the frame with a sharp clean outline. ` +
+          `${BG_CLAUSE(chroma)}. ${GAPS_CLAUSE}. No shadow, no ground, no motion lines, ` +
+          `no text. ${style}`,
     fallbackSubject: (d) => d?.player
   },
   enemy: {
@@ -289,8 +305,12 @@ export const SLOT_SPECS = {
     gen: { aspectRatio: '1:1', model: GEMINI_SLOT_MODEL },
     post: { fit: 'stretch', keying: 'flood', trimBorder: false, crop: true, outline: true, pocketClean: true },
     qa: { facing: true },
-    scaffold: (subject, style, { chroma } = {}) =>
-      `Draw a 2d video game enemy sprite: ${subject}, prowling to the right, full ` +
+    scaffold: (subject, style, { chroma, gameType } = {}) => gameType === 'shooter'
+      ? `Draw a 2d video game enemy sprite, viewed from directly above (top-down ` +
+        `bird's-eye view): ${subject}, a single creature filling most of the frame ` +
+        `with a sharp clean outline, centered in the frame. ${BG_CLAUSE(chroma)}. ` +
+        `${GAPS_CLAUSE}. No shadow, no ground, no motion lines, no text. ${style}`
+      : `Draw a 2d video game enemy sprite: ${subject}, prowling to the right, full ` +
       `body in side profile facing right, a single creature filling most of the frame ` +
       `with a sharp clean outline. ${BG_CLAUSE(chroma)}. ${GAPS_CLAUSE}. No shadow, ` +
       `no ground, no motion lines, no text. ${style}`,

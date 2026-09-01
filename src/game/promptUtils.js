@@ -178,6 +178,19 @@ export function generateProceduralLayout(promptText, mode, worldWidth = 4000, di
 }
 
 /**
+ * Generates starting wave/enemy-count scaling for Shooter Arena, scaled by
+ * difficulty. Unlike generateProceduralLayout (a side-scroll platform-chain
+ * generator, not applicable here), a shooter arena has no level geometry to
+ * precompute — waves are spawned at runtime by ShooterMode. This only seeds
+ * the starting counts it reads from config.
+ */
+export function generateWaveConfig(difficulty = 5) {
+  const waveCount = Math.max(3, Math.round(3 + difficulty / 2));
+  const enemiesPerWave = Math.max(2, Math.round(3 + difficulty / 3));
+  return { waveCount, enemiesPerWave };
+}
+
+/**
  * Parses user prompts and builds a customized configuration
  */
 export function parsePromptKeywords(text) {
@@ -198,7 +211,13 @@ export function parsePromptKeywords(text) {
   let keywordsMatched = 0;
 
   // 1. Parse Mode Intent
-  if (lower.match(/(action|quest|fight|platformer|enemies|shoot|kill|combat)/)) {
+  // Shooter Arena requires explicit multi-word phrases, checked BEFORE the
+  // action_quest pattern — a bare "shoot" ("a platformer where you shoot
+  // arrows") still routes to Action Quest.
+  if (lower.match(/(shooter arena|arena shooter|top[- ]?down shooter|twin[- ]?stick|bullet hell)/)) {
+    mode = 'shooter_arena';
+    keywordsMatched++;
+  } else if (lower.match(/(action|quest|fight|platformer|enemies|shoot|kill|combat)/)) {
     mode = 'action_quest';
     keywordsMatched++;
   } else if (lower.match(/(run|dash|runner|dodge|sprint)/)) {
@@ -326,7 +345,9 @@ export function generateTitle(text, mode, themeKey) {
   const words = trimmed.split(/\s+/).filter((w) => w.length > 2 && !STOP_WORDS.has(w.toLowerCase()));
   const modeWordsList = mode === 'action_quest'
     ? ['Quest', 'Raid', 'Path', 'Saga']
-    : ['Run', 'Sprint', 'Rush', 'Dash'];
+    : mode === 'shooter_arena'
+      ? ['Strike', 'Siege', 'Assault', 'Onslaught']
+      : ['Run', 'Sprint', 'Rush', 'Dash'];
   if (words.length >= 2) {
     return `${cap(words[0])} ${cap(words[1])} ${modeWordsList[Math.floor(Math.random() * modeWordsList.length)]}`;
   }
@@ -342,7 +363,9 @@ export function generateTitle(text, mode, themeKey) {
   const modeWords =
     mode === 'action_quest'
       ? ['Quest', 'Runes', 'Raid', 'Path', 'Chronicle', 'Saga']
-      : ['Run', 'Sprint', 'Rush', 'Dash', 'Circuit', 'Marathon'];
+      : mode === 'shooter_arena'
+        ? ['Strike', 'Siege', 'Assault', 'Onslaught', 'Salvo', 'Breach']
+        : ['Run', 'Sprint', 'Rush', 'Dash', 'Circuit', 'Marathon'];
 
   const list = themeWords[themeKey] || themeWords.default;
   return `${list[Math.floor(Math.random() * list.length)]} ${modeWords[Math.floor(Math.random() * modeWords.length)]}`;

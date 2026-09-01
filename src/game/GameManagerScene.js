@@ -52,6 +52,10 @@ export default class GameManagerScene extends Phaser.Scene {
     this.load.svg('coin', 'assets/coin.svg', { width: 32, height: 32 }); // static collectible fallback
     this.load.image('ground', 'assets/ground.png');
     this.load.svg('projectile', 'assets/shuriken.svg', { width: 48, height: 16 }); // Laser bolt
+    // Top-down placeholder figures for Shooter Arena's static/keyless path —
+    // authored facing right so rotate-toward-travel (rotation 0 = +x) reads correctly.
+    this.load.svg('topdown_player', 'assets/topdown_player.svg', { width: 48, height: 48 });
+    this.load.svg('topdown_enemy', 'assets/topdown_enemy.svg', { width: 44, height: 44 });
     this.load.svg('shuriken', 'assets/shuriken.svg', { width: 32, height: 32 });
     this.load.svg('fireball', 'assets/fireball.svg', { width: 32, height: 32 });
     this.load.svg('laser', 'assets/laser.svg', { width: 48, height: 16 });
@@ -150,7 +154,10 @@ export default class GameManagerScene extends Phaser.Scene {
     // keys — missing textures render as green boxes. Downgrade to built-in theme
     // art instead (mirrors ScreenZero's toStaticThemeConfig).
     if (this.gameConfig.dynamicAssetUrls && !this.gameConfig.preloadedImages) {
-      const required = ['dyn_bg_far', 'dyn_floor', 'dyn_player', 'dyn_enemy', 'dyn_obstacle',
+      const required = ['dyn_bg_far', 'dyn_floor', 'dyn_player', 'dyn_enemy',
+        // Shooter never generates the obstacle/cover-prop slot — requiring it
+        // would falsely downgrade an otherwise-successful run to static art.
+        ...(this.gameConfig.gameType === 'shooter' ? [] : ['dyn_obstacle']),
         ...(this.gameConfig.gameType === 'platformer' ? ['dyn_platform'] : [])];
       const missing = required.filter(key => !this.textures.exists(key));
       if (missing.length > 0) {
@@ -203,42 +210,74 @@ export default class GameManagerScene extends Phaser.Scene {
     }
 
     // Floor - Make it wide enough to cover the world width if we are in platformer mode.
-    const floorWidth = this.gameConfig.gameType === 'platformer' ? 4000 : Math.max(width * 2, 4000);
-    const floorTexture = this.gameConfig.dynamicAssetUrls ? 'dyn_floor' : (this.secondaryTheme?.floorTexture || this.activeTheme.floorTexture || 'ground');
-    const floorFrameIndex = this.gameConfig.dynamicAssetUrls ? 0 : (this.secondaryTheme?.floorFrame !== undefined ? this.secondaryTheme.floorFrame : (this.activeTheme.floorFrame !== undefined ? this.activeTheme.floorFrame : 0));
-    const textureObj = this.textures.get(floorTexture);
-    const frame = textureObj?.get(floorFrameIndex);
+    // Shooter is a fixed top-down arena with no ground plane — it skips floor
+    // creation entirely and sets world bounds to the arena size instead (the
+    // same worldWidth/worldHeight MultiCameraManager.configureFixedArena reads).
+    if (this.gameConfig.gameType === 'shooter') {
+      const arenaWidth = this.gameConfig.worldWidth || 2000;
+      const arenaHeight = this.gameConfig.worldHeight || 1500;
+      this.physics.world.setBounds(0, 0, arenaWidth, arenaHeight);
 
-    if (frame && frame.width && frame.height) {
-      const tileWidth = frame.width;
-      const tileHeight = frame.height;
-      const scaleY = floorHeight / tileHeight;
-      const scaledWidth = tileWidth * scaleY;
-      const repeatCount = Math.ceil(floorWidth / scaledWidth);
-
-      this.floorSegments = [];
-      for (let i = 0; i < repeatCount; i++) {
-        const tile = this.add.sprite(i * scaledWidth, this.LOGICAL_FLOOR_Y, floorTexture, floorFrameIndex).setOrigin(0, 0);
-        tile.setScale(scaleY);
-        this.floorSegments.push(tile);
+      // Visual-only tiled ground fill covering the whole arena (no physics body —
+      // the world bounds above are the only collision surface). Depth -1 sits
+      // below the player/enemies (default depth 0) and above background_far
+      // (depth -5), same relative ordering as the side-scroll floor.
+      const floorTexture = this.gameConfig.dynamicAssetUrls ? 'dyn_floor' : (this.secondaryTheme?.floorTexture || this.activeTheme.floorTexture || 'ground');
+      if (this.gameConfig.dynamicAssetUrls && this.textures.exists(floorTexture)) {
+        // Generated dyn_floor art is designed to tile at 1:1.
+        this.arenaFloor = this.add.tileSprite(0, 0, arenaWidth, arenaHeight, floorTexture)
+          .setOrigin(0, 0)
+          .setDepth(-1);
+      } else {
+        // Static/theme fallback: a small ground tile (winter_ground_1 is 16×16)
+        // repeated thousands of times across a 2000px arena aliases into visible
+        // moire noise under the fixed-arena camera's zoom, even with floorTileScale
+        // applied. A flat, opaque, average-color fill sidesteps the tiling
+        // artifact entirely — good enough for testing gameplay without needing
+        // generated art.
+        const fillColor = this.textures.exists(floorTexture) ? this.sampleFloorAverage(floorTexture) : 0x3a3a46;
+        this.arenaFloor = this.add.rectangle(0, 0, arenaWidth, arenaHeight, fillColor)
+          .setOrigin(0, 0)
+          .setDepth(-1);
       }
-
-      this.floor = this.add.rectangle(0, this.LOGICAL_FLOOR_Y, floorWidth, floorHeight, 0x000000, 0);
-      this.floor.setOrigin(0, 0);
-
-      this.createFloorFill(floorWidth, floorHeight, floorTexture, floorFrameIndex);
     } else {
-      this.floor = this.add.tileSprite(0, this.LOGICAL_FLOOR_Y, floorWidth, floorHeight, floorTexture, floorFrameIndex).setOrigin(0, 0);
-      const themeTileScale = this.secondaryTheme?.floorTileScale || this.activeTheme.floorTileScale || 0.15;
-      this.floor.tileScaleX = this.gameConfig.dynamicAssetUrls ? 1.0 : (this.gameConfig.floorTileScale || themeTileScale);
-      this.floor.tileScaleY = this.gameConfig.dynamicAssetUrls ? 1.0 : (this.gameConfig.floorTileScale || themeTileScale);
+      const floorWidth = this.gameConfig.gameType === 'platformer' ? 4000 : Math.max(width * 2, 4000);
+      const floorTexture = this.gameConfig.dynamicAssetUrls ? 'dyn_floor' : (this.secondaryTheme?.floorTexture || this.activeTheme.floorTexture || 'ground');
+      const floorFrameIndex = this.gameConfig.dynamicAssetUrls ? 0 : (this.secondaryTheme?.floorFrame !== undefined ? this.secondaryTheme.floorFrame : (this.activeTheme.floorFrame !== undefined ? this.activeTheme.floorFrame : 0));
+      const textureObj = this.textures.get(floorTexture);
+      const frame = textureObj?.get(floorFrameIndex);
 
-      this.createFloorFill(floorWidth, floorHeight, floorTexture, floorFrameIndex);
+      if (frame && frame.width && frame.height) {
+        const tileWidth = frame.width;
+        const tileHeight = frame.height;
+        const scaleY = floorHeight / tileHeight;
+        const scaledWidth = tileWidth * scaleY;
+        const repeatCount = Math.ceil(floorWidth / scaledWidth);
+
+        this.floorSegments = [];
+        for (let i = 0; i < repeatCount; i++) {
+          const tile = this.add.sprite(i * scaledWidth, this.LOGICAL_FLOOR_Y, floorTexture, floorFrameIndex).setOrigin(0, 0);
+          tile.setScale(scaleY);
+          this.floorSegments.push(tile);
+        }
+
+        this.floor = this.add.rectangle(0, this.LOGICAL_FLOOR_Y, floorWidth, floorHeight, 0x000000, 0);
+        this.floor.setOrigin(0, 0);
+
+        this.createFloorFill(floorWidth, floorHeight, floorTexture, floorFrameIndex);
+      } else {
+        this.floor = this.add.tileSprite(0, this.LOGICAL_FLOOR_Y, floorWidth, floorHeight, floorTexture, floorFrameIndex).setOrigin(0, 0);
+        const themeTileScale = this.secondaryTheme?.floorTileScale || this.activeTheme.floorTileScale || 0.15;
+        this.floor.tileScaleX = this.gameConfig.dynamicAssetUrls ? 1.0 : (this.gameConfig.floorTileScale || themeTileScale);
+        this.floor.tileScaleY = this.gameConfig.dynamicAssetUrls ? 1.0 : (this.gameConfig.floorTileScale || themeTileScale);
+
+        this.createFloorFill(floorWidth, floorHeight, floorTexture, floorFrameIndex);
+      }
+      this.physics.add.existing(this.floor, true); // Static
+
+      // Bounds must accommodate the static depth
+      this.physics.world.setBounds(0, 0, floorWidth, this.LOGICAL_FLOOR_Y + floorHeight);
     }
-    this.physics.add.existing(this.floor, true); // Static
-
-    // Bounds must accommodate the static depth
-    this.physics.world.setBounds(0, 0, floorWidth, this.LOGICAL_FLOOR_Y + floorHeight);
 
     // Animations
     // Generated player run cycle — recreated per scene start since the texture changes
@@ -378,6 +417,10 @@ export default class GameManagerScene extends Phaser.Scene {
     if (this.useDynPlayer) {
       playerTexture = 'dyn_player';
       playerFrame = undefined;
+    } else if (this.gameConfig.gameType === 'shooter' && this.textures.exists('topdown_player')) {
+      // Static/keyless shooter uses the top-down placeholder — the side-view
+      // theme characters read as lying down when rotated toward travel.
+      playerTexture = 'topdown_player';
     } else if (playerType === 'yeti') {
       playerTexture = 'fox';
       playerFrame = 'yeti-1';
@@ -394,11 +437,22 @@ export default class GameManagerScene extends Phaser.Scene {
       const h = frame ? frame.height : 128;
       // Target a standardized height of 64px
       scale = 64 / h;
+    } else if (playerTexture === 'topdown_player') {
+      scale = 1; // the SVG is authored at its in-game size (48px)
     }
     this.player.setScale(scale);
 
-    // Use SpriteAlignmentManager for better ground contact
-    if (this.alignmentManager && this.useDynPlayer) {
+    const isShooter = this.gameConfig.gameType === 'shooter';
+
+    if (isShooter) {
+      // Top-down: no ground plane, and the sprite rotates at render time toward
+      // movement/fire direction — always a centered origin and a full-texture
+      // hitbox, whether the art is generated or the static theme fallback.
+      this.player.setOrigin(0.5, 0.5);
+      this.player.body.setSize(this.player.width, this.player.height);
+      this.player.body.setOffset(0, 0);
+    } else if (this.alignmentManager && this.useDynPlayer) {
+      // Use SpriteAlignmentManager for better ground contact
       // Apply intelligent alignment for dynamic assets
       this.alignmentManager.initializeSprite(this.player, {
         type: 'character',
@@ -431,13 +485,18 @@ export default class GameManagerScene extends Phaser.Scene {
       }
     }
 
-    this.physics.add.collider(this.player, this.floor);
+    // Shooter has no floor body to collide against.
+    if (!isShooter) {
+      this.physics.add.collider(this.player, this.floor);
+    }
 
     // Initialize Multi-Camera Manager
     this.cameraManager = new MultiCameraManager(this);
-    const cameraMode = this.gameConfig.gameType === 'runner' 
-      ? 'side-scrolling' 
-      : (this.gameConfig.gameType === 'platformer' ? 'follow-target' : 'fixed-arena');
+    const cameraMode = this.gameConfig.gameType === 'runner'
+      ? 'side-scrolling'
+      : this.gameConfig.gameType === 'platformer'
+        ? 'follow-target'
+        : 'fixed-arena'; // covers 'shooter' explicitly and any future unset default
     this.cameraManager.setMode(cameraMode, this.player);
 
     // Core game mode handling
@@ -483,6 +542,8 @@ export default class GameManagerScene extends Phaser.Scene {
         this.scene.restart();
       } else if (this.gameConfig.gameType === 'runner') {
         this.gameModeManager.jump();
+      } else if (this.gameConfig.gameType === 'shooter') {
+        this.keyStates._shootTrigger = true;
       }
     }, this);
 
@@ -652,6 +713,33 @@ export default class GameManagerScene extends Phaser.Scene {
       if (!n) return FALLBACK;
       const shade = (c) => Math.max(0, Math.min(255, Math.round((c / n) * 0.35)));
       return (shade(r) << 16) | (shade(g) << 8) | shade(b);
+    } catch {
+      return FALLBACK;
+    }
+  }
+
+  // Plain (undarkened) average color sampled across a 4×4 grid of the texture —
+  // used for the shooter arena's flat static-floor fill (see the shooter block
+  // in create()). Unlike sampleFloorShade this isn't meant to sit in a shadowed
+  // underground gap, so it keeps the texture's real brightness.
+  sampleFloorAverage(textureKey, frameIndex) {
+    const FALLBACK = 0x3a3a46;
+    try {
+      const texture = this.textures.get(textureKey);
+      const frame = texture?.get(frameIndex ?? 0) || texture?.get(0);
+      if (!frame || !frame.width || !frame.height) return FALLBACK;
+      let r = 0, g = 0, b = 0, n = 0;
+      for (let gy = 0; gy < 4; gy++) {
+        for (let gx = 0; gx < 4; gx++) {
+          const x = Math.floor((gx + 0.5) * frame.width / 4);
+          const y = Math.floor((gy + 0.5) * frame.height / 4);
+          const px = this.textures.getPixel(x, y, textureKey, frame.name);
+          if (!px || px.alpha < 128) continue;
+          r += px.red; g += px.green; b += px.blue; n += 1;
+        }
+      }
+      if (!n) return FALLBACK;
+      return (Math.round(r / n) << 16) | (Math.round(g / n) << 8) | Math.round(b / n);
     } catch {
       return FALLBACK;
     }
@@ -965,8 +1053,10 @@ export default class GameManagerScene extends Phaser.Scene {
       this.parallaxSystem.update(time, delta);
     }
 
-    // Update sprite alignment if needed
-    if (this.alignmentManager && this.player && this.player.body) {
+    // Update sprite alignment if needed. Shooter rotates its sprite toward
+    // movement/fire direction instead of flipping — this horizontal-only
+    // facing heuristic doesn't apply.
+    if (this.alignmentManager && this.player && this.player.body && this.gameConfig.gameType !== 'shooter') {
       this.alignmentManager.updateFacing(this.player, this.player.body.velocity.x);
     }
 

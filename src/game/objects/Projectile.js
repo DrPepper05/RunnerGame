@@ -51,6 +51,37 @@ export default class Projectile extends Phaser.Physics.Arcade.Sprite {
 
     // Reset lifespan (e.g., live for 2000 milliseconds)
     this.lifespan = 2000;
+    this._rotationLocked = false;
+  }
+
+  /**
+   * Fires the projectile from (x, y) toward an arbitrary target point, rotating
+   * the sprite to face its travel direction. Used by top-down modes (Shooter)
+   * where motion isn't constrained to left/right, unlike fire().
+   * @param {number} x
+   * @param {number} y
+   * @param {number} targetX
+   * @param {number} targetY
+   * @param {number} speed
+   */
+  fireAt(x, y, targetX, targetY, speed = 500) {
+    this.setActive(true);
+    this.setVisible(true);
+
+    if (this.body) {
+      this.body.enable = true;
+      this.setPosition(x, y);
+      this.body.setSize(this.width, this.height);
+
+      const angle = Phaser.Math.Angle.Between(x, y, targetX, targetY);
+      this.body.setVelocity(Math.cos(angle) * speed, Math.sin(angle) * speed);
+      this.rotation = angle;
+    }
+
+    this.lifespan = 2000;
+    // preUpdate's texture-based spin logic would otherwise fight this rotation
+    // every frame — lock it out for angle-fired projectiles.
+    this._rotationLocked = true;
   }
 
   /**
@@ -59,8 +90,10 @@ export default class Projectile extends Phaser.Physics.Arcade.Sprite {
    * @param {number} delta - The delta time in ms since the last frame.
    */
   preUpdate(time, delta) {
-    // Shuriken spinning effect
-    if (this.texture && this.texture.key === 'shuriken') {
+    if (this._rotationLocked) {
+      // fireAt() already set the correct travel-facing rotation; leave it alone.
+    } else if (this.texture && this.texture.key === 'shuriken') {
+      // Shuriken spinning effect
       this.rotation += 0.2;
     } else {
       this.rotation = 0;

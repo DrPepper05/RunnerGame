@@ -1,5 +1,6 @@
 import RunnerMode from './modes/RunnerMode';
 import PlatformerMode from './modes/PlatformerMode';
+import ShooterMode from './modes/ShooterMode';
 // import DodgeMode from './modes/DodgeMode'; // For later
 
 export default class GameModeManager {
@@ -16,6 +17,9 @@ export default class GameModeManager {
     switch (gameType) {
       case 'platformer':
         this.activeMode = new PlatformerMode(this.scene);
+        break;
+      case 'shooter':
+        this.activeMode = new ShooterMode(this.scene);
         break;
       case 'dodge': // placeholder
         this.activeMode = new RunnerMode(this.scene); // fallback for now

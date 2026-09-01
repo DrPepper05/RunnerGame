@@ -276,6 +276,9 @@ export async function generateImage({
     const sizeActive = !strippedOptional && imageSize && activeModel.startsWith('gemini-3') && !fieldRejected(activeModel, 'imageSize');
     // Thinking is billed by default on 3.x models — ask for none. Models that
     // can't disable it (e.g. pro) reject once, then the field is dropped.
+    // thinkingLevel MINIMAL rides along since 2026-08-28: budget-0 alone was
+    // accepted-but-ignored here too (cost reports kept showing billed thinking
+    // tokens on image calls) — the same shape the text path fixed on 2026-08-05.
     const thinkActive = !strippedOptional && activeModel.startsWith('gemini-3') && !fieldRejected(activeModel, 'thinkingConfig');
     // Not every model honors every aspect ratio (e.g. the 2.5 fallback hard-rejects
     // an 8:1 sheet strip instead of silently ignoring it) — drop it and let the
@@ -289,7 +292,7 @@ export async function generateImage({
           config: {
             responseModalities: ['IMAGE'],
             imageConfig: { ...(aspectActive ? { aspectRatio } : {}), ...(sizeActive ? { imageSize } : {}) },
-            ...(thinkActive ? { thinkingConfig: { thinkingBudget: 0 } } : {})
+            ...(thinkActive ? { thinkingConfig: { thinkingBudget: 0, thinkingLevel: 'MINIMAL' } } : {})
           }
         }),
         timeoutMs,

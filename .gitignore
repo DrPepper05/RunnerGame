@@ -21,6 +21,10 @@ dist-ssr
 generated_test_assets
 scratch
 
+# AI assistant docs — kept locally, never tracked
+AI_STATUS.md
+CLAUDE.md
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
